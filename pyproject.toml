@@ -1,0 +1,72 @@
+[project]
+name = "my-agent"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "objones25", email = "59661118+objones25@users.noreply.github.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "deepagents>=0.7.15",
+    "langchain-openai>=1.6.2",
+    "langsmith>=0.12.6",
+    "pydantic-settings>=2.15.0",
+    "python-dotenv>=1.2.3",
+    "weave>=0.53.9",
+]
+
+[project.scripts]
+my-agent = "my_agent.main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "mypy>=2.3.1",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "pytest-cov>=7.1.0",
+    "pytest-mock>=3.15.1",
+    "ruff>=0.16.8",
+]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers --strict-config"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "live: hits a real network endpoint (HF router, LangSmith, W&B). Deselected by default.",
+    "eval: an eval-suite case, not a unit test. Deselected by default.",
+]
+filterwarnings = ["error"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+# Vendored audit tool: refreshed from the skill, not maintained here.
+extend-exclude = ["scripts/audit_negative_space.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "ANN", "ASYNC", "S", "RET", "PL", "RUF"]
+ignore = ["ANN401"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "ANN", "PLR2004"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+warn_unreachable = true
+disallow_any_explicit = false
+files = ["src", "tests"]
+
+[tool.coverage.run]
+source = ["src"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:", "raise NotImplementedError"]
