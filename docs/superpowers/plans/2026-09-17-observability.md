@@ -1473,7 +1473,85 @@ def test_langsmith_and_weave_trace_the_same_run():
 Run: `uv run pytest tests/test_tracing.py -m live -v`
 Expected: PASS. If it fails, that is the finding — record what actually happened in Step 3 rather than making the test agree with the assumption.
 
-- [ ] **Step 3: Record the findings**
+- [ ] **Step 3: Re-prove both documentation claims before editing anything**
+
+**Do not edit a doc on the strength of this plan's say-so.** Both claims below were
+proved false on 2026-09-17 by running the scripts here. Run them again. If either comes
+back the other way — the claim holds on your versions — leave that doc sentence alone
+and say so in the task report. A doc is only wrong once you have watched it be wrong.
+
+Proof 1, the `LANGCHAIN_*` claim. Save and run:
+
+```python
+"""CLAUDE.md claims: "(Older `LANGCHAIN_*` names no longer work.)" """
+import os
+
+for key in list(os.environ):
+    if key.startswith(("LANGSMITH_", "LANGCHAIN_")):
+        del os.environ[key]
+
+os.environ["LANGCHAIN_TRACING"] = "true"
+os.environ["LANGCHAIN_API_KEY"] = "fake-key"
+os.environ["LANGCHAIN_PROJECT"] = "legacy-project"
+
+from langchain_core.callbacks.manager import CallbackManager
+from langsmith.utils import get_tracer_project, tracing_is_enabled
+
+print("tracing_is_enabled():", tracing_is_enabled())
+print("get_tracer_project():", get_tracer_project())
+print("installed handlers:  ", [type(h).__name__ for h in CallbackManager.configure().handlers])
+```
+
+Observed 2026-09-17 (langsmith 0.12.6, langchain-core 1.6.3):
+
+```
+tracing_is_enabled(): True
+get_tracer_project(): legacy-project
+installed handlers:   ['LangChainTracer']
+```
+
+With no `LANGSMITH_*` variable set at all, the legacy namespace enables tracing, resolves
+the project, and installs the tracer. The claim is false. Cause: `langsmith.utils.get_env_var`
+takes `namespaces=("LANGSMITH", "LANGCHAIN")` and searches both.
+
+Proof 2, the `CheckFailed` claim in `src/my_agent/main.py`. Save and run:
+
+```python
+"""main.py claims: "A CheckFailed is a bug in our own contracts and is left to propagate." """
+from pydantic import SecretStr
+
+from my_agent import main as main_module
+from my_agent.model import ModelConfig
+from my_agent.negative_space import CheckFailed
+
+
+def check_that_violates_a_contract(config):
+    raise CheckFailed("a contract of ours was violated")
+
+
+main_module.CHECKS = (check_that_violates_a_contract,)
+
+try:
+    exit_code = main_module._run_checks(ModelConfig(api_key=SecretStr("hf_token_value")))
+except CheckFailed:
+    print("RESULT: propagated -- the comment is correct.")
+else:
+    print(f"RESULT: swallowed, reported as a failed check (exit {exit_code}) -- comment is wrong.")
+```
+
+Observed 2026-09-17:
+
+```
+  [FAIL] ??  check_that_violates_a_contract
+         CheckFailed: a contract of ours was violated
+0/1 checks passed
+RESULT: swallowed, reported as a failed check (exit 1) -- comment is wrong.
+```
+
+`CheckFailed.__mro__` is `(CheckFailed, AssertionError, Exception, BaseException, object)`,
+so `except Exception` catches it. The comment describes an intent the code never had.
+
+- [ ] **Step 4: Record the findings**
 
 Append two findings to `docs/findings.md`, in the existing F-format (heading, how it was checked, what the code does about it):
 
@@ -1482,14 +1560,14 @@ Append two findings to `docs/findings.md`, in the existing F-format (heading, ho
 
 Also record, under the same file's conventions, that `langsmith.utils.get_env_var` is `lru_cache`d — a lookup before `load_dotenv()` disables tracing for the life of the process — and that it still honours the `LANGCHAIN_*` namespace.
 
-- [ ] **Step 4: Update CLAUDE.md**
+- [ ] **Step 5: Update CLAUDE.md**
 
 1. Repo layout: add `tracing.py` (TracingBackend + LangSmith/Weave adapters) and `mirror.py` (JsonlMirror, run-file naming) to the `src/my_agent/` block, and `test_tracing.py` / `test_mirror.py` to `tests/`.
 2. Observability section: replace the "this has not been verified end to end in this repo yet" sentence with Step 2's result, linked to F11.
-3. **Correct an inaccurate claim.** CLAUDE.md line ~300 says "(Older `LANGCHAIN_*` names no longer work.)" This is false for langsmith 0.12.6: `get_env_var` searches `namespaces=("LANGSMITH", "LANGCHAIN")`, and `LANGCHAIN_TRACING=true` enables tracing. Fix the sentence and note the `lru_cache`.
+3. **Correct the claim Step 3 disproved**, and only if Step 3 disproved it again on your run. CLAUDE.md line ~300 says "(Older `LANGCHAIN_*` names no longer work.)" Replace it with what the proof showed: `langsmith.utils.get_env_var` searches `namespaces=("LANGSMITH", "LANGCHAIN")`, so the legacy names still enable tracing and still resolve the project; prefer `LANGSMITH_*` for new work. Note the `lru_cache` on the same function while you are there.
 4. Verified API facts: add `BaseCallbackHandler.raise_error`/`run_inline` defaults, `CallbackManager.configure()` as the way to read installed tracers, `tracing_is_enabled()`, `get_weave_client()`, and the `WEAVE_TRACE_LANGCHAIN` gate.
 
-- [ ] **Step 5: Full gate, then commit**
+- [ ] **Step 6: Full gate, then commit**
 
 ```bash
 uv run ruff check . --fix && uv run mypy && uv run pytest
