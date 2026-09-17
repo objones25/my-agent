@@ -168,7 +168,8 @@ project `.env`, for the same reason in reverse. Pass an explicit path from anywh
 
 `require(x is not None, ...)` does not narrow `x`. Where a check also narrows, use an explicit
 `if ... raise CheckFailed(...)` — same runtime behaviour, survives `python -O`, and mypy follows it.
-`check_shape` in `negative_space.py` and `compiled_tool_names` in `agent.py` are the worked examples.
+`check_shape` in `negative_space.py` and `compiled_tool_names` in `capabilities.py` are the worked
+examples.
 
 ---
 

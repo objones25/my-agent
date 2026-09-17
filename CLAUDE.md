@@ -61,15 +61,17 @@ path, and network reach is off unless something needs it, and turning one on is 
 reviewed edit — never something inherited from a library default.
 
 This is not theoretical here: `create_deep_agent` enables a shell `execute` tool with no opt-in
-(`docs/findings.md` F4). `build_agent` withholds it. Concretely:
+(`docs/findings.md` F4). `capabilities.py` withholds it and `build_agent` installs the
+result. Concretely:
 
 - `DEFAULT_FILESYSTEM_TOOLS` is defined by *subtraction* from what deepagents offers, and a
   load-time check asserts it equals `get_args(FsToolName) - {"execute"}`. A new upstream tool fails
   the import rather than being granted silently.
 - `AgentConfig.middleware` and `.permissions` default to empty. Empty permissions means "no rules",
   not "deny all" — if the threat model needs denial, write the rules.
-- Postconditions assert the withheld capability is actually absent from the compiled graph, because
-  an allowlist is only a request until it is checked.
+- Postconditions assert the withheld capability is actually absent from the compiled graph (and
+  that the graph bound *some* tools, so the absence cannot pass vacuously) — an allowlist is only
+  a request until it is checked.
 
 When adding a capability, say in the commit message what needs it and what the blast radius is.
 
@@ -133,8 +135,8 @@ call site changes.
 
 The cost is that `as_kwargs()` splatting trusts field names to be real parameters, and a typo would
 otherwise surface as a `TypeError` from inside the library — or vanish into a `**kwargs` signature.
-So `_check_config_contract` verifies every field against the callee's actual parameters **at import
-time**, via `inspect.signature(create_deep_agent)` and `ChatOpenAI.model_fields` (pydantic's
+So `contracts.check_config_contract` verifies every field against the callee's actual parameters
+**at import time**, via `inspect.signature(create_deep_agent)` and `ChatOpenAI.model_fields` (pydantic's
 `__init__` is `**data`, so its fields and aliases are the real contract). A misspelled field or an
 upstream rename fails on import, by name. It also refuses fields the factory injects itself
 (`model`, `use_responses_api`), which would collide on splat.
@@ -281,7 +283,7 @@ infers the endpoint from the model name (`_model_prefers_responses_api`, which m
 containing `codex`) and from the payload (`reasoning`, `include`, `truncation`, `text`,
 `context_management`, or any builtin tool), **independent of `base_url`**. langchain-openai's own
 `ChatOpenAI` docstring carries a warning to set this explicitly for OpenAI-compatible providers.
-`agent.py` pins it via the `USE_RESPONSES_API` constant and asserts it as a postcondition.
+`model.py` pins it via the `USE_RESPONSES_API` constant and asserts it as a postcondition.
 
 ### Observability
 
@@ -314,9 +316,16 @@ but **this has not been verified end to end in this repo yet**. Verify it before
 
 ```
 src/my_agent/
-  agent.py            # composition root: ModelConfig/AgentConfig, build_model, build_agent.
+  model.py            # ModelConfig, build_model, router/model defaults, USE_RESPONSES_API.
                       # The only module that reads os.environ or knows the router exists.
-  main.py             # `uv run my-agent` — live checks against the router, one per finding.
+  agent.py            # AgentConfig, build_agent. Takes a BaseChatModel; imports nothing
+                      # from model.py — main.py is the only place the two meet.
+  capabilities.py     # DEFAULT_FILESYSTEM_TOOLS, least_privilege_filesystem,
+                      # compiled_tool_names. The allowlist and the proof it held.
+  contracts.py        # check_config_contract, pydantic_param_names — the import-time
+                      # check that makes as_kwargs() splatting safe.
+  main.py             # `uv run my-agent` — composition root. Live checks against the
+                      # router, one per finding.
   negative_space.py   # contract helpers: require/unreachable/bounded/check_shape/check_finite
 tests/                # deterministic, offline
 evals/                # model-dependent, -m eval
