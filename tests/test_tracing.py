@@ -13,13 +13,19 @@ from collections.abc import Iterator
 import pytest
 from langsmith.utils import get_env_var
 
+import my_agent.tracing as tracing_module
 from my_agent.tracing import (
+    DEFAULT_WEAVE_PROJECT,
     LANGSMITH_API_KEY_ENV_VAR,
     LANGSMITH_PROJECT_ENV_VAR,
     LANGSMITH_TRACING_ENV_VAR,
+    WANDB_API_KEY_ENV_VAR,
+    WEAVE_PROJECT_ENV_VAR,
     LangSmithTracing,
     TracingBackend,
     TracingMisconfigured,
+    WeaveTracing,
+    available_backends,
 )
 
 LANGSMITH_ENV = {
@@ -27,6 +33,8 @@ LANGSMITH_ENV = {
     LANGSMITH_TRACING_ENV_VAR: "true",
     LANGSMITH_PROJECT_ENV_VAR: "my-project",
 }
+
+WEAVE_ENV = {WANDB_API_KEY_ENV_VAR: "wandb-key-value", WEAVE_PROJECT_ENV_VAR: "weave-project"}
 
 
 @pytest.fixture(autouse=True)
@@ -142,3 +150,99 @@ def test_langsmith_satisfies_the_protocol() -> None:
     """Checked by mypy, not at runtime: the assignment is the assertion."""
     backend: TracingBackend = LangSmithTracing(project=None)
     assert backend.name == "langsmith"
+
+
+@pytest.fixture
+def weave_spy(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Records weave.init calls and reports a client only once init has run.
+
+    weave.init reaches the network; nothing offline may call the real one.
+    """
+    calls: list[str] = []
+    client: list[object] = []
+
+    def fake_init(project_name: str, **kwargs: object) -> object:
+        assert "settings" not in kwargs, "settings= is silently ignored on weave's thread pool"
+        calls.append(project_name)
+        client.append(object())
+        return client[-1]
+
+    monkeypatch.setattr(tracing_module.weave, "init", fake_init)
+    monkeypatch.setattr(tracing_module, "get_weave_client", lambda: client[0] if client else None)
+    monkeypatch.setattr(
+        tracing_module, "langchain_tracer_names", lambda: frozenset({"WeaveTracer"})
+    )
+    return calls
+
+
+def test_weave_is_configured_from_a_wandb_key(weave_spy: list[str]) -> None:
+    backend = WeaveTracing.from_env(WEAVE_ENV)
+    assert backend is not None
+    assert backend.project == "weave-project"
+    assert backend.name == "weave"
+
+
+def test_weave_is_absent_without_a_wandb_key() -> None:
+    assert WeaveTracing.from_env({WEAVE_PROJECT_ENV_VAR: "weave-project"}) is None
+
+
+def test_weave_falls_back_to_the_default_project() -> None:
+    backend = WeaveTracing.from_env({WANDB_API_KEY_ENV_VAR: "wandb-key-value"})
+    assert backend is not None
+    assert backend.project == DEFAULT_WEAVE_PROJECT
+
+
+def test_weave_activate_initialises_the_client(weave_spy: list[str]) -> None:
+    WeaveTracing(project="weave-project").activate()
+    assert weave_spy == ["weave-project"]
+
+
+def test_weave_activate_is_idempotent(weave_spy: list[str]) -> None:
+    """Claimed in CLAUDE.md, tested nowhere until now. A second init would
+    install global state twice."""
+    backend = WeaveTracing(project="weave-project")
+    backend.activate()
+    backend.activate()
+    assert weave_spy == ["weave-project"]
+
+
+def test_weave_activate_fails_when_the_langchain_tracer_is_missing(
+    monkeypatch: pytest.MonkeyPatch, weave_spy: list[str]
+) -> None:
+    """A Weave client with no LangChain hook means Weave is on and the agent is
+    still untraced — the exact silent failure this postcondition exists for."""
+    monkeypatch.setattr(tracing_module, "langchain_tracer_names", frozenset)
+    with pytest.raises(AssertionError, match="WeaveTracer"):
+        WeaveTracing(project="weave-project").activate()
+
+
+def test_weave_rejects_an_empty_project() -> None:
+    with pytest.raises(AssertionError, match="project"):
+        WeaveTracing(project="")
+
+
+def test_weave_satisfies_the_protocol() -> None:
+    backend: TracingBackend = WeaveTracing()
+    assert backend.name == "weave"
+
+
+def test_no_backends_are_available_in_an_empty_environment() -> None:
+    assert available_backends({}) == ()
+
+
+def test_both_backends_are_available_when_both_are_configured() -> None:
+    backends = available_backends(LANGSMITH_ENV | WEAVE_ENV)
+    assert [b.name for b in backends] == ["langsmith", "weave"]
+
+
+def test_only_the_configured_backend_is_available() -> None:
+    backends = available_backends(WEAVE_ENV)
+    assert [b.name for b in backends] == ["weave"]
+
+
+def test_langchain_tracer_names_reports_the_installed_tracers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LANGSMITH_TRACING", "true")
+    monkeypatch.setenv("LANGSMITH_API_KEY", "ls-key-value")
+    assert "LangChainTracer" in tracing_module.langchain_tracer_names()
