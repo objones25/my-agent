@@ -39,7 +39,6 @@ __all__ = [
     "WeaveTracing",
     "available_backends",
     "langchain_tracer_names",
-    "weave",  # re-exported so tests can monkeypatch tracing.weave.init directly
 ]
 
 LANGSMITH_API_KEY_ENV_VAR = "LANGSMITH_API_KEY"

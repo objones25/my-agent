@@ -11,6 +11,7 @@ import re
 from collections.abc import Iterator
 
 import pytest
+import weave
 from langsmith.utils import get_env_var
 
 import my_agent.tracing as tracing_module
@@ -167,7 +168,7 @@ def weave_spy(monkeypatch: pytest.MonkeyPatch) -> list[str]:
         client.append(object())
         return client[-1]
 
-    monkeypatch.setattr(tracing_module.weave, "init", fake_init)
+    monkeypatch.setattr(weave, "init", fake_init)
     monkeypatch.setattr(tracing_module, "get_weave_client", lambda: client[0] if client else None)
     monkeypatch.setattr(
         tracing_module, "langchain_tracer_names", lambda: frozenset({"WeaveTracer"})
