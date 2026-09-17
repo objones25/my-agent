@@ -13,7 +13,11 @@ here is installed, and nothing here knows a tracing backend exists.
 from __future__ import annotations
 
 import json
+import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, TextIO, override
 from uuid import UUID
 
@@ -23,11 +27,19 @@ from langchain_core.outputs import LLMResult
 
 from my_agent.negative_space import require
 
-__all__ = ["MAX_FIELD_CHARS", "JsonlMirror"]
+__all__ = [
+    "DEFAULT_LOG_DIR",
+    "MAX_FIELD_CHARS",
+    "JsonlMirror",
+    "mirror_to_file",
+    "run_log_path",
+]
 
 MAX_FIELD_CHARS = 4000
 """Per-value bound. A `read_file` on something large would otherwise put
 megabytes on one line and make the file unreadable exactly when it matters."""
+
+DEFAULT_LOG_DIR = Path("logs")
 
 
 def _clip(value: Any) -> tuple[Any, bool]:
@@ -266,3 +278,35 @@ class JsonlMirror(BaseCallbackHandler):
             error_type=type(error).__name__,
             error=str(error),
         )
+
+
+# -- run-file lifecycle -------------------------------------------------------
+
+
+def run_log_path(
+    directory: Path = DEFAULT_LOG_DIR,
+    *,
+    now: datetime | None = None,
+    run_id: str | None = None,
+) -> Path:
+    """Where this run's mirror goes: `<dir>/<utc-stamp>-<short-id>.jsonl`.
+
+    `now` and `run_id` are injectable so the name is deterministic under test.
+    """
+    moment = datetime.now(UTC) if now is None else now
+    require(
+        moment.tzinfo is not None,
+        "now must be timezone-aware; these filenames sort by time and a naive "
+        "stamp is ambiguous",
+    )
+    token = uuid.uuid4().hex[:8] if run_id is None else run_id
+    require(token != "", "run_id must not be empty")
+    return directory / f"{moment.astimezone(UTC).strftime('%Y%m%dT%H%M%SZ')}-{token}.jsonl"
+
+
+@contextmanager
+def mirror_to_file(path: Path) -> Iterator[JsonlMirror]:
+    """A mirror writing to `path`, closed on the way out — exception or not."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as stream:
+        yield JsonlMirror(stream)

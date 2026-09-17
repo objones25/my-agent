@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import io
 import json
+from datetime import UTC, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -15,7 +17,13 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.outputs import ChatGeneration, LLMResult
 
-from my_agent.mirror import MAX_FIELD_CHARS, JsonlMirror
+from my_agent.mirror import (
+    DEFAULT_LOG_DIR,
+    MAX_FIELD_CHARS,
+    JsonlMirror,
+    mirror_to_file,
+    run_log_path,
+)
 
 RUN_ID = UUID("00000000-0000-4000-8000-000000000001")
 PARENT_ID = UUID("00000000-0000-4000-8000-000000000002")
@@ -150,3 +158,54 @@ def test_handler_flags_are_pinned(mirror: JsonlMirror) -> None:
     """Defaults are False for both; each True is a deliberate decision."""
     assert mirror.run_inline is True
     assert mirror.raise_error is True
+
+
+FIXED_NOW = datetime(2026, 9, 17, 14, 30, 5, tzinfo=UTC)
+
+
+def test_run_log_path_is_deterministic_when_time_and_id_are_injected() -> None:
+    path = run_log_path(Path("logs"), now=FIXED_NOW, run_id="abc123")
+    assert path == Path("logs/20260917T143005Z-abc123.jsonl")
+
+
+def test_run_log_path_defaults_to_the_log_directory() -> None:
+    assert run_log_path(now=FIXED_NOW, run_id="abc123").parent == DEFAULT_LOG_DIR
+
+
+def test_run_log_path_rejects_a_naive_timestamp() -> None:
+    """A naive stamp is ambiguous, and these filenames sort by time."""
+    with pytest.raises(AssertionError, match="timezone"):
+        run_log_path(now=datetime(2026, 9, 17, 14, 30, 5), run_id="abc123")
+
+
+def test_run_log_path_normalises_to_utc() -> None:
+    eastern = timezone(timedelta(hours=-4))
+    path = run_log_path(now=FIXED_NOW.astimezone(eastern), run_id="abc123")
+    assert path.name == "20260917T143005Z-abc123.jsonl"
+
+
+def test_run_log_paths_differ_between_runs() -> None:
+    assert run_log_path(now=FIXED_NOW) != run_log_path(now=FIXED_NOW)
+
+
+def test_mirror_to_file_writes_a_readable_run_log(tmp_path: Path) -> None:
+    path = tmp_path / "logs" / "run.jsonl"
+    with mirror_to_file(path) as mirror:
+        mirror.on_chain_start({"name": "agent"}, {}, run_id=RUN_ID)
+    assert json.loads(path.read_text().strip())["name"] == "agent"
+
+
+def test_mirror_to_file_creates_the_directory(tmp_path: Path) -> None:
+    path = tmp_path / "deeper" / "logs" / "run.jsonl"
+    with mirror_to_file(path) as mirror:
+        mirror.on_chain_start({"name": "agent"}, {}, run_id=RUN_ID)
+    assert path.exists()
+
+
+def test_mirror_to_file_closes_the_file_even_when_the_run_raises(tmp_path: Path) -> None:
+    """The crashed run is the one whose log has to survive."""
+    path = tmp_path / "run.jsonl"
+    with pytest.raises(RuntimeError), mirror_to_file(path) as mirror:
+        mirror.on_chain_start({"name": "agent"}, {}, run_id=RUN_ID)
+        raise RuntimeError("the agent exploded")
+    assert json.loads(path.read_text().strip())["name"] == "agent"

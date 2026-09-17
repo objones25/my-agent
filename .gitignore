@@ -23,3 +23,6 @@ htmlcov/
 
 # Claude Code worktrees
 .claude/worktrees/
+
+# Local JSONL run mirrors
+logs/
