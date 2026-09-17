@@ -126,6 +126,64 @@ check_config_contract(
 # --------------------------------------------------------------------------
 
 
+def _replaces_filesystem_middleware(config: AgentConfig) -> bool:
+    """Whether the caller supplied their own `FilesystemMiddleware`.
+
+    deepagents merges middleware by `.name`, so a caller-supplied one displaces
+    the least-privilege middleware entirely — allowlist, permission rules and
+    all. Two decisions hang on this: `_agent_kwargs` refuses to pair it with
+    `permissions`, and `build_agent` stops asserting a tool allowlist it no
+    longer owns.
+    """
+    return any(isinstance(m, FilesystemMiddleware) for m in config.middleware)
+
+
+def _agent_kwargs(config: AgentConfig) -> dict[str, Any]:
+    """`create_deep_agent` keywords, with the middleware list assembled.
+
+    Everything splats straight from the config except `middleware`, which gains
+    the least-privilege `FilesystemMiddleware` in front of the caller's own.
+    Extracted from `build_agent` because this is where the subtle failure lives
+    and it is worth testing without building a model or compiling a graph.
+    """
+    # `permissions` reaches the tool layer only through FilesystemMiddleware's
+    # `_permissions`. Replacing that middleware without forwarding them drops
+    # every rule silently, so refuse the combination rather than half-apply it.
+    require(
+        not (_replaces_filesystem_middleware(config) and config.permissions),
+        "a FilesystemMiddleware in AgentConfig.middleware replaces the one build_agent "
+        "installs and would silently drop AgentConfig.permissions; pass the rules to "
+        "that middleware's own _permissions instead",
+    )
+
+    # Empty means "no rules", and deepagents spells that `None`, not `[]`.
+    permissions = list(config.permissions) or None
+    kwargs = config.as_kwargs()
+    kwargs["permissions"] = permissions
+    kwargs["middleware"] = [least_privilege_filesystem(permissions), *config.middleware]
+
+    # Postcondition: the two places the rules have to land must agree. They are
+    # set three lines apart today, which is exactly how they drift later.
+    require(
+        kwargs["middleware"][0]._permissions == list(permissions or []),
+        "assembled middleware does not carry the permissions passed to create_deep_agent",
+    )
+    return kwargs
+
+
+def _require_shell_withheld(agent: CompiledStateGraph[Any, Any, Any, Any]) -> None:
+    """Assert the withheld capability is really absent from the compiled graph.
+
+    The allowlist is only a request until something reads back what was bound.
+    """
+    bound = compiled_tool_names(agent)
+    require(bound != frozenset(), "no tools bound at all; the absence check would be vacuous")
+    require(
+        SHELL_TOOL_NAME not in bound,
+        f"{SHELL_TOOL_NAME} leaked into the agent despite the allowlist: {sorted(bound)}",
+    )
+
+
 def build_agent(
     model: BaseChatModel, config: AgentConfig | None = None
 ) -> CompiledStateGraph[AgentState[Any], Any, InputAgentState, OutputAgentState[Any]]:
@@ -156,35 +214,12 @@ def build_agent(
         f"expected an AgentConfig, got {type(agent_config).__name__}",
     )
 
-    # `permissions` reaches the tool layer only through FilesystemMiddleware's
-    # `_permissions`. Replacing that middleware without forwarding them drops
-    # every rule silently, so refuse the combination rather than half-apply it.
-    caller_filesystem = [m for m in agent_config.middleware if isinstance(m, FilesystemMiddleware)]
-    require(
-        not (caller_filesystem and agent_config.permissions),
-        "a FilesystemMiddleware in AgentConfig.middleware replaces the one build_agent "
-        "installs and would silently drop AgentConfig.permissions; pass the rules to "
-        "that middleware's own _permissions instead",
-    )
-
-    permissions = list(agent_config.permissions) or None
-    kwargs = agent_config.as_kwargs()
-    kwargs["permissions"] = permissions
-    kwargs["middleware"] = [
-        least_privilege_filesystem(permissions),
-        *agent_config.middleware,
-    ]
-
-    agent = create_deep_agent(model=model, **kwargs)
+    agent = create_deep_agent(model=model, **_agent_kwargs(agent_config))
 
     require(agent is not None, "create_deep_agent returned None")
 
-    # Postcondition: the capability we withheld must actually be absent. This is
-    # the guarantee that matters, and it is cheap to state once per build.
-    if not caller_filesystem:
-        bound = compiled_tool_names(agent)
-        require(
-            SHELL_TOOL_NAME not in bound,
-            f"{SHELL_TOOL_NAME} leaked into the agent despite the allowlist: {sorted(bound)}",
-        )
+    # A caller-supplied FilesystemMiddleware owns the allowlist from then on, so
+    # there is no allowlist of ours left to assert.
+    if not _replaces_filesystem_middleware(agent_config):
+        _require_shell_withheld(agent)
     return agent

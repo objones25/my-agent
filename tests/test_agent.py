@@ -25,7 +25,7 @@ from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, SecretStr
 
-from my_agent.agent import AgentConfig, build_agent
+from my_agent.agent import AgentConfig, _agent_kwargs, build_agent
 from my_agent.capabilities import (
     DEFAULT_FILESYSTEM_TOOLS,
     SHELL_TOOL_NAME,
@@ -412,6 +412,59 @@ def test_permissions_reach_the_filesystem_middleware() -> None:
 def test_no_permissions_still_produces_a_usable_middleware() -> None:
     """`None` normalises to an empty rule list, not a missing attribute."""
     assert least_privilege_filesystem(None)._permissions == []
+
+
+def test_agent_kwargs_sends_the_same_rules_to_both_places_they_are_needed() -> None:
+    """`permissions` has to reach `create_deep_agent` AND the FilesystemMiddleware
+    that replaces its default. Disagreement between the two is the silent failure
+    this assembly exists to prevent."""
+    kwargs = _agent_kwargs(AgentConfig(permissions=[DENY_SECRETS]))
+    installed = kwargs["middleware"][0]
+
+    assert kwargs["permissions"] == [DENY_SECRETS]
+    assert isinstance(installed, FilesystemMiddleware)
+    assert installed._permissions == kwargs["permissions"]
+
+
+def test_agent_kwargs_puts_the_least_privilege_middleware_before_the_callers() -> None:
+    """Ours has to be in the list at all, and the caller's additions follow it."""
+    extra = TodoListMiddleware()
+    kwargs = _agent_kwargs(AgentConfig(middleware=[extra]))
+
+    assert isinstance(kwargs["middleware"][0], FilesystemMiddleware)
+    assert kwargs["middleware"][1:] == [extra]
+
+
+def test_agent_kwargs_passes_no_rules_as_none_rather_than_an_empty_list() -> None:
+    """Empty permissions means "no rules", not "deny everything" — deepagents
+    reads `None` as the former."""
+    kwargs = _agent_kwargs(AgentConfig())
+
+    assert kwargs["permissions"] is None
+
+
+def test_agent_kwargs_leaves_every_other_field_untouched() -> None:
+    """`middleware` and `permissions` are the only two fields build_agent
+    rewrites; the rest is why AgentConfig is a parameter object at all."""
+    config = AgentConfig(name="assembled", system_prompt="Be brief.")
+    kwargs = _agent_kwargs(config)
+
+    passthrough = {k: v for k, v in kwargs.items() if k not in {"middleware", "permissions"}}
+    assert passthrough == {
+        k: v for k, v in config.as_kwargs().items() if k not in {"middleware", "permissions"}
+    }
+
+
+def test_agent_kwargs_refuses_the_rule_dropping_combination_without_a_model() -> None:
+    """The same refusal build_agent surfaces, reachable without building a model
+    or compiling a graph."""
+    with pytest.raises(CheckFailed, match="silently drop"):
+        _agent_kwargs(
+            AgentConfig(
+                middleware=[FilesystemMiddleware(tools=list(DEFAULT_FILESYSTEM_TOOLS))],
+                permissions=[DENY_SECRETS],
+            )
+        )
 
 
 def test_build_agent_refuses_a_middleware_permission_combination_that_drops_rules() -> None:
