@@ -163,7 +163,7 @@ def test_build_model_applies_every_config_field() -> None:
     assert isinstance(model, ChatOpenAI)
     assert model.model_name == "org/model:provider"
     assert model.openai_api_base == HF_ROUTER_BASE_URL
-    assert model.temperature == 0.7
+    assert model.temperature == pytest.approx(0.7)
     assert model.request_timeout == 30.0
     assert model.max_retries == 5
 

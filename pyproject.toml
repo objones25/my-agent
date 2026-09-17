@@ -34,7 +34,7 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
-addopts = "-ra --strict-markers --strict-config"
+addopts = "-ra --strict-markers --strict-config -m 'not live and not eval'"
 testpaths = ["tests"]
 asyncio_mode = "auto"
 markers = [
