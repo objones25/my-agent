@@ -20,3 +20,6 @@ htmlcov/
 
 # macOS
 .DS_Store
+
+# Claude Code worktrees
+.claude/worktrees/
