@@ -21,21 +21,34 @@ from typing import ClassVar, Protocol
 
 from langsmith.utils import get_env_var, tracing_is_enabled
 
-from my_agent.negative_space import require
-
 __all__ = [
     "LANGSMITH_API_KEY_ENV_VAR",
     "LANGSMITH_PROJECT_ENV_VAR",
     "LANGSMITH_TRACING_ENV_VAR",
     "LangSmithTracing",
     "TracingBackend",
+    "TracingMisconfigured",
 ]
 
 LANGSMITH_API_KEY_ENV_VAR = "LANGSMITH_API_KEY"
 LANGSMITH_TRACING_ENV_VAR = "LANGSMITH_TRACING"
 LANGSMITH_PROJECT_ENV_VAR = "LANGSMITH_PROJECT"
 
+# Deliberately more permissive than langsmith's own comparison (see `activate`'s
+# docstring): narrowing this to exact "true" would make `LANGSMITH_TRACING=True`
+# silently not trace, which is exactly the failure this module exists to prevent.
 _TRUTHY = frozenset({"true", "1", "yes", "on"})
+
+
+class TracingMisconfigured(RuntimeError):
+    """Tracing looked configured but langsmith reports it is not active.
+
+    An operating error, not a programmer error: everything `activate()` inspects
+    came from the environment, not from a caller we own (CLAUDE.md's rule decides
+    the category by where the value came from). A composition root is expected to
+    catch this, report it, and keep running with tracing off — a misconfigured
+    observability backend should degrade loudly, not take down the agent.
+    """
 
 
 class TracingBackend(Protocol):
@@ -82,7 +95,17 @@ class LangSmithTracing:
         return cls(project=source.get(LANGSMITH_PROJECT_ENV_VAR, "").strip() or None)
 
     def activate(self) -> None:
-        """Verify LangSmith agrees that tracing is on."""
+        """Verify LangSmith agrees that tracing is on, and say precisely why when it does not.
+
+        `from_env`'s `_TRUTHY` accepts more spellings ("1", "yes", "True", ...) than
+        `langsmith.utils.tracing_is_enabled()` does: it compares the raw
+        `LANGSMITH_TRACING` string to the literal `"true"`, with no stripping or
+        case-folding. That gap is deliberate — narrowing `_TRUTHY` to match would risk
+        silently not tracing on a value the user clearly meant as "on" — which means
+        this method, not `from_env`, is where a spelling langsmith will not honour has
+        to be caught and named. "Check for a misspelled variable" would be wrong here:
+        nothing is misspelled, it just is not the one exact string langsmith accepts.
+        """
         # `langsmith.utils.get_env_var` is lru_cached. Any lookup made before
         # load_dotenv() ran is remembered for the life of the process, so a
         # cached "absent" would disable tracing no matter what .env says.
@@ -92,8 +115,11 @@ class LangSmithTracing:
         # cache_clear; confirmed present and working via `inspect` on the installed
         # wheel (langsmith 0.12.6).
         get_env_var.cache_clear()  # type: ignore[attr-defined]
-        require(
-            bool(tracing_is_enabled()),
-            f"{LANGSMITH_API_KEY_ENV_VAR} and {LANGSMITH_TRACING_ENV_VAR} are set, but "
-            f"langsmith reports tracing off; check for a misspelled LANGSMITH_* variable",
+        if tracing_is_enabled():
+            return
+        raw = os.environ.get(LANGSMITH_TRACING_ENV_VAR, "")
+        raise TracingMisconfigured(
+            f"{LANGSMITH_TRACING_ENV_VAR} is {raw!r}, but langsmith enables tracing "
+            f'only for the exact string "true" (it compares literally, without '
+            f"stripping or case-folding)"
         )

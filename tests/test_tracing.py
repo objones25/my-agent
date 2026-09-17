@@ -7,6 +7,7 @@ guarantees no test leaks its environment into the next one.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator
 
 import pytest
@@ -18,6 +19,7 @@ from my_agent.tracing import (
     LANGSMITH_TRACING_ENV_VAR,
     LangSmithTracing,
     TracingBackend,
+    TracingMisconfigured,
 )
 
 LANGSMITH_ENV = {
@@ -72,6 +74,30 @@ def test_langsmith_accepts_the_usual_truthy_spellings(flag: str) -> None:
     assert LangSmithTracing.from_env(LANGSMITH_ENV | {LANGSMITH_TRACING_ENV_VAR: flag}) is not None
 
 
+@pytest.mark.parametrize("flag", ["true", "True", "  TRUE  ", "1", "yes", "on"])
+def test_langsmith_pipeline_only_the_exact_string_true_actually_traces(
+    monkeypatch: pytest.MonkeyPatch, flag: str
+) -> None:
+    """`from_env` is permissive on purpose (`_TRUTHY` accepts more spellings than
+    langsmith's own literal `"true"` comparison), so `from_env` alone configuring a
+    backend does not mean the backend will actually trace. This exercises the full
+    pipeline, `from_env()` then `.activate()`, for every accepted spelling: only the
+    exact string "true" may activate cleanly, and every other spelling must raise
+    `TracingMisconfigured` naming the offending value.
+    """
+    monkeypatch.setenv(LANGSMITH_API_KEY_ENV_VAR, "ls-key-value")
+    monkeypatch.setenv(LANGSMITH_TRACING_ENV_VAR, flag)
+
+    backend = LangSmithTracing.from_env()
+    assert backend is not None
+
+    if flag == "true":
+        backend.activate()  # must not raise
+    else:
+        with pytest.raises(TracingMisconfigured, match=re.escape(flag)):
+            backend.activate()
+
+
 def test_langsmith_activate_passes_when_langsmith_agrees(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("LANGSMITH_TRACING", "true")
     monkeypatch.setenv("LANGSMITH_API_KEY", "ls-key-value")
@@ -81,12 +107,17 @@ def test_langsmith_activate_passes_when_langsmith_agrees(monkeypatch: pytest.Mon
 def test_langsmith_activate_fails_loudly_when_langsmith_disagrees(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The whole value of the class: a misspelled variable is loud, not silent."""
+    """The whole value of the class: a misconfigured setup fails loudly, not silently.
+
+    An operating error (everything `activate()` looks at came from the environment,
+    not from a caller this code owns), so `TracingMisconfigured` rather than a
+    `require()`-raised `CheckFailed`/`AssertionError`.
+    """
     monkeypatch.delenv("LANGSMITH_TRACING", raising=False)
     monkeypatch.delenv("LANGCHAIN_TRACING", raising=False)
     monkeypatch.delenv("LANGSMITH_TRACING_V2", raising=False)
     monkeypatch.delenv("LANGCHAIN_TRACING_V2", raising=False)
-    with pytest.raises(AssertionError, match="tracing off"):
+    with pytest.raises(TracingMisconfigured, match="exact string"):
         LangSmithTracing(project="my-project").activate()
 
 
