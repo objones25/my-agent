@@ -1,18 +1,19 @@
-"""Composition root: config -> model -> agent.
+"""Compiling the deep agent: `AgentConfig` -> `create_deep_agent`.
 
-This is the only module that knows about Hugging Face, base URLs, tokens, or the
-environment. Everything downstream accepts a `BaseChatModel` and a compiled graph
-and stays ignorant of where they came from.
+Takes a `BaseChatModel` and knows nothing about where it came from — no router,
+no tokens, no environment. That is `model.py`'s job, and the two modules import
+nothing from each other.
 
-**Configs are parameter objects, not argument lists.** Each config's field names
-are exactly the callee's parameter names, and the factories splat them
-(`ChatOpenAI(**config.as_kwargs())`). Adding a setting later — `subagents`,
-`backend`, `permissions`, `top_p` — is one new field with a default. No factory
-signature changes, no factory body changes, no call site changes.
+**`AgentConfig` is a parameter object, not an argument list.** Its field names
+are exactly `create_deep_agent` parameter names, and `build_agent` splats them.
+Giving the agent `subagents`, `skills`, a `backend` or `interrupt_on` is one new
+field with a default: no factory signature change, no factory body change, no
+call site change. That coupling is checked at import rather than assumed, so a
+typo or an upstream rename fails when this module loads, by name.
 
-The coupling that buys is checked at import time rather than assumed: every
-config field is verified against the callee's real signature when this module
-loads, so a typo or an upstream rename fails immediately and by name.
+The one field `build_agent` does not pass straight through is `middleware` —
+see `capabilities.py` for why the shell tool has to be withheld by replacing
+deepagents' own filesystem middleware.
 """
 
 from __future__ import annotations
@@ -38,44 +39,18 @@ from langchain_core.tools import BaseTool
 from langgraph.graph.state import CompiledStateGraph
 
 from my_agent.capabilities import (
-    DEFAULT_FILESYSTEM_TOOLS,
     SHELL_TOOL_NAME,
     compiled_tool_names,
     least_privilege_filesystem,
 )
 from my_agent.contracts import check_config_contract
-from my_agent.model import (
-    API_KEY_ENV_VAR,
-    DEFAULT_MAX_RETRIES,
-    DEFAULT_MODEL,
-    DEFAULT_TEMPERATURE,
-    DEFAULT_TIMEOUT_S,
-    HF_ROUTER_BASE_URL,
-    MODEL_ENV_VAR,
-    USE_RESPONSES_API,
-    ModelConfig,
-    build_model,
-)
 from my_agent.negative_space import require
 
 __all__ = [
-    "API_KEY_ENV_VAR",
     "DEFAULT_AGENT_NAME",
-    "DEFAULT_FILESYSTEM_TOOLS",
-    "DEFAULT_MAX_RETRIES",
-    "DEFAULT_MODEL",
     "DEFAULT_SYSTEM_PROMPT",
-    "DEFAULT_TEMPERATURE",
-    "DEFAULT_TIMEOUT_S",
-    "HF_ROUTER_BASE_URL",
-    "MODEL_ENV_VAR",
-    "SHELL_TOOL_NAME",
-    "USE_RESPONSES_API",
     "AgentConfig",
-    "ModelConfig",
     "build_agent",
-    "build_model",
-    "compiled_tool_names",
 ]
 
 # --------------------------------------------------------------------------

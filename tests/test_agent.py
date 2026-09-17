@@ -25,21 +25,22 @@ from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, SecretStr
 
-from my_agent.agent import (
-    API_KEY_ENV_VAR,
+from my_agent.agent import AgentConfig, build_agent
+from my_agent.capabilities import (
     DEFAULT_FILESYSTEM_TOOLS,
+    SHELL_TOOL_NAME,
+    least_privilege_filesystem,
+)
+from my_agent.contracts import check_config_contract, pydantic_param_names
+from my_agent.model import (
+    API_KEY_ENV_VAR,
     DEFAULT_MODEL,
     HF_ROUTER_BASE_URL,
     MODEL_ENV_VAR,
-    SHELL_TOOL_NAME,
     USE_RESPONSES_API,
-    AgentConfig,
     ModelConfig,
-    build_agent,
     build_model,
 )
-from my_agent.capabilities import least_privilege_filesystem
-from my_agent.contracts import check_config_contract, pydantic_param_names
 from my_agent.negative_space import CheckFailed
 
 VALID_KEY = "hf_token_value"

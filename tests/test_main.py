@@ -11,16 +11,14 @@ from langchain.agents.middleware import TodoListMiddleware
 from pydantic import SecretStr
 
 from my_agent import main as main_module
-from my_agent.agent import (
+from my_agent.agent import AgentConfig, build_agent
+from my_agent.capabilities import (
     DEFAULT_FILESYSTEM_TOOLS,
     SHELL_TOOL_NAME,
-    AgentConfig,
-    ModelConfig,
-    build_agent,
-    build_model,
     compiled_tool_names,
 )
 from my_agent.main import EXIT_MISCONFIGURED, main
+from my_agent.model import ModelConfig, build_model
 
 VALID_SECRET = SecretStr("hf_token_value")
 

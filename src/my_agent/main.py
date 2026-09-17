@@ -21,15 +21,13 @@ from deepagents import FilesystemPermission
 from dotenv import load_dotenv
 from langchain_core.messages import BaseMessage
 
-from my_agent.agent import (
+from my_agent.agent import AgentConfig, build_agent
+from my_agent.capabilities import (
     DEFAULT_FILESYSTEM_TOOLS,
     SHELL_TOOL_NAME,
-    AgentConfig,
-    ModelConfig,
-    build_agent,
-    build_model,
     compiled_tool_names,
 )
+from my_agent.model import ModelConfig, build_model
 from my_agent.negative_space import require
 
 EXIT_MISCONFIGURED = 2
