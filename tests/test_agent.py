@@ -35,10 +35,10 @@ from my_agent.agent import (
     USE_RESPONSES_API,
     AgentConfig,
     ModelConfig,
-    _least_privilege_filesystem,
     build_agent,
     build_model,
 )
+from my_agent.capabilities import least_privilege_filesystem
 from my_agent.contracts import check_config_contract, pydantic_param_names
 from my_agent.negative_space import CheckFailed
 
@@ -403,14 +403,14 @@ def test_permissions_reach_the_filesystem_middleware() -> None:
     """`permissions` only takes effect through FilesystemMiddleware's private
     `_permissions`. build_agent installs that middleware, so it must forward
     them or every rule is silently lost."""
-    middleware = _least_privilege_filesystem([DENY_SECRETS])
+    middleware = least_privilege_filesystem([DENY_SECRETS])
 
     assert middleware._permissions == [DENY_SECRETS]
 
 
 def test_no_permissions_still_produces_a_usable_middleware() -> None:
     """`None` normalises to an empty rule list, not a missing attribute."""
-    assert _least_privilege_filesystem(None)._permissions == []
+    assert least_privilege_filesystem(None)._permissions == []
 
 
 def test_build_agent_refuses_a_middleware_permission_combination_that_drops_rules() -> None:
