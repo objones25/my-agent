@@ -41,6 +41,7 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph.state import CompiledStateGraph
 from pydantic import SecretStr
 
+from my_agent.contracts import check_config_contract, pydantic_param_names
 from my_agent.negative_space import CheckFailed, require
 
 __all__ = [
@@ -130,63 +131,17 @@ _MAX_TEMPERATURE = 2.0
 # --------------------------------------------------------------------------
 
 
-def _chat_openai_param_names() -> frozenset[str]:
-    """Constructor keywords `ChatOpenAI` accepts: field names and their aliases.
-
-    `ChatOpenAI.__init__` is pydantic-generated (`**data`), so `inspect.signature`
-    reveals nothing usable; the model fields are the real contract.
-    """
-    names: set[str] = set()
-    for name, field in ChatOpenAI.model_fields.items():
-        names.add(name)
-        if field.alias is not None:
-            names.add(field.alias)
-
-    # Postconditions. This set is what `_check_config_contract` validates against,
-    # so a silently degraded result would make that check vacuous. Aliases are the
-    # part most likely to move: every keyword below is one ModelConfig relies on,
-    # and three of the four are aliases rather than field names.
-    require(names != set(), "ChatOpenAI exposes no model_fields; introspection broke")
-    missing = {"model", "base_url", "api_key", "timeout"} - names
-    require(not missing, f"ChatOpenAI no longer accepts {sorted(missing)}; ModelConfig must change")
-    return frozenset(names)
-
-
-_CHAT_OPENAI_PARAMS = _chat_openai_param_names()
+_CHAT_OPENAI_PARAMS = pydantic_param_names(ChatOpenAI)
 _CREATE_DEEP_AGENT_PARAMS = frozenset(inspect.signature(create_deep_agent).parameters)
 
-
-def _check_config_contract(
-    config_cls: type,
-    callee_params: frozenset[str],
-    callee_name: str,
-    injected: frozenset[str],
-) -> None:
-    """Fail at import if a config field is not a real parameter of its callee.
-
-    This is the check that makes `as_kwargs()` splatting safe. Without it, a
-    misspelled field or an upstream rename would surface as a `TypeError` from
-    deep inside the library on the first call — or worse, be silently swallowed
-    by a `**kwargs` signature. Here it names the offending field at load time.
-    """
-    require(callee_params != frozenset(), f"could not introspect {callee_name} parameters")
-
-    field_names = {f.name for f in fields(config_cls)}
-    require(field_names != set(), f"{config_cls.__name__} has no fields")
-
-    unknown = field_names - callee_params
-    require(
-        not unknown,
-        f"{config_cls.__name__} fields are not {callee_name} parameters: {sorted(unknown)}",
-    )
-
-    conflicting = field_names & injected
-    require(
-        not conflicting,
-        f"{config_cls.__name__} must not configure {sorted(conflicting)}; "
-        f"those are supplied by the factory and would collide when splatted",
-    )
-
+# Aliases are the part of the ChatOpenAI contract most likely to move: every
+# keyword below is one ModelConfig relies on, and three of the four are aliases
+# rather than field names.
+_MISSING_CHAT_OPENAI_PARAMS = {"model", "base_url", "api_key", "timeout"} - _CHAT_OPENAI_PARAMS
+require(
+    not _MISSING_CHAT_OPENAI_PARAMS,
+    f"ChatOpenAI no longer accepts {sorted(_MISSING_CHAT_OPENAI_PARAMS)}; ModelConfig must change",
+)
 
 _MODEL_INJECTED_PARAMS = frozenset({"use_responses_api"})
 _AGENT_INJECTED_PARAMS = frozenset({"model"})
@@ -304,7 +259,7 @@ class ModelConfig:
         return cls(api_key=SecretStr(api_key), model=model)
 
 
-_check_config_contract(ModelConfig, _CHAT_OPENAI_PARAMS, "ChatOpenAI", _MODEL_INJECTED_PARAMS)
+check_config_contract(ModelConfig, _CHAT_OPENAI_PARAMS, "ChatOpenAI", _MODEL_INJECTED_PARAMS)
 
 
 @dataclass(frozen=True, slots=True)
@@ -349,7 +304,7 @@ class AgentConfig:
         return {f.name: getattr(self, f.name) for f in fields(self)}
 
 
-_check_config_contract(
+check_config_contract(
     AgentConfig, _CREATE_DEEP_AGENT_PARAMS, "create_deep_agent", _AGENT_INJECTED_PARAMS
 )
 
