@@ -188,6 +188,34 @@ def test_run_log_paths_differ_between_runs() -> None:
     assert run_log_path(now=FIXED_NOW) != run_log_path(now=FIXED_NOW)
 
 
+def test_run_log_path_rejects_a_traversal_run_id() -> None:
+    """The path is built by string interpolation: an unvalidated run_id can escape
+    the log directory entirely (`../../etc/passwd`)."""
+    with pytest.raises(AssertionError, match="separator"):
+        run_log_path(now=FIXED_NOW, run_id="../../etc/passwd")
+
+
+def test_run_log_path_rejects_a_run_id_with_a_path_separator() -> None:
+    with pytest.raises(AssertionError, match="separator"):
+        run_log_path(now=FIXED_NOW, run_id="a/b")
+
+
+def test_run_log_path_rejects_a_run_id_with_a_backslash() -> None:
+    with pytest.raises(AssertionError, match="separator"):
+        run_log_path(now=FIXED_NOW, run_id="a\\b")
+
+
+def test_run_log_path_rejects_a_bare_traversal_token() -> None:
+    with pytest.raises(AssertionError, match="traversal"):
+        run_log_path(now=FIXED_NOW, run_id="..")
+
+
+def test_run_log_path_accepts_a_normal_run_id() -> None:
+    """Guard against over-tightening: an ordinary hex token still works."""
+    path = run_log_path(now=FIXED_NOW, run_id="deadbeef")
+    assert path == Path("logs/20260917T143005Z-deadbeef.jsonl")
+
+
 def test_mirror_to_file_writes_a_readable_run_log(tmp_path: Path) -> None:
     path = tmp_path / "logs" / "run.jsonl"
     with mirror_to_file(path) as mirror:

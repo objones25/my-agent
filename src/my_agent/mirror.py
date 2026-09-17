@@ -301,6 +301,20 @@ def run_log_path(
     )
     token = uuid.uuid4().hex[:8] if run_id is None else run_id
     require(token != "", "run_id must not be empty")
+    require(
+        "/" not in token,
+        f"run_id must not contain a path separator (got {token!r}): "
+        "it becomes part of a filename, not a subdirectory",
+    )
+    require(
+        "\\" not in token,
+        f"run_id must not contain a path separator (got {token!r}): "
+        "it becomes part of a filename, not a subdirectory",
+    )
+    require(
+        token not in (".", ".."),
+        f"run_id must not be a directory-traversal token (got {token!r})",
+    )
     return directory / f"{moment.astimezone(UTC).strftime('%Y%m%dT%H%M%SZ')}-{token}.jsonl"
 
 
