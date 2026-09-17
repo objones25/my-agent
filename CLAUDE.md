@@ -185,13 +185,22 @@ Bugs live in the states the code was never written to handle. Write those down a
 
 Two different things; keep them apart.
 
-- **Unit tests** (`tests/`, default selection) are deterministic and offline. No network, no real
-  model. They test the harness: protocol conformance, wiring, bounds, error paths. For each
-  `require()`, a test that trips it — that is what turns a contract into a tested contract.
+- **Unit tests** (`tests/`, default selection) are deterministic and offline. One test file per
+  source module; a new module gets a new file rather than an extra section in an existing one.
+  They test the harness: protocol conformance, wiring, bounds, error paths. For each `require()`,
+  a test that trips it — that is what turns a contract into a tested contract.
+- "Offline" is enforced, not assumed: an autouse fixture in `tests/conftest.py` fails any test
+  that opens a socket, and steps aside only for `live`. Shared setup (`valid_secret`,
+  `deny_secrets`) lives there too — as fixtures, so no test can leak a mutation into the next.
 - **Evals** (`evals/`, `-m eval`) measure model-dependent behaviour and are allowed to be
   non-deterministic and slow. A failing eval is a signal, not a broken build.
-- `-m live` marks anything touching the HF router, LangSmith, or W&B. Deselected by default so the
-  default suite stays free and fast.
+- `-m live` marks anything touching the HF router, LangSmith, or W&B. `addopts` carries
+  `-m "not live and not eval"`, so both are deselected by default and the suite stays free and
+  fast; a command-line `-m live` overrides it. Registering a marker does *not* deselect it — that
+  was a real gap here until it was measured.
+- **A passing suite is not a passing state if the tests cannot fail.** Before trusting new tests,
+  break the code they cover and watch them go red. The last split was verified with five such
+  mutants; a test that survives one is decorative.
 - Never run the suite under `python -O`: the assertions inside the tests vanish and everything passes.
 - `filterwarnings = ["error"]` is set. A new deprecation warning from these fast-moving libraries
   fails the build on purpose — fix it or scope an ignore, do not widen the setting.
@@ -327,7 +336,9 @@ src/my_agent/
   main.py             # `uv run my-agent` — composition root. Live checks against the
                       # router, one per finding.
   negative_space.py   # contract helpers: require/unreachable/bounded/check_shape/check_finite
-tests/                # deterministic, offline
+tests/                # deterministic, offline — one file per source module
+  conftest.py         # shared fixtures + the autouse guard that blocks sockets
+  test_model.py  test_agent.py  test_capabilities.py  test_contracts.py  test_main.py
 evals/                # model-dependent, -m eval
 docs/
   findings.md         # F1-F10: verified library behaviour and what the code does about it
