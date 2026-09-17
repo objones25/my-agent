@@ -5,9 +5,12 @@ The live round trip is not tested here — that is what `uv run my-agent` is for
 
 from __future__ import annotations
 
+import io
+
 import pytest
 from deepagents import FilesystemMiddleware, create_deep_agent
 from langchain.agents.middleware import TodoListMiddleware
+from langchain_core.messages import AIMessage
 from pydantic import SecretStr
 
 from my_agent import main as main_module
@@ -18,7 +21,9 @@ from my_agent.capabilities import (
     compiled_tool_names,
 )
 from my_agent.main import EXIT_MISCONFIGURED, main
+from my_agent.mirror import JsonlMirror
 from my_agent.model import ModelConfig, build_model
+from my_agent.negative_space import CheckFailed
 
 VALID_SECRET = SecretStr("hf_token_value")
 
@@ -103,3 +108,80 @@ def test_main_exits_cleanly_when_the_token_is_missing(
     captured = capsys.readouterr()
     assert "HF_TOKEN" in captured.err
     assert "Traceback" not in captured.err
+
+
+def test_activate_tracing_reports_each_backend_that_turned_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    activated: list[str] = []
+
+    class FakeBackend:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def activate(self) -> None:
+            activated.append(self.name)
+
+    monkeypatch.setattr(
+        main_module, "available_backends", lambda: (FakeBackend("a"), FakeBackend("b"))
+    )
+    assert main_module._activate_tracing() == ("a", "b")
+    assert activated == ["a", "b"]
+
+
+def test_activate_tracing_survives_a_backend_that_cannot_reach_its_service(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A telemetry outage must not take the run down with it."""
+
+    class Broken:
+        name = "weave"
+
+        def activate(self) -> None:
+            raise ConnectionError("w&b unreachable")
+
+    class Working:
+        name = "langsmith"
+
+        def activate(self) -> None:
+            return None
+
+    monkeypatch.setattr(main_module, "available_backends", lambda: (Broken(), Working()))
+    assert main_module._activate_tracing() == ("langsmith",)
+    assert "weave" in capsys.readouterr().err
+
+
+def test_activate_tracing_lets_a_broken_contract_crash(monkeypatch: pytest.MonkeyPatch) -> None:
+    """CheckFailed is a bug in our own code, not an operating error."""
+
+    class Contradictory:
+        name = "langsmith"
+
+        def activate(self) -> None:
+            raise CheckFailed("tracing reported off")
+
+    monkeypatch.setattr(main_module, "available_backends", lambda: (Contradictory(),))
+    with pytest.raises(CheckFailed):
+        main_module._activate_tracing()
+
+
+def test_activate_tracing_is_quiet_when_nothing_is_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(main_module, "available_backends", tuple)
+    assert main_module._activate_tracing() == ()
+
+
+def test_run_passes_callbacks_to_the_graph() -> None:
+    """The mirror is only worth having if it is actually attached."""
+    seen: dict[str, object] = {}
+
+    class FakeAgent:
+        def invoke(self, payload: object, config: dict[str, object]) -> dict[str, object]:
+            seen.update(config)
+            return {"messages": [{"role": "user", "content": "hi"}, AIMessage("pong")]}
+
+    mirror = JsonlMirror(io.StringIO())
+    main_module._run(FakeAgent(), "ping", [mirror])
+    assert seen["callbacks"] == [mirror]
+    assert seen["recursion_limit"] == main_module.RECURSION_LIMIT
