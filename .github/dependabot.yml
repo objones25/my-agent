@@ -4,11 +4,19 @@
 # astral-sh/setup-uv to a full commit SHA (that action publishes no major tags),
 # and a SHA pin cannot self-update. Without this file it would silently rot.
 #
-# `uv` support exists in dependabot-core but is absent from GitHub's published
-# ecosystem table, so treat it as unconfirmed until the Dependabot config status
-# for this repo reports it valid. CLAUDE.md requires the recorded version block
-# in its "Verified API facts" section to be re-verified after any dependency
-# move -- a Dependabot PR is the prompt to do that, not a reason to skip it.
+# `uv` is supported and confirmed working: the repository's dependency graph
+# lists uv.lock as a tracked manifest alongside ci.yml (checked 2026-09-18).
+# Note that GitHub's published "supported ecosystems" table does not list uv,
+# so the docs lag the product here -- dependabot-core carrying a uv directory
+# was the accurate signal, and the repository's own Dependabot tab is what
+# settles it. Registration is not instant after the config lands; an empty tab
+# means not yet, not unsupported.
+#
+# CLAUDE.md requires the recorded version block in its "Verified API facts"
+# section to be re-verified after any dependency move -- a Dependabot PR is the
+# prompt to do that, not a reason to skip it. This matters more for uv than for
+# actions: it is what watches langchain, deepagents, openai, pytest and mypy,
+# all pinned to recent majors that move faster than any training cutoff.
 version: 2
 updates:
   - package-ecosystem: "github-actions"
