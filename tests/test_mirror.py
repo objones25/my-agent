@@ -97,6 +97,44 @@ def test_errors_are_mirrored(mirror: JsonlMirror, stream: io.StringIO) -> None:
     assert "permission denied" in written["error"]
 
 
+def test_chain_error_is_recorded_with_its_type_and_message(
+    mirror: JsonlMirror, stream: io.StringIO
+) -> None:
+    """A crashed chain is the case the mirror exists for, and it was the one
+    callback no test drove."""
+    mirror.on_chain_error(RuntimeError("the agent exploded"), run_id=RUN_ID)
+
+    written = records(stream)[0]
+
+    assert written["event"] == "chain_error"
+    assert written["error_type"] == "RuntimeError"
+    assert "the agent exploded" in written["error"]
+
+
+def test_llm_error_is_recorded_with_its_type_and_message(
+    mirror: JsonlMirror, stream: io.StringIO
+) -> None:
+    mirror.on_llm_error(TimeoutError("router timed out"), run_id=RUN_ID)
+
+    written = records(stream)[0]
+
+    assert written["event"] == "llm_error"
+    assert written["error_type"] == "TimeoutError"
+    assert "router timed out" in written["error"]
+
+
+def test_error_records_carry_no_name_to_join_on(
+    mirror: JsonlMirror, stream: io.StringIO
+) -> None:
+    """Documented contract: only `*_start` records carry a name, so an error is
+    joined back to its start by `run_id`. A name here would make the log look
+    self-describing when it is not."""
+    mirror.on_chain_error(RuntimeError("boom"), run_id=RUN_ID)
+    mirror.on_llm_error(RuntimeError("boom"), run_id=RUN_ID)
+
+    assert all("name" not in record for record in records(stream))
+
+
 def test_record_order_is_event_order(mirror: JsonlMirror, stream: io.StringIO) -> None:
     for index in range(10):
         mirror.on_chain_start({"name": f"step-{index}"}, {}, run_id=RUN_ID)
