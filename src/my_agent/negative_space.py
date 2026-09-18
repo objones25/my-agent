@@ -1,6 +1,8 @@
 """Runtime checks that survive ``python -O``.
 
-Copy this module into your project. Standard library only, no dependencies.
+Adapted from the negative-space-programming skill and owned here: this copy has
+diverged deliberately (PEP 695 generics, a sorted ``__all__``, and only the
+helpers this project actually uses). Standard library only, no dependencies.
 
 Why not ``assert``: ``python -O`` / ``PYTHONOPTIMIZE=1`` removes every ``assert``
 statement from the bytecode, condition and message included. Checks that encode
@@ -13,15 +15,12 @@ typed exception instead and handle it.
 
 from __future__ import annotations
 
-import math
-from collections.abc import Iterable, Iterator, Sequence
-from typing import Any, NoReturn
+from collections.abc import Iterable, Iterator
+from typing import NoReturn
 
 __all__ = [
     "CheckFailed",
     "bounded",
-    "check_finite",
-    "check_shape",
     "require",
     "unreachable",
 ]
@@ -73,77 +72,6 @@ def bounded[T](iterable: Iterable[T], limit: int, name: str = "loop") -> Iterato
         if count > limit:
             raise CheckFailed(f"{name} exceeded its bound of {limit} iterations")
         yield item
-
-
-def check_shape(
-    array: Any,
-    spec: Sequence[int | str | None],
-    name: str = "array",
-) -> dict[str, int]:
-    """Check a NumPy/PyTorch-style ``.shape`` against ``spec`` and return the
-    bindings for any named dimensions.
-
-    ``spec`` entries: an ``int`` for a fixed size, a ``str`` for a named
-    dimension that must be consistent across its uses, or ``None``/``-1`` for
-    "any size".
-
-    >>> class Fake:  # any object with a .shape tuple
-    ...     shape = (8, 3, 32, 32)
-    >>> check_shape(Fake(), ("B", 3, "H", "H"), name="images")
-    {'B': 8, 'H': 32}
-    """
-    raw_shape = getattr(array, "shape", None)
-    # Explicit raise rather than require(): mypy narrows `if ... raise`, but cannot
-    # narrow through a helper call. Same runtime behaviour, and survives `python -O`.
-    if raw_shape is None:
-        raise CheckFailed(f"{name} has no .shape attribute")
-    shape = tuple(int(d) for d in raw_shape)
-    require(
-        len(shape) == len(spec),
-        f"{name}: expected {len(spec)} dims {tuple(spec)}, got {len(shape)} {shape}",
-    )
-
-    bindings: dict[str, int] = {}
-    for axis, (actual, expected) in enumerate(zip(shape, spec, strict=True)):
-        if expected is None or expected == -1:
-            continue
-        if isinstance(expected, str):
-            if expected in bindings:
-                require(
-                    bindings[expected] == actual,
-                    f"{name}: dim '{expected}' is {bindings[expected]} elsewhere "
-                    f"but {actual} at axis {axis}; full shape {shape}",
-                )
-            else:
-                bindings[expected] = actual
-        else:
-            require(
-                actual == expected,
-                f"{name}: axis {axis} expected {expected}, got {actual}; "
-                f"full shape {shape}",
-            )
-    return bindings
-
-
-def check_finite(value: Any, name: str = "value") -> None:
-    """Fail if ``value`` contains NaN or infinity. Accepts a Python float or any
-    array exposing ``.isfinite()`` / working with ``math.isfinite`` after
-    ``float()``.
-
-    >>> check_finite(0.5)
-    >>> check_finite(float("nan"), name="loss")
-    Traceback (most recent call last):
-        ...
-    negative_space.CheckFailed: loss is not finite: nan
-    """
-    isfinite = getattr(value, "isfinite", None)
-    if callable(isfinite):
-        result = isfinite()
-        allf = getattr(result, "all", None)
-        ok = bool(allf()) if callable(allf) else bool(result)
-        require(ok, f"{name} is not finite: {value}")
-        return
-    require(math.isfinite(float(value)), f"{name} is not finite: {value}")
 
 
 if __name__ == "__main__":

@@ -207,9 +207,9 @@ test has to set an env var to reach the line under test, the wiring is in the wr
 
 Bugs live in the states the code was never written to handle. Write those down as executable checks.
 
-- `src/my_agent/negative_space.py` holds `require()`, `unreachable()`, `bounded()`, `check_shape()`,
-  `check_finite()`. Use these, not bare `assert` — `python -O` deletes `assert` statements entirely,
-  condition and message both, and some container images set `PYTHONOPTIMIZE`.
+- `src/my_agent/negative_space.py` holds `require()`, `unreachable()` and `bounded()`. Use these,
+  not bare `assert` — `python -O` deletes `assert` statements entirely, condition and message both,
+  and some container images set `PYTHONOPTIMIZE`.
 - Write preconditions before the body and postconditions after it. Assert the positive space *and*
   the negative space: not just "k is in range" but "the two halves do not overlap".
 - **`require()` for programmer errors** (a caller you own passed something impossible) — crash.
@@ -235,7 +235,7 @@ Bugs live in the states the code was never written to handle. Write those down a
 - Split compound checks: `require(a); require(b)` names the failure, `require(a and b)` does not.
 - mypy cannot narrow types through `require()`. Where a check also narrows (`x is not None`), use an
   explicit `if ... raise CheckFailed(...)` — same runtime behaviour, and mypy follows it.
-  `check_shape` in `negative_space.py` is the worked example.
+  `compiled_tools` in `capabilities.py` is the worked example.
 - Plain `assert` stays correct in test bodies (pytest rewrites it for readable failures).
 - **A test expecting a tripped `require()` names `CheckFailed`, never `AssertionError`.** The
   latter is its base class, so it is also satisfied by a bare `assert` — which means an
@@ -472,7 +472,7 @@ src/my_agent/
                       # Imports no deepagents and builds no model.
   main.py             # `uv run my-agent` — composition root. Live checks against the
                       # router, one per finding.
-  negative_space.py   # contract helpers: require/unreachable/bounded/check_shape/check_finite
+  negative_space.py   # contract helpers: require/unreachable/bounded
   tracing.py          # TracingBackend protocol, LangSmithTracing, WeaveTracing,
                       # available_backends, langchain_tracer_names.
   mirror.py           # JsonlMirror, run_log_path, mirror_to_file — the local,
