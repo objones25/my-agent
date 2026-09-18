@@ -781,9 +781,22 @@ Grepping the installed wheel finds it only in `call_batch_processor.py`.
 wait exists and cannot be bounded from here, so the next reader does not spend the afternoon this
 took. `WeaveClient.finish()` remains reverted for hanging worse (F11).
 
-*Not reproducible on demand.* `weave.init()` plus one `@weave.op` call exits in **3.4s**; the long
-wait needs the server in the state that drops a start. Insurance to know about, not a permanent
-condition.
+*How reliably it fires, revised.* This was first recorded as "not reproducible on demand", on the
+evidence that `weave.init()` plus one `@weave.op` call exits in **3.4s** locally. That reading was
+too generous. Measured again on 2026-09-18 from a clean GitHub Actions runner -- no prior weave
+state, fresh environment, the scheduled `-m live` workflow -- the job ran **5m51s** (15:47:32 to
+15:53:23 UTC) for a suite whose tests take about four seconds. The gap is the `atexit` flush
+against `FLUSH_TIMEOUT_SECONDS`, landing within seconds of the hardcoded 300.
+
+So the minimal one-op case exits fast, but a real agent turn under the LangChain integration
+appears to hit it consistently rather than occasionally. Treat roughly five minutes as the expected
+shutdown cost of any process that traces a real run through Weave, not as a rare outcome.
+
+*Consequence for any timeout around this.* `.github/workflows/live.yml` sets `timeout-minutes: 20`,
+which looked generous when written for a four-second suite and was not: 5m51s leaves no useful
+headroom under a 10-minute ceiling, and a 5-minute one -- an entirely reasonable-looking choice --
+would have killed a passing run. Any future timeout wrapping a Weave-traced process needs the same
+300s allowance on top of whatever the work itself costs.
 
 *Also recorded, about testing this:* `monkeypatch.delenv(name, raising=False)` on a name that is
 **absent** records no undo, so a variable the code under test writes afterwards survives into the
