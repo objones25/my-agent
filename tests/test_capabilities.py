@@ -33,7 +33,11 @@ from my_agent.capabilities import (
     GREP_MATCH_LIMIT,
     HUMAN_MESSAGE_TOKEN_LIMIT,
     SHELL_TOOL_NAME,
+    SUBAGENT_TASK_TOOL_NAME,
+    TASK_DISPATCH_LIMIT,
+    TOOL_CALL_LIMIT,
     TOOL_RESULT_TOKEN_LIMIT,
+    call_limits,
     compiled_tool_names,
     least_privilege_filesystem,
     require_granted,
@@ -346,3 +350,49 @@ def test_the_plugin_groups_are_the_names_deepagents_actually_reads() -> None:
 
     for group in DEEPAGENTS_PLUGIN_GROUPS:
         assert f'"{group}"' in source
+
+
+# --------------------------------------------------------------------------
+# Call limits (F30)
+# --------------------------------------------------------------------------
+
+
+def test_call_limits_bound_both_all_tools_and_task_specifically() -> None:
+    """Two bounds, because they answer different questions: how much work a run
+    may do at all, and how much of it may be delegated."""
+    limits = call_limits()
+
+    assert [m.name for m in limits] == [
+        "ToolCallLimitMiddleware",
+        f"ToolCallLimitMiddleware[{SUBAGENT_TASK_TOOL_NAME}]",
+    ]
+
+
+def test_the_two_call_limits_have_distinct_names() -> None:
+    """deepagents merges middleware by `.name`. Two entries sharing one would
+    mean the second silently replacing the first, and a bound nobody applied."""
+    names = [m.name for m in call_limits()]
+
+    assert len(set(names)) == len(names)
+
+
+def test_the_task_limit_is_tighter_than_the_overall_tool_limit() -> None:
+    """A `task` cap at or above the overall cap could never bind first, which is
+    the one thing it exists to do — a dispatch costs a whole subagent run."""
+    assert TASK_DISPATCH_LIMIT < TOOL_CALL_LIMIT
+
+
+def test_call_limits_are_per_run_not_per_thread() -> None:
+    """A thread limit needs a checkpointer to mean anything, and the graph
+    carries none by default — it would be a bound that never counts."""
+    for middleware in call_limits():
+        assert middleware.thread_limit is None
+        assert middleware.run_limit is not None
+
+
+def test_call_limits_block_rather_than_abort() -> None:
+    """`continue` blocks the exceeded call and lets the agent answer with what
+    it has. `error` would turn a model that asked for too much into a crashed
+    turn, and the run is already bounded by the step limit and the deadline."""
+    for middleware in call_limits():
+        assert middleware.exit_behavior == "continue"

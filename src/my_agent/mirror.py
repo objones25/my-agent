@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -139,6 +139,50 @@ def _invocation_params(kwargs: dict[str, Any]) -> dict[str, Any]:
     return summary
 
 
+def _json_bytes(value: Any) -> int:
+    """Serialized size of `value`, or 0 for anything that will not serialize.
+
+    A size is a diagnostic, never a reason to fail a run, so an exotic object in
+    a tool schema costs its own bytes rather than the record.
+    """
+    try:
+        return len(json.dumps(value, default=str).encode())
+    except (TypeError, ValueError):  # pragma: no cover - default=str covers the known cases
+        return 0
+
+
+def _request_size(params: dict[str, Any], messages: Sequence[BaseMessage]) -> dict[str, Any]:
+    """Roughly how many bytes this call is about to send, and where they go.
+
+    **The number that explains the bill.** A two-line prompt against this agent
+    costs ~2,090 input tokens: the conversation is twelve of them and the rest
+    is tool schemas, sent on every turn whether or not a tool is used (F30).
+    Nothing in the log said so, and a per-call `usage` figure cannot — it
+    reports a total, not a breakdown.
+
+    An estimate, and the error is known: this serializes the langchain-level
+    request, which measured 10,593 bytes against 10,508 on the wire for the same
+    call — **+0.8%**, all of it `json.dumps` whitespace the HTTP body omits.
+    Close enough to act on, and cheaper than an HTTP hook that would have to see
+    the whole conversation to count it.
+    """
+    tools = params.get("tools")
+    tool_bytes: dict[str, int] = {}
+    if isinstance(tools, list):
+        for tool in tools:
+            name = _tool_definition_name(tool)
+            tool_bytes[str(name)] = _json_bytes(tool)
+    messages_bytes = sum(len(message.text.encode()) for message in messages)
+    tools_bytes = sum(tool_bytes.values())
+    return {
+        "total_bytes": tools_bytes + messages_bytes,
+        "tools_bytes": tools_bytes,
+        "messages_bytes": messages_bytes,
+        "tool_count": len(tool_bytes),
+        "tool_bytes": tool_bytes,
+    }
+
+
 def _tool_definition_name(tool: Any) -> Any:
     if isinstance(tool, dict):
         function = tool.get("function")
@@ -237,6 +281,11 @@ class JsonlMirror(BaseCallbackHandler):
         require(hasattr(stream, "write"), f"stream must be writable, got {type(stream).__name__}")
         self._stream = stream
         self._records = 0
+        self._wrote_tool_sizes = False
+        """The per-tool breakdown is written once. The schemas do not change
+        within a run, so repeating them on every model call would be the same
+        bytes logged forever for no new information — while the aggregate stays
+        per call, because the messages do grow."""
 
     @property
     def records(self) -> int:
@@ -374,13 +423,21 @@ class JsonlMirror(BaseCallbackHandler):
         metadata: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> None:
+        flat = [message for batch in messages for message in batch]
+        params = kwargs.get("invocation_params")
+        size = _request_size(params if isinstance(params, dict) else {}, flat)
+        if self._wrote_tool_sizes:
+            del size["tool_bytes"]
+        else:
+            self._wrote_tool_sizes = True
         self._write(
             "chat_model_start",
             run_id,
             parent_run_id,
             name=_component_name(serialized, kwargs),
             params=_invocation_params(kwargs),
-            messages=[_message_summary(message) for batch in messages for message in batch],
+            size=size,
+            messages=[_message_summary(message) for message in flat],
         )
 
     @override

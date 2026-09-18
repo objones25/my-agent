@@ -20,6 +20,7 @@ from typing import Any, get_args
 from deepagents import FilesystemMiddleware, FilesystemPermission, FsToolName
 from deepagents.backends import StateBackend
 from deepagents.backends.protocol import BackendProtocol
+from langchain.agents.middleware import ToolCallLimitMiddleware
 from langgraph.graph.state import CompiledStateGraph
 
 from my_agent.negative_space import CheckFailed, require
@@ -34,8 +35,11 @@ __all__ = [
     "SHELL_TOOL_NAME",
     "SUBAGENT_STEP_LIMIT",
     "SUBAGENT_TASK_TOOL_NAME",
+    "TASK_DISPATCH_LIMIT",
+    "TOOL_CALL_LIMIT",
     "TOOL_RESULT_TOKEN_LIMIT",
     "bound_step_limit",
+    "call_limits",
     "compiled_tool_names",
     "compiled_tools",
     "least_privilege_filesystem",
@@ -117,6 +121,32 @@ thing that would need a different number. Two graph steps buy one model/tool
 round trip, so this is twelve of them — below the depth a tool-using model
 reaches on its own (OpenAI's own gpt-oss write-up shows it chaining 28 browsing
 calls in one turn), which is the trade being made until a domain says otherwise.
+"""
+
+TOOL_CALL_LIMIT = 24
+"""Tool calls one run may make, across every tool.
+
+**Not covered by `RunBounds.step_limit`.** That bounds graph *steps*, and one
+step can execute any number of tool calls: langgraph's tool node runs every
+call in a single `AIMessage`, so a model that fans out ten calls a turn does ten
+times the work per step. The step limit sees one step either way.
+
+Twenty-four is two calls per round trip at the default step limit (25 steps buys
+12 model/tool round trips). Ordinary work never approaches it; a fan-out does.
+Stated as its own number rather than derived from `run.RECURSION_LIMIT`, because
+the two bound different things and the first domain that needs wide parallel
+tool use will move this one alone.
+"""
+
+TASK_DISPATCH_LIMIT = 3
+"""`task` dispatches one run may make.
+
+`SUBAGENT_STEP_LIMIT` bounds how far *one* dispatch runs; nothing bounded how
+many there are. With 12 parent round trips and a 25-step subagent, twelve
+dispatches is ~144 model calls inside a turn the caller asked to bound at 25
+steps. Three caps the worst case at roughly 37 — and a delegating agent that
+needs a fourth subagent to answer one turn is a agent that has lost the thread,
+not one that needs a wider budget.
 """
 
 LIBRARY_SUBAGENT_STEP_LIMIT = 9999
@@ -323,6 +353,49 @@ def compiled_tools(agent: CompiledStateGraph[Any, Any, Any, Any]) -> dict[str, A
 def compiled_tool_names(agent: CompiledStateGraph[Any, Any, Any, Any]) -> frozenset[str]:
     """Tool names actually bound in a compiled agent."""
     return frozenset(compiled_tools(agent))
+
+
+def call_limits() -> list[ToolCallLimitMiddleware]:
+    """The two per-run call bounds `build_agent` installs on every agent.
+
+    Build-time rather than a `RunBounds` field: these are middleware, and
+    middleware is fixed when the graph compiles, while `RunBounds` is chosen per
+    invocation. Both numbers therefore belong here, beside the other bounds on
+    capabilities we *do* grant.
+
+    Typed as the concrete class rather than `AgentMiddleware`, so a test can
+    read `run_limit` and `exit_behavior` back off it. A bound stated in a
+    constructor call and never read again is a bound nothing checks.
+
+    `run_limit`, never `thread_limit`: a thread limit counts across a
+    checkpointed conversation, and the graph carries no checkpointer by default,
+    so it would be a bound that never counts.
+
+    `exit_behavior="continue"` blocks the exceeded call and lets the agent
+    answer with what it already has. `"error"` would turn a model that asked for
+    too much into a crashed turn, and the run is bounded twice over already by
+    the step limit and the deadline; this bound exists to stop *spend*, not to
+    stop the turn. The blocked call is visible in the mirror as a tool message,
+    which is where a reader looks for what a run actually did.
+    """
+    limits = [
+        ToolCallLimitMiddleware(run_limit=TOOL_CALL_LIMIT, exit_behavior="continue"),
+        ToolCallLimitMiddleware(
+            tool_name=SUBAGENT_TASK_TOOL_NAME,
+            run_limit=TASK_DISPATCH_LIMIT,
+            exit_behavior="continue",
+        ),
+    ]
+    # Postcondition: deepagents merges middleware by `.name`, so two entries
+    # sharing one would mean the second silently replacing the first. The names
+    # are the library's to choose (`ToolCallLimitMiddleware[task]` today), which
+    # is exactly why this is read back rather than assumed.
+    names = [m.name for m in limits]
+    require(
+        len(set(names)) == len(names),
+        f"the call limits share a middleware name ({names}); one would replace the other",
+    )
+    return limits
 
 
 def bound_step_limit(graph: CompiledStateGraph[Any, Any, Any, Any]) -> int | None:
