@@ -31,8 +31,11 @@ it should slot in behind the existing protocols without any existing file changi
 
 ```bash
 uv sync
-cp .env.example .env    # then fill in HF_TOKEN
+cp .env.example .env         # then fill in HF_TOKEN
+uv run pre-commit install    # optional: run the offline gate on every commit
 ```
+
+The hook is configured but not installed by default -- see CLAUDE.md for why.
 
 Only `HF_TOKEN` is required. Tracing switches on if you supply the LangSmith or W&B keys; see
 `.env.example`.
@@ -52,8 +55,8 @@ uv run pytest                    # the offline suite on its own
 uv run pytest -m live > live.log 2>&1   # hits the real router; redirect, never pipe
 ```
 
-`scripts/check.sh` is the single source of truth for the gate: the pre-commit hook and
-`.github/workflows/ci.yml` both call it and re-list nothing.
+`scripts/check.sh` is the single source of truth for the gate: the pre-commit hook (once installed,
+see Setup) and `.github/workflows/ci.yml` both call it and re-list nothing.
 
 ## Where to look
 

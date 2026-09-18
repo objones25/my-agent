@@ -161,6 +161,23 @@ class AgentConfig:
         # `permissions` and `middleware` that means a capability decision that
         # can be changed after it was reviewed. `object.__setattr__` is how a
         # frozen dataclass assigns; it works with `slots=True`.
+        #
+        # The boundary, stated exactly, because overstating it is worse than not
+        # claiming it: `tuple()` is shallow, so what is frozen is the *sequence*
+        # -- its length and which objects are in it. The objects themselves are
+        # deepagents' own mutable classes and are not frozen by this:
+        # `FilesystemPermission` is a dataclass declared `frozen=False`, and
+        # `AgentMiddleware` is an ordinary class. Verified against the installed
+        # wheel: on a rule already inside a validated AgentConfig, both
+        # `rule.paths.append("/")` and `rule.mode = "allow"` succeed, so a
+        # reviewed *deny* rule can still be flipped to *allow* after
+        # construction. Deepcopying instead was considered and rejected --
+        # it would break the identity assertion in
+        # `test_agent_config_freezes_the_rules_it_was_given` and buy little,
+        # since the caller who can reach inside a rule can also build a
+        # different config. What this guarantees is that no rule can be *added*
+        # or *removed* behind the validation; not that each rule's own fields
+        # are immutable.
         object.__setattr__(self, "tools", tuple(self.tools))
         object.__setattr__(self, "middleware", tuple(self.middleware))
         object.__setattr__(self, "permissions", tuple(self.permissions))

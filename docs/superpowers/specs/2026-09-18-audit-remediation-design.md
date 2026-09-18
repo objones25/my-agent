@@ -10,9 +10,10 @@ This spec covers all eight findings, ordered by dependency rather than severity.
 
 ## What this builds
 
-1. **`AgentConfig` that cannot be invalidated after construction.** `frozen=True` today blocks
-   rebinding a field but not mutating the list behind it, so `__post_init__`'s validation is
-   defeatable on the two capability-relevant fields.
+1. **`AgentConfig` whose validated sequences cannot be added to or removed from after
+   construction.** `frozen=True` today blocks rebinding a field but not mutating the list behind
+   it, so `__post_init__`'s validation is defeatable on the two capability-relevant fields. Scoped
+   deliberately: this closes the *sequence*, not the objects inside it — see Task 1 below.
 2. **Two speculative helpers removed.** `check_shape` and `check_finite` have zero call sites and
    serve a domain the project has deliberately not chosen.
 3. **The contract helpers inside the default test gate.** `negative_space.py` is the only module
@@ -102,6 +103,18 @@ object.__setattr__(self, "permissions", tuple(self.permissions))
 already does `list(config.permissions) or None`, and `create_deep_agent` takes `Sequence` for
 `tools` and `middleware`.
 
+**What this does and does not guarantee.** `tuple()` is shallow. It closes the sequence — its
+length, and which objects are in it — so no rule or middleware can be added or removed behind the
+validation. It does **not** make the elements immutable: `deepagents.FilesystemPermission` is a
+dataclass declared `frozen=False` and `AgentMiddleware` is an ordinary class. Verified against the
+installed wheel: on a rule already inside a validated `AgentConfig`, both `rule.paths.append("/")`
+and `rule.mode = "allow"` succeed, so a reviewed *deny* rule can still be flipped to *allow* after
+construction. Deepcopying the elements would close that too, and is declined: it would break the
+identity assertion in `test_agent_config_freezes_the_rules_it_was_given` and buys little, since a
+caller who can reach inside a rule can equally construct a different config. The claim this task
+delivers is therefore the narrow one — the validated *set* of rules is final — not
+"`AgentConfig` cannot be invalidated after construction".
+
 ### Task 2 — remove the speculative helpers
 
 Delete `check_shape` and `check_finite` from `negative_space.py` and from `__all__`. Both have
@@ -109,8 +122,12 @@ zero call sites in `src/` and `tests/`; every apparent use elsewhere is prose in
 are tensor-shape and NaN-loss helpers for a domain CLAUDE.md says is undecided on purpose, which
 is the YAGNI rule the project applies everywhere else.
 
-`bounded()` and `unreachable()` stay. `bounded()` is the agent-loop bound CLAUDE.md explicitly
-promises; `unreachable()` is a three-line idiom. Both get real tests in Task 3.
+`bounded()` and `unreachable()` stay, although they have zero call sites too — they are
+domain-neutral control-flow idioms rather than helpers for an unchosen domain. That asymmetry is
+deliberate and thin, and is recorded under Open questions. Both get real tests in Task 3. What does
+*not* justify keeping `bounded()` is CLAUDE.md's old claim that it is the agent-loop bound: a turn
+is bounded by `run.RunBounds`' step limit and `RunDeadline`, neither of which calls it, and that
+sentence is corrected as part of Task 6.
 
 Deleting `check_shape` removes a cited worked example in two places: `CLAUDE.md:238`
 ("`check_shape` in `negative_space.py` is the worked example") and `docs/findings.md:174`, which
@@ -250,6 +267,37 @@ and the doc citations resolve to real code.
   `fail_under`, and the import mode is the default `prepend` rather than `importlib`. None has bitten
   yet — there are no `xfail`s in the suite, and coverage is reported rather than gated. Worth doing
   when a coverage floor is actually wanted; a floor nobody agreed to is a floor someone lowers.
-- **`bounded()` still has no call site** after this work. It is kept on CLAUDE.md's explicit promise
-  that it is the agent-loop bound. If the next domain slice does not use it, deleting it is the
-  honest follow-up.
+- **`bounded()` still has no call site** after this work, and neither does `unreachable()`. Keeping
+  them while Task 2 deletes `check_shape` and `check_finite` for exactly that reason is a
+  **deliberate asymmetry**, recorded here so the next person deciding does so knowingly rather than
+  rediscovering the inconsistency. The distinction drawn: the two deleted helpers were
+  domain-specific (tensor shapes, NaN losses) for a domain the project has not chosen, whereas
+  `bounded()` and `unreachable()` are domain-neutral control-flow idioms that any slice would use.
+  That is a judgement, not a rule, and it is thin. What the branch does *not* claim any more is
+  that `bounded()` is already load-bearing: CLAUDE.md now says outright that a turn is bounded by
+  `run.RunBounds`' step limit and `RunDeadline`, and that `bounded()` is provided for loops this
+  codebase does not have yet. If the next domain slice does not use it, deleting both is the honest
+  follow-up.
+- **The three freeze tests in `tests/test_agent.py` are near-identical on purpose. Do not
+  parametrize them.** One asserts `tools`, one `middleware`, one `permissions`, and the shape is
+  what makes each one discriminate: the mutation that must turn them red is "coerce only
+  `permissions`", which a single parametrized test over a field name would still catch but a
+  reviewer reading it would no longer see as three independent claims about three fields with
+  different blast radii. Noted because the duplication looks like something to tidy and is not.
+- **Installing `pre-commit` moved a runtime dependency, and nothing pins it.** `pre-commit` pulls
+  `virtualenv`, whose requirement is `filelock<4,>=3.24.2`; that upper bound constrained `filelock`
+  from **4.0.0 down to 3.32.7** in `uv.lock`. `filelock` is not dev-only — `weave` requires
+  `polyfile-weave`, which requires `filelock>=3.20.3`, so this is the weave runtime stack. Verified
+  rather than assumed: `uv run pytest -m live` — the only suite that exercises weave — was run
+  after the change and reported **2 passed, exit 0**. So nothing is broken; it was simply
+  unrecorded. It stays open because nothing pins `filelock` and nothing in the offline gate would
+  notice the next move, so a future resolution can shift it again silently. No `docs/findings.md`
+  F-number: that file's preamble states every finding there is pinned by a test or a load-time
+  check, and a lockfile resolution is neither library behaviour nor pinnable.
+- **Two commits on this branch carry a `Co-Authored-By` line that git does not parse.** `f38e08a`
+  and `4cf5bcc` glue it to the last paragraph with no blank line, so it is body text rather than a
+  trailer — `git log --format='%(trailers:key=Co-Authored-By,valueonly)'` is empty for both.
+  Deliberately not fixed: correcting it means rewriting five commits of an already-reviewed branch,
+  which is a worse trade than a malformed trailer on two of them. Recorded because the fix is
+  available at the same cost for as long as the branch is unpushed, and stops being available the
+  moment it is not.

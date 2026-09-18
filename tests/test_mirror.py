@@ -132,7 +132,11 @@ def test_error_records_carry_no_name_to_join_on(
     mirror.on_chain_error(RuntimeError("boom"), run_id=RUN_ID)
     mirror.on_llm_error(RuntimeError("boom"), run_id=RUN_ID)
 
-    assert all("name" not in record for record in records(stream))
+    written = records(stream)
+    # Count first. `all()` over an empty list is True, so without this a
+    # regression where the handlers write nothing at all would pass.
+    assert len(written) == 2
+    assert all("name" not in record for record in written)
 
 
 def test_record_order_is_event_order(mirror: JsonlMirror, stream: io.StringIO) -> None:

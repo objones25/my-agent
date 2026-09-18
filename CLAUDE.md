@@ -33,7 +33,8 @@ uv run ruff check . --fix                 # lint
 uv run mypy                               # type check (strict; src + tests)
 uv run pyright                            # second type checker (standard; see F16)
 
-# Negative-space audit. First command is the CI gate, second is advisory.
+# The two negative-space audit steps, spelled out so they can be run on their own.
+# `scripts/check.sh` runs both; the first is enforced there, the second advisory.
 uv run python scripts/audit_negative_space.py src/ --select NSP002,NSP003,NSP005,NSP006,NSP007
 uv run python scripts/audit_negative_space.py src/ --select NSP001 --min-assertions 2 || true
 ```
@@ -218,7 +219,11 @@ Bugs live in the states the code was never written to handle. Write those down a
   malformed model output) — handle at the edge. Same predicate, different category, decided by where
   the value came from. Model output is *always* an operating error: it is untrusted input.
 - Every loop, retry, and agent turn gets an explicit bound. An agent that loops forever is the
-  worst failure mode here; `bounded()` exists for exactly this.
+  worst failure mode here. What bounds a turn today is `run.RunBounds` — its `step_limit`, sent as
+  `recursion_limit` on every `run_turn` config, plus the wall-clock `RunDeadline` callback. Neither
+  goes through `bounded()`, and **`bounded()` has no call site in `src/` at all**: it is provided,
+  tested and documented for the iteration loops this codebase does not have yet, so do not go
+  looking for the place it is already used.
 - **A bound belongs to the thing it bounds, not to the call site.** `RECURSION_LIMIT` lived in
   `main.py`, so every other caller of `build_agent` inherited langchain-core's default by accident
   — and that default is *also* 25, which is what made it look like a decision. Both bounds now live
@@ -279,9 +284,16 @@ Two different things; keep them apart.
   the argument leaves the same value in place, so the test passes over the mutant. Record the
   *call* instead (patch the constructor where it is used, delegate to the real one) — F21 is the
   worked example, found only because a mutant survived.
-- "Offline" is enforced, not assumed: an autouse fixture in `tests/conftest.py` fails any test
-  that opens a socket, and steps aside only for `live`. Shared setup (`valid_secret`,
-  `deny_secrets`) lives there too — as fixtures, so no test can leak a mutation into the next.
+- "Offline" is enforced for `tests/`, not assumed: an autouse fixture in `tests/conftest.py` fails
+  any test in that directory that opens a socket, and steps aside only for `live`. Shared setup
+  (`valid_secret`, `deny_secrets`) lives there too — as fixtures, so no test can leak a mutation
+  into the next. **The guard does not reach the `src/` doctests.** A `conftest.py` is
+  directory-scoped, and `src` is in `testpaths`, so those two items run outside the socket block
+  and outside the RNG seeding — confirmed with `pytest --setup-show`, where a doctest item lists no
+  `_forbid_network` fixture and a `tests/` item does. Harmless today: both doctests are pure
+  arithmetic over `require()` and `bounded()` and touch no I/O. If a `src/` doctest ever does, the
+  fix is a small `src/conftest.py` re-exporting the guard rather than moving it to the repo root,
+  which would change what applies to every test in the project.
 - **Evals** (`evals/`, `-m eval`) measure model-dependent behaviour and are allowed to be
   non-deterministic and slow. A failing eval is a signal, not a broken build.
 - `-m live` marks anything touching the HF router, LangSmith, or W&B. `addopts` carries

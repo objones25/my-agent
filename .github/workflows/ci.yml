@@ -7,14 +7,35 @@ on:
     branches: [main]
   pull_request:
 
+# Least privilege, not the platform default. This job reads the tree and writes
+# nothing back -- no checks, no comments, no packages -- so the GITHUB_TOKEN it
+# is handed should reach no further than that.
+permissions:
+  contents: read
+
+# One run per ref. A second push supersedes the first rather than paying for
+# both; the gate is a few seconds, so there is nothing worth preserving.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   gate:
     runs-on: ubuntu-latest
+    # The gate itself is ~15s. This bound exists so a hung step fails instead of
+    # burning the 360-minute default -- the same reason every run here has a
+    # step limit and a deadline.
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      # Major tags are still published and maintained for this action; v7 is the
+      # current major (latest release v7.0.1).
+      - uses: actions/checkout@v7
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        # setup-uv no longer publishes major-version tags -- there is no `v10`
+        # ref -- and its README pins a full commit SHA in every example, for
+        # supply-chain reasons. This is v10.1.0's SHA.
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
           enable-cache: true
 
