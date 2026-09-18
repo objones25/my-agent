@@ -26,6 +26,7 @@ from langchain_core.messages import BaseMessage
 
 from my_agent.agent import AgentConfig, build_agent
 from my_agent.capabilities import (
+    CONTEXT_WINDOW_TOKENS,
     DEFAULT_FILESYSTEM_TOOLS,
     SHELL_TOOL_NAME,
     compiled_tool_names,
@@ -35,7 +36,14 @@ from my_agent.capabilities import (
 from my_agent.mirror import mirror_to_file, run_log_path
 from my_agent.model import REASONING_EFFORTS, ModelConfig, build_model
 from my_agent.negative_space import CheckFailed, require
-from my_agent.run import DeadlineExceeded, StepLimitExceeded, TurnResult, run_turn
+from my_agent.run import (
+    DeadlineExceeded,
+    ResumeLimitExceeded,
+    StepLimitExceeded,
+    TokenLimitExceeded,
+    TurnResult,
+    run_turn,
+)
 from my_agent.tracing import available_backends
 
 EXIT_MISCONFIGURED = 2
@@ -56,14 +64,6 @@ effort we allow was accepted" also passes on a router that accepts everything.
 
 COT_CONTENT_KEYS = ("reasoning", "reasoning_content")
 """Where a provider would put chain-of-thought *text* if it returned any."""
-
-ASSUMED_CONTEXT_TOKENS = 128_000
-"""The context window this harness assumes a provider serves.
-
-gpt-oss natively supports 128k (OpenAI, *Introducing gpt-oss*). The router picks
-among providers, and they do not all advertise the same number — so this is the
-floor a prompt may be sized against, not the ceiling any one provider offers.
-"""
 
 DENIED_PREFIX = "/secrets"
 ALLOWED_PATH = "/notes/smoke.txt"
@@ -336,6 +336,10 @@ def check_every_provider_serves_the_context_we_assume(
     inference: a prompt sized for the largest advertised window is a prompt that
     fails on whichever provider advertises less.
 
+    The floor is `capabilities.CONTEXT_WINDOW_TOKENS`, which is no longer only a
+    reporting number: `COMPACTION_TRIGGER_TOKENS` is sized against it, so a
+    provider dropping below it moves a bound rather than a printed figure.
+
     Asserted on the providers that state a length, and reported for those that
     do not. An unstated window is a real unknown — the mitigation is pinning
     `:provider`, not a check that can never go green — while a *stated* window
@@ -358,14 +362,14 @@ def check_every_provider_serves_the_context_we_assume(
     # stops publishing context lengths at all.
     require(stated, f"no provider states a context length for {config.model}: {sorted(lengths)}")
     shortest = min(stated.values())
-    short = sorted(name for name, n in stated.items() if n < ASSUMED_CONTEXT_TOKENS)
+    short = sorted(name for name, n in stated.items() if n < CONTEXT_WINDOW_TOKENS)
     unstated = sorted(name for name in lengths if name not in stated)
 
     return CheckResult(
         "F25",
         "every provider that states a context window meets our floor",
         not short,
-        f"shortest {shortest} across {len(stated)} providers (floor {ASSUMED_CONTEXT_TOKENS}); "
+        f"shortest {shortest} across {len(stated)} providers (floor {CONTEXT_WINDOW_TOKENS}); "
         f"below floor: {short or 'none'}; unstated (pin :provider to remove the unknown): "
         f"{unstated or 'none'}",
     )
@@ -405,6 +409,24 @@ def _single_turn(config: ModelConfig, prompt: str, callbacks: list[BaseCallbackH
     reply = result[-1]
     require(reply.type != "human", f"last message is still our own turn: {reply.type}")
     print(f"reply:  {reply.text}")
+
+    # A turn can finish and still not have done what it says. Both call limits
+    # run `exit_behavior="continue"`, so an exceeded call comes back as an error
+    # `ToolMessage` and the model answers over the top of it — measured
+    # 2026-09-18 as twenty-four writes executed, six blocked, and a reply
+    # reading "All done! I wrote every file." The reply is still printed,
+    # because it is what the agent said; the exit code stops that from being
+    # the only thing a caller reads.
+    failed = result.failed_tool_calls
+    if failed:
+        for message in failed:
+            print(f"failed: {message.name} — {str(message.content)[:120]}", file=sys.stderr)
+        print(
+            f"error: {len(failed)} tool call(s) did not run, so the reply above is not "
+            f"backed by the work it describes",
+            file=sys.stderr,
+        )
+        return EXIT_CHECK_FAILED
     return 0
 
 
@@ -464,11 +486,19 @@ def main() -> int:
                 exit_code = _single_turn(config, prompt, callbacks)
             else:
                 exit_code = _run_checks(config, callbacks)
-        except (DeadlineExceeded, StepLimitExceeded) as exc:
-            # Both bounds in `RunBounds`, reported the same way. Before
+        except (
+            DeadlineExceeded,
+            ResumeLimitExceeded,
+            StepLimitExceeded,
+            TokenLimitExceeded,
+        ) as exc:
+            # Every bound in `RunBounds`, reported the same way. Before
             # `StepLimitExceeded` existed the step limit escaped as langgraph's
             # `GraphRecursionError` and printed a traceback, so the wall clock
             # was a handled ceiling and the step count was a crash (F24).
+            # `ResumeLimitExceeded` joined them with the bound on how many times
+            # one paused turn may be resumed, and `TokenLimitExceeded` with the
+            # bound on what the turn costs.
             print(f"error: {exc}", file=sys.stderr)
             exit_code = EXIT_CHECK_FAILED
 

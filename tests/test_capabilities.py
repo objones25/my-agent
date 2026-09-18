@@ -23,20 +23,31 @@ from deepagents import (
 )
 from deepagents.backends import FilesystemBackend, StateBackend
 from deepagents.backends.protocol import SandboxBackendProtocol
+from deepagents.middleware.summarization import (
+    compute_summarization_defaults,
+    create_summarization_middleware,
+)
 from deepagents.profiles import _builtin_profiles
 from langchain_core.language_models.fake_chat_models import ParrotFakeChatModel
 from langgraph.graph.state import CompiledStateGraph
+from pydantic import SecretStr
 
 from my_agent.capabilities import (
+    COMPACTION_ARG_TRUNCATION_MESSAGES,
+    COMPACTION_KEEP_MESSAGES,
+    COMPACTION_TRIGGER_TOKENS,
+    CONTEXT_WINDOW_TOKENS,
     DEEPAGENTS_PLUGIN_GROUPS,
     DEFAULT_FILESYSTEM_TOOLS,
     GREP_MATCH_LIMIT,
     HUMAN_MESSAGE_TOKEN_LIMIT,
+    LIBRARY_COMPACTION_TRIGGER_TOKENS,
     SHELL_TOOL_NAME,
     SUBAGENT_TASK_TOOL_NAME,
     TASK_DISPATCH_LIMIT,
     TOOL_CALL_LIMIT,
     TOOL_RESULT_TOKEN_LIMIT,
+    bounded_compaction,
     call_limits,
     compiled_tool_names,
     least_privilege_filesystem,
@@ -44,6 +55,7 @@ from my_agent.capabilities import (
     require_withheld,
     subagent_graphs,
 )
+from my_agent.model import DEFAULT_MODEL, ModelConfig, build_model
 from my_agent.negative_space import CheckFailed
 
 
@@ -396,3 +408,80 @@ def test_call_limits_block_rather_than_abort() -> None:
     turn, and the run is already bounded by the step limit and the deadline."""
     for middleware in call_limits():
         assert middleware.exit_behavior == "continue"
+
+
+# --------------------------------------------------------------------------
+# Compaction: the bound on how much conversation the model ever sees
+# --------------------------------------------------------------------------
+
+
+def test_compaction_trigger_leaves_room_below_the_window_we_assume() -> None:
+    """The whole point of owning the number. A trigger at or above the window
+    can only fire after the provider has already rejected the request."""
+    assert COMPACTION_TRIGGER_TOKENS < CONTEXT_WINDOW_TOKENS
+
+
+def test_deepagents_would_compact_above_the_window_it_is_serving() -> None:
+    """The discriminator, and the reason this bound is stated at all.
+
+    Without it, `test_compaction_trigger_leaves_room_below_the_window_we_assume`
+    keeps passing on the day deepagents picks a sane number for its own reasons,
+    and a bound we merely agree with reads as a bound we set.
+    """
+    assert LIBRARY_COMPACTION_TRIGGER_TOKENS > CONTEXT_WINDOW_TOKENS
+    assert compute_summarization_defaults(ParrotFakeChatModel())["trigger"] == (
+        "tokens",
+        LIBRARY_COMPACTION_TRIGGER_TOKENS,
+    )
+
+
+def test_a_router_model_has_no_profile_for_deepagents_to_size_itself_from() -> None:
+    """Why the library lands on its fallback: `compute_summarization_defaults`
+    picks fraction-of-window thresholds only when the model exposes
+    `max_input_tokens`, and a `org/model` router id resolves to no profile at
+    all. Verified against langchain-openai 1.6.2, 2026-09-18."""
+    model = build_model(ModelConfig(api_key=SecretStr("hf_token_value"), model=DEFAULT_MODEL))
+
+    assert model.profile is None
+    assert compute_summarization_defaults(model)["trigger"] == (
+        "tokens",
+        LIBRARY_COMPACTION_TRIGGER_TOKENS,
+    )
+
+
+def test_bounded_compaction_states_the_thresholds_it_runs_under() -> None:
+    """Passing a bound and having it land are different claims. Read back off
+    the langchain middleware deepagents wraps, which is where they end up."""
+    middleware = bounded_compaction(ParrotFakeChatModel(), StateBackend())
+
+    assert middleware._lc_helper.trigger == ("tokens", COMPACTION_TRIGGER_TOKENS)
+    assert middleware._lc_helper.keep == ("messages", COMPACTION_KEEP_MESSAGES)
+
+
+def test_bounded_compaction_keeps_tool_argument_truncation_switched_on() -> None:
+    """`truncate_args_settings` defaults to `None`, which disables clipping
+    oversized `write_file` arguments entirely — a capability deepagents' own
+    factory switches on and a hand-built replacement silently drops."""
+    middleware = bounded_compaction(ParrotFakeChatModel(), StateBackend())
+
+    assert middleware._truncate_args_trigger == ("messages", COMPACTION_ARG_TRUNCATION_MESSAGES)
+    assert middleware._truncate_args_keep == ("messages", COMPACTION_ARG_TRUNCATION_MESSAGES)
+
+
+def test_bounded_compaction_runs_on_the_backend_it_was_given() -> None:
+    """Compaction offloads the messages it replaces. On a different backend
+    from the filesystem tools, the agent would read files it cannot see."""
+    backend = StateBackend()
+
+    middleware = bounded_compaction(ParrotFakeChatModel(), backend)
+
+    assert middleware._backend is backend
+
+
+def test_bounded_compaction_replaces_deepagents_own_rather_than_joining_it() -> None:
+    """deepagents merges middleware by `.name`. A different name would leave
+    both installed and the library's 170k trigger still in the stack."""
+    ours = bounded_compaction(ParrotFakeChatModel(), StateBackend())
+    theirs = create_summarization_middleware(ParrotFakeChatModel(), StateBackend())
+
+    assert ours.name == theirs.name

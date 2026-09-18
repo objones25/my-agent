@@ -26,23 +26,30 @@ from dotenv import load_dotenv
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
-from langchain_core.outputs import ChatGeneration, ChatResult
+from langchain_core.outputs import ChatGeneration, ChatResult, LLMResult
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.errors import GraphRecursionError
 from langgraph.types import Command, Interrupt
 
 from my_agent.agent import AgentConfig, build_agent
+from my_agent.capabilities import TOOL_CALL_LIMIT
 from my_agent.mirror import JsonlMirror
 from my_agent.model import ModelConfig, build_model
 from my_agent.negative_space import CheckFailed
 from my_agent.run import (
     RECURSION_LIMIT,
+    RESUME_LIMIT,
     RUN_DEADLINE_S,
+    TOKEN_LIMIT,
     DeadlineExceeded,
+    ResumeLimitExceeded,
     RunBounds,
     RunDeadline,
+    RunTokenBudget,
     StepLimitExceeded,
+    TokenLimitExceeded,
+    TurnResult,
     resume_turn,
     run_turn,
 )
@@ -835,3 +842,428 @@ def test_run_turn_names_the_tool_call_that_was_left_unanswered() -> None:
 
     with pytest.raises(CheckFailed, match="t9"):
         run_turn(FakeGraph(), "b", history=orphaned)
+
+
+# --------------------------------------------------------------------------
+# A tool call that failed is an outcome too
+#
+# `exit_behavior="continue"` on the call limits means an exceeded call is
+# blocked and the agent answers with what it already has. Before these, the
+# only record of that was the mirror — a file for a human — so a turn cut short
+# by the harness's own ceiling returned exactly like a clean one.
+# --------------------------------------------------------------------------
+
+
+class ToolFailingGraph:
+    """A graph whose tool call came back as an error, the way a real one does."""
+
+    def invoke(self, _payload: Any, _config: RunnableConfig | None = None) -> dict[str, Any]:
+        return {
+            "messages": [
+                HumanMessage("write it"),
+                AIMessage(
+                    content="",
+                    tool_calls=[{"name": "write_file", "args": {}, "id": "t1"}],
+                ),
+                ToolMessage(
+                    content="Error: permission denied",
+                    tool_call_id="t1",
+                    name="write_file",
+                    status="error",
+                ),
+                AIMessage("All done!"),
+            ]
+        }
+
+
+def test_a_turn_reports_the_tool_calls_that_came_back_as_errors() -> None:
+    """The claim: a caller can tell that the agent's confident summary is not
+    backed by the work it describes, without reading the log file."""
+    result = run_turn(ToolFailingGraph(), "write it")
+
+    assert [m.name for m in result.failed_tool_calls] == ["write_file"]
+
+
+def test_a_turn_whose_tools_all_succeeded_reports_no_failures() -> None:
+    """The discriminator. Without it, `failed_tool_calls` returning everything
+    would satisfy the test above."""
+    graph = FakeGraph(
+        {
+            "messages": [
+                HumanMessage("a"),
+                AIMessage(content="", tool_calls=[{"name": "ls", "args": {}, "id": "t1"}]),
+                ToolMessage(content="[]", tool_call_id="t1", name="ls"),
+                AIMessage("done"),
+            ]
+        }
+    )
+
+    result = run_turn(graph, "a")
+
+    assert result.failed_tool_calls == ()
+
+
+def test_a_completed_turn_with_no_tools_at_all_reports_no_failures() -> None:
+    assert run_turn(FakeGraph(), "ping").failed_tool_calls == ()
+
+
+class FanningOutModel(BaseChatModel):
+    """A model that asks for `width` tools a turn until it is cut off.
+
+    Exists because the call limits are middleware: nothing about them is
+    reachable through a fake *graph*, and the failure they produce — a blocked
+    call the agent then talks over — only appears on a real compiled agent.
+    """
+
+    width: int = 6
+    turns_before_answering: int = 5
+    calls: int = 0
+
+    @property
+    def _llm_type(self) -> str:
+        return "fanning-out"
+
+    def bind_tools(self, tools: Any, **kwargs: Any) -> BaseChatModel:
+        return self
+
+    def _generate(self, messages: Any, stop: Any = None, run_manager: Any = None, **kw: Any) -> Any:
+        self.calls += 1
+        if self.calls > self.turns_before_answering:
+            return ChatResult(
+                generations=[ChatGeneration(message=AIMessage("All done! I wrote every file."))]
+            )
+        tool_calls = [
+            {
+                "name": "write_file",
+                "args": {"file_path": f"/f{self.calls}-{i}.txt", "content": "x"},
+                "id": f"c{self.calls}-{i}",
+            }
+            for i in range(self.width)
+        ]
+        answer = AIMessage("", tool_calls=tool_calls)
+        return ChatResult(generations=[ChatGeneration(message=answer)])
+
+
+def test_a_turn_stopped_by_the_tool_call_limit_says_so() -> None:
+    """The regression this property exists for, end to end on a real graph.
+
+    Measured 2026-09-18 before it was added: thirty tool calls requested,
+    `TOOL_CALL_LIMIT` executed, the rest blocked, and the agent signing off with
+    "All done!" — while `run_turn` returned a result whose only outcome fields
+    were `paused` and `interrupts`, both of them clean.
+    """
+    result = run_turn(build_agent(FanningOutModel()), "write me thirty files")
+
+    executed = [m for m in result.messages if isinstance(m, ToolMessage) and m.status != "error"]
+    assert len(executed) == TOOL_CALL_LIMIT
+    assert len(result.failed_tool_calls) == 6
+    assert not result.paused
+
+
+def test_a_turn_inside_the_tool_call_limit_blocks_nothing() -> None:
+    """The discriminator: the same graph and the same model, fanning out
+    narrowly enough to stay inside the ceiling."""
+    model = FanningOutModel(width=2, turns_before_answering=3)
+
+    result = run_turn(build_agent(model), "write me six files")
+
+    assert result.failed_tool_calls == ()
+
+
+# --------------------------------------------------------------------------
+# A pause must not be a way around the bounds
+#
+# Every bound `run_turn` applies is per *invocation*: a fresh `RunDeadline`
+# starting now, and `recursion_limit` sent again in full. So a turn paused and
+# approved ten times used to get ten complete budgets, and "a turn is bounded"
+# quietly stopped being true the moment the human gate was used.
+# --------------------------------------------------------------------------
+
+
+def _budget_of(config: RunnableConfig | None) -> RunTokenBudget:
+    """The token budget that actually reached the graph, so its allowance can be
+    read back — on a resume it is the turn's remainder, not a fresh one."""
+    return next(h for h in _handlers(config) if isinstance(h, RunTokenBudget))
+
+
+def _deadline_of(config: RunnableConfig | None) -> RunDeadline:
+    """The deadline that actually reached the graph, so its budget can be read
+    back. A resume that silently got a fresh one is the defect being tested."""
+    return next(h for h in _handlers(config) if isinstance(h, RunDeadline))
+
+
+class AlwaysPausingGraph:
+    """Pauses on every invoke, including the resumes. Real enough to exhaust a
+    resume bound with, which one pause followed by one completion cannot."""
+
+    def __init__(self) -> None:
+        self.checkpointer = object()
+        self.config: RunnableConfig | None = None
+        self.invocations = 0
+
+    def invoke(self, _payload: Any, config: RunnableConfig | None = None) -> dict[str, Any]:
+        self.config = config
+        self.invocations += 1
+        return _paused_result()
+
+
+def test_a_finished_turn_reports_the_wall_clock_it_consumed() -> None:
+    """Without this the turn's own spend is unreadable, and `resume_turn` has
+    nothing to subtract a remaining budget from."""
+    result = run_turn(SteppingGraph(steps=3), "ping")
+
+    assert result.elapsed_s > 0.0
+
+
+def test_a_resumed_turn_gets_only_the_wall_clock_the_pause_left_over() -> None:
+    """The bound made whole. 600s spent before the pause plus a fresh 600s after
+    it is a 1200s turn that every docstring here calls 600s."""
+    graph = PausingGraph()
+    paused = TurnResult(messages=run_turn(graph, "write it", thread_id="t").messages,
+                        interrupts=run_turn(graph, "write it", thread_id="t").interrupts,
+                        thread_id="t",
+                        elapsed_s=550.0)
+
+    resume_turn(graph, paused, [{"type": "approve"}], bounds=RunBounds(deadline_s=600.0))
+
+    assert _deadline_of(graph.config).budget_s == pytest.approx(50.0)
+
+
+def test_a_resume_is_refused_once_the_turn_has_spent_its_whole_budget() -> None:
+    """A remaining budget of zero is not a very short deadline, it is a turn
+    that is already over — and `RunDeadline` refuses a non-positive budget, so
+    the failure has to be named here or it arrives as a broken contract."""
+    graph = PausingGraph()
+    paused = TurnResult(
+        messages=[HumanMessage("write it")],
+        interrupts=run_turn(graph, "write it", thread_id="t").interrupts,
+        thread_id="t",
+        elapsed_s=600.0,
+    )
+
+    with pytest.raises(DeadlineExceeded, match="before it was resumed"):
+        resume_turn(graph, paused, [{"type": "approve"}], bounds=RunBounds(deadline_s=600.0))
+
+
+def test_a_resumed_turn_adds_its_own_time_to_the_turns_running_total() -> None:
+    """Elapsed accumulates across the halves of one turn, which is what makes
+    the subtraction above correct on the second resume as well as the first."""
+    graph = PausingGraph()
+    paused = TurnResult(
+        messages=[HumanMessage("write it")],
+        interrupts=run_turn(graph, "write it", thread_id="t").interrupts,
+        thread_id="t",
+        elapsed_s=42.0,
+    )
+
+    resumed = resume_turn(graph, paused, [{"type": "approve"}])
+
+    assert resumed.elapsed_s > 42.0
+
+
+def test_each_resume_counts_towards_the_bound_on_how_many_a_turn_may_have() -> None:
+    graph = AlwaysPausingGraph()
+    first = run_turn(graph, "write it", thread_id="t")
+
+    second = resume_turn(graph, first, [{"type": "approve"}])
+    third = resume_turn(graph, second, [{"type": "approve"}])
+
+    assert (first.resumes, second.resumes, third.resumes) == (0, 1, 2)
+
+
+def test_a_turn_may_not_be_resumed_more_often_than_its_bound_allows() -> None:
+    """The bound the wall clock cannot express: a human who approves promptly
+    every time never spends the deadline, and the step limit restarts at full
+    on each half. Something has to count the halves."""
+    graph = AlwaysPausingGraph()
+    result = run_turn(graph, "write it", thread_id="t")
+
+    for _ in range(RESUME_LIMIT):
+        result = resume_turn(graph, result, [{"type": "approve"}])
+
+    with pytest.raises(ResumeLimitExceeded, match=str(RESUME_LIMIT)):
+        resume_turn(graph, result, [{"type": "approve"}])
+
+
+def test_a_turn_inside_the_resume_bound_is_still_resumable() -> None:
+    """The discriminator: a bound that refused the first resume would satisfy
+    the test above just as well."""
+    graph = AlwaysPausingGraph()
+    paused = run_turn(graph, "write it", thread_id="t")
+
+    resumed = resume_turn(graph, paused, [{"type": "approve"}])
+
+    assert resumed.paused
+    assert graph.invocations == 2
+
+
+def test_run_bounds_default_the_resume_limit_to_the_module_constant() -> None:
+    assert RunBounds().resume_limit == RESUME_LIMIT
+
+
+@pytest.mark.parametrize("limit", [-1, -25])
+def test_run_bounds_reject_a_resume_limit_below_zero(limit: int) -> None:
+    """Zero is meaningful — a turn that may pause but never be resumed — so the
+    floor is zero rather than one."""
+    with pytest.raises(CheckFailed, match="resume_limit"):
+        RunBounds(resume_limit=limit)
+
+
+def test_the_resume_limit_is_an_operating_error_not_a_broken_contract() -> None:
+    """A human who keeps approving is the outside world being persistent, not a
+    caller of ours passing something impossible. Reported at the edge, like the
+    other two bounds in `RunBounds`."""
+    assert issubclass(ResumeLimitExceeded, RuntimeError)
+    assert not issubclass(ResumeLimitExceeded, CheckFailed)
+
+
+# --------------------------------------------------------------------------
+# The bound the other three cannot express: what the turn costs
+#
+# `step_limit` counts graph steps, `deadline_s` counts seconds and
+# `resume_limit` counts halves. None of them counts tokens, and tokens are what
+# a turn is billed for — a fan-out of cheap steps against a 96,000-token
+# conversation is a large bill inside every existing bound.
+# --------------------------------------------------------------------------
+
+
+def _usage_report(total: int) -> LLMResult:
+    """What `on_llm_end` carries back from a real call, narrowed to the field
+    the budget reads."""
+    message = AIMessage(
+        "ok",
+        usage_metadata={"input_tokens": total, "output_tokens": 0, "total_tokens": total},
+    )
+    return LLMResult(generations=[[ChatGeneration(message=message)]])
+
+
+class SpendingGraph:
+    """A graph that reports token usage to its callbacks, the way a real one
+    does. Used to prove the budget stops a run rather than merely counting it."""
+
+    def __init__(self, calls: int, tokens_each: int) -> None:
+        self.calls = calls
+        self.tokens_each = tokens_each
+        self.completed = 0
+
+    def invoke(self, _payload: Any, config: RunnableConfig | None = None) -> dict[str, Any]:
+        handlers = _handlers(config)
+        for _ in range(self.calls):
+            for handler in handlers:
+                handler.on_chat_model_start({}, [[]], run_id=uuid4())
+            for handler in handlers:
+                handler.on_llm_end(_usage_report(self.tokens_each), run_id=uuid4())
+            self.completed += 1
+        return _two_messages()
+
+
+def test_the_token_budget_adds_up_what_each_model_call_reported() -> None:
+    budget = RunTokenBudget(1000)
+
+    budget.on_llm_end(_usage_report(120), run_id=uuid4())
+    budget.on_llm_end(_usage_report(80), run_id=uuid4())
+
+    assert budget.tokens == 200
+
+
+def test_the_token_budget_stops_the_next_call_once_the_allowance_is_gone() -> None:
+    """Checked when a call is about to start, like the deadline: the spend that
+    crossed the line is already paid for, the one after it is not."""
+    budget = RunTokenBudget(100)
+    budget.on_llm_end(_usage_report(101), run_id=uuid4())
+
+    with pytest.raises(TokenLimitExceeded, match="101"):
+        budget.on_chat_model_start({}, [[]], run_id=uuid4())
+
+
+def test_the_token_budget_counts_calls_that_reported_no_usage_at_all() -> None:
+    """A provider that omits usage makes this bound blind, and a blind bound
+    that says nothing is worse than none. The router does report it (F2
+    asserts so live), which is exactly why a silent change would go unnoticed."""
+    budget = RunTokenBudget(100)
+
+    silent = LLMResult(generations=[[ChatGeneration(message=AIMessage("ok"))]])
+
+    budget.on_llm_end(silent, run_id=uuid4())
+
+    assert budget.tokens == 0
+    assert budget.unmeasured_calls == 1
+
+
+def test_the_token_budget_does_not_let_langchain_swallow_its_own_failure() -> None:
+    budget = RunTokenBudget(100)
+
+    assert budget.raise_error is True
+    assert budget.run_inline is True
+
+
+def test_the_token_budget_refuses_an_allowance_that_permits_nothing() -> None:
+    with pytest.raises(CheckFailed, match="allowance"):
+        RunTokenBudget(0)
+
+
+def test_run_turn_aborts_a_run_that_spends_past_its_token_limit() -> None:
+    """End to end on the seam: a graph that keeps spending is stopped part-way,
+    not after it finishes."""
+    graph = SpendingGraph(calls=5, tokens_each=1000)
+
+    with pytest.raises(TokenLimitExceeded):
+        run_turn(graph, "ping", bounds=RunBounds(token_limit=1500))
+
+    assert graph.completed < 5
+
+
+def test_run_turn_lets_a_run_inside_its_token_limit_finish() -> None:
+    """The discriminating half: the same graph, an allowance it fits inside."""
+    graph = SpendingGraph(calls=5, tokens_each=1000)
+
+    result = run_turn(graph, "ping", bounds=RunBounds(token_limit=TOKEN_LIMIT))
+
+    assert graph.completed == 5
+    assert result.tokens == 5000
+
+
+def test_a_resumed_turn_gets_only_the_tokens_the_pause_left_over() -> None:
+    """The same carry-across as the wall clock, for the same reason: a turn
+    approved ten times would otherwise be billed ten full allowances."""
+    graph = PausingGraph()
+    paused = TurnResult(
+        messages=[HumanMessage("write it")],
+        interrupts=run_turn(graph, "write it", thread_id="t").interrupts,
+        thread_id="t",
+        tokens=900,
+    )
+
+    resume_turn(graph, paused, [{"type": "approve"}], bounds=RunBounds(token_limit=1000))
+
+    assert _budget_of(graph.config).allowance == 100
+
+
+def test_a_resume_is_refused_once_the_turn_has_spent_every_token() -> None:
+    graph = PausingGraph()
+    paused = TurnResult(
+        messages=[HumanMessage("write it")],
+        interrupts=run_turn(graph, "write it", thread_id="t").interrupts,
+        thread_id="t",
+        tokens=1000,
+    )
+
+    with pytest.raises(TokenLimitExceeded, match="before it was resumed"):
+        resume_turn(graph, paused, [{"type": "approve"}], bounds=RunBounds(token_limit=1000))
+
+
+def test_run_bounds_default_the_token_limit_to_the_module_constant() -> None:
+    assert RunBounds().token_limit == TOKEN_LIMIT
+
+
+@pytest.mark.parametrize("limit", [0, -1])
+def test_run_bounds_reject_a_token_limit_that_permits_nothing(limit: int) -> None:
+    with pytest.raises(CheckFailed, match="token_limit"):
+        RunBounds(token_limit=limit)
+
+
+def test_the_token_limit_is_an_operating_error_not_a_broken_contract() -> None:
+    """A model that kept talking is the outside world being expensive, not a
+    caller of ours passing something impossible."""
+    assert issubclass(TokenLimitExceeded, RuntimeError)
+    assert not issubclass(TokenLimitExceeded, CheckFailed)

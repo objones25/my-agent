@@ -34,6 +34,7 @@ from uuid import UUID
 
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
+from langchain_core.outputs import LLMResult
 from langchain_core.runnables import RunnableConfig
 
 # The only langgraph imports in this module, and both are about a bound this
@@ -49,13 +50,18 @@ from my_agent.negative_space import CheckFailed, require
 __all__ = [
     "DEFAULT_RUN_BOUNDS",
     "RECURSION_LIMIT",
+    "RESUME_LIMIT",
     "RUN_DEADLINE_S",
+    "TOKEN_LIMIT",
     "DeadlineExceeded",
     "Decision",
     "Invokable",
+    "ResumeLimitExceeded",
     "RunBounds",
     "RunDeadline",
+    "RunTokenBudget",
     "StepLimitExceeded",
+    "TokenLimitExceeded",
     "TurnResult",
     "resume_turn",
     "run_turn",
@@ -88,30 +94,113 @@ RUN_DEADLINE_S = 600.0
 sequence. At 120s per request, `max_retries=2` and 25 steps, a single `invoke`
 could legitimately run for hours. The two bounds compose: one caps a request,
 this caps the run.
+
+Spent across every invocation one turn takes, pauses included: `TurnResult`
+carries what has gone, and `resume_turn` gets the remainder rather than a fresh
+budget. Only time the *agent* spends counts — a human deliberating over an
+approval is not charged for it, because this bounds how long the agent may run,
+not how long a conversation may stay open.
 """
+
+RESUME_LIMIT = 3
+"""Times one paused turn may be resumed.
+
+**The bound the other two cannot express.** `deadline_s` now carries across a
+pause, but a human who approves promptly never spends it; `step_limit` is
+langgraph's `recursion_limit`, which counts supersteps *within one invocation*
+and restarts at full on the next, and the count it reached is not reported back
+in any form this module can read. So a turn paused and approved repeatedly gets
+a complete step budget every time, and nothing counts the halves.
+
+This does. Three is the same reasoning as `capabilities.TASK_DISPATCH_LIMIT`:
+the worst case becomes four step budgets rather than unboundedly many, and a
+turn that needs a fourth round of human approval is a turn that should be
+restarted rather than extended. Zero is a legal value and means a turn may pause but never be
+resumed.
+"""
+
+
+TOKEN_LIMIT = 500_000
+"""Tokens one turn may spend, summed across every model call it makes.
+
+**The bound the other three cannot express.** `step_limit` counts graph steps,
+`deadline_s` counts seconds and `resume_limit` counts halves; a turn is billed
+for none of those. The gap is not theoretical: F30 measured ~2,090 input tokens
+on a one-line prompt because the tool schemas are resent every call, and with
+`capabilities.COMPACTION_TRIGGER_TOKENS` at 96,000 a busy turn can legitimately
+carry a conversation forty times that size into each of its calls.
+
+The arithmetic this sits against: 25 steps buys 12 parent round trips, and
+`TASK_DISPATCH_LIMIT` (3) dispatches of a 25-step subagent buys ~37 model calls
+in one turn. At the compaction ceiling that is ~3.5M tokens — inside every
+existing bound. Half a million is roughly 5% of that worst case and something
+like seventy times an ordinary tool-using turn, so it never bites on real work
+and does bite on a runaway.
+
+A number to revisit with a domain, like the rest: it is the one bound here whose
+right value depends on what a turn is worth.
+"""
+
+
+class TokenLimitExceeded(RuntimeError):
+    """A run spent every token `RunBounds.token_limit` allowed it.
+
+    An *operating* error, like the other three: a model that kept talking is the
+    outside world being expensive, not a caller of ours passing something
+    impossible.
+    """
 
 
 @dataclass(frozen=True, slots=True)
 class RunBounds:
     """Everything one turn is allowed to consume.
 
-    A parameter object rather than two more keyword arguments, for the reason
+    A parameter object rather than four more keyword arguments, for the reason
     `AgentConfig` is one: a bound added later is one new field with a default,
-    and `run_turn`'s signature does not change. It is also the seam a token or
-    cost ceiling belongs on when one is needed — the accounting would be a
-    callback like `RunDeadline`, and the number would be a field here.
+    and `run_turn`'s signature does not change. `token_limit` arrived exactly
+    that way — a number here and a callback beside `RunDeadline`, with no call
+    site changed.
+
+    Four bounds because they count four different things and a turn can exhaust
+    any one of them while the other three are comfortable: steps, seconds,
+    tokens, and the halves a pause splits a turn into. Two of them span a
+    pause (`deadline_s`, `token_limit`), one cannot (`step_limit` — see
+    `RESUME_LIMIT`), and one exists because of that.
 
     Frozen, so a bound cannot be widened after it has been validated.
     """
 
     step_limit: int = RECURSION_LIMIT
+    """Graph steps one *invocation* may take, sent as langgraph's
+    `recursion_limit`. Per invocation and not per turn, on purpose: langgraph
+    restarts the count on a resume and never reports what it reached, so a
+    remainder cannot be computed the way `deadline_s`'s is. `resume_limit` is
+    what bounds the total instead."""
+
     deadline_s: float = RUN_DEADLINE_S
+    """Wall clock the *turn* may spend, across every invocation it takes."""
+
+    token_limit: int = TOKEN_LIMIT
+    """Tokens the *turn* may spend, across every model call and every
+    invocation — subagent calls included, because callbacks reach them."""
+
+    resume_limit: int = RESUME_LIMIT
+    """Times the turn may be resumed after a pause."""
 
     def __post_init__(self) -> None:
         require(
             self.step_limit >= 1, f"step_limit must permit at least one step, got {self.step_limit}"
         )
         require(self.deadline_s > 0.0, f"deadline_s must be positive, got {self.deadline_s}")
+        require(
+            self.token_limit >= 1,
+            f"token_limit must permit at least one token, got {self.token_limit}",
+        )
+        require(
+            self.resume_limit >= 0,
+            f"resume_limit must not be negative, got {self.resume_limit}; zero means a turn "
+            f"may pause but never be resumed",
+        )
 
 
 DEFAULT_RUN_BOUNDS = RunBounds()
@@ -129,6 +218,15 @@ class DeadlineExceeded(RuntimeError):
     An *operating* error, not a broken contract: a slow provider is the outside
     world misbehaving, so the edge reports it rather than crashing with an
     assertion that implies a bug in this code.
+    """
+
+
+class ResumeLimitExceeded(RuntimeError):
+    """One turn was resumed as often as `RunBounds.resume_limit` allowed.
+
+    An *operating* error, for the same reason the other two are: a human who
+    keeps approving is the outside world being persistent, not a caller of ours
+    passing something impossible.
     """
 
 
@@ -177,10 +275,64 @@ class TurnResult:
     fail, it silently starts a second run wearing the first one's name.
     """
 
+    elapsed_s: float = 0.0
+    """Wall clock the *agent* has spent on this turn, across every invocation.
+
+    Carried rather than recomputed, because the thing being bounded spans a
+    pause: `resume_turn` subtracts this from `RunBounds.deadline_s` and runs the
+    second half on the remainder. Time a human spends deciding is not in here —
+    the clock is read when an invocation starts and when it returns, so the gap
+    between them is not charged to the agent.
+    """
+
+    tokens: int = 0
+    """Tokens the turn has spent, across every model call and every invocation.
+
+    Carried for the reason `elapsed_s` is: the bound spans a pause, so
+    `resume_turn` subtracts this from `RunBounds.token_limit` and finishes on
+    the remainder. Unlike the wall clock there is nothing a human can do to
+    make this number grow while they think.
+    """
+
+    resumes: int = 0
+    """How many times this turn has already been resumed.
+
+    The only bound on the total work one paused turn may do. `step_limit` cannot
+    supply one — see `RESUME_LIMIT` — so this is counted here and checked by
+    `resume_turn`.
+    """
+
     @property
     def paused(self) -> bool:
         """Whether the graph stopped waiting for a human decision."""
         return len(self.interrupts) > 0
+
+    @property
+    def failed_tool_calls(self) -> tuple[ToolMessage, ...]:
+        """Every tool call in this turn that came back an error.
+
+        **The outcome that used to be invisible.** A turn has three shapes — it
+        finished, it failed, it paused — and none of them says whether the work
+        the agent describes actually happened. `status="error"` is langchain's
+        authoritative signal and covers all three ways a call comes back
+        unfulfilled: the tool itself failed, a `FilesystemPermission` denied it,
+        or one of `capabilities.call_limits` blocked it.
+
+        That last one is why this is a property of the *turn* rather than
+        something a caller greps the log for. Both call limits run
+        `exit_behavior="continue"`: the exceeded call is replaced by an error
+        `ToolMessage` and the agent answers with what it already has, usually
+        without mentioning the difference. Measured 2026-09-18 against a
+        six-wide fan-out — twenty-four calls executed, six blocked, and the
+        final message read "All done! I wrote every file." A caller reading
+        `paused` and `interrupts` saw a clean turn.
+
+        Deliberately not a `require()`: a failed tool call is not a violated
+        contract of ours, it is a fact about the run that the caller decides
+        what to do with. `main` prints them; a domain with a success criterion
+        is what would eventually fail on them.
+        """
+        return tuple(m for m in self.messages if isinstance(m, ToolMessage) and m.status == "error")
 
     @property
     def action_requests(self) -> tuple[Mapping[str, Any], ...]:
@@ -260,6 +412,21 @@ class RunDeadline(BaseCallbackHandler):
         self._clock = clock
         self._started = clock()
 
+    @property
+    def budget_s(self) -> float:
+        """What this invocation was given. Read back rather than assumed: on a
+        resume it is the *remainder* of the turn's budget, and a resume that
+        silently got a fresh one is the defect this property exists to catch."""
+        return self._budget_s
+
+    @property
+    def elapsed_s(self) -> float:
+        """Wall clock since construction. What `TurnResult.elapsed_s` accumulates,
+        and therefore what the next resume has subtracted from its budget."""
+        elapsed = self._clock() - self._started
+        require(elapsed >= 0.0, f"clock ran backwards: {elapsed}s elapsed since the run started")
+        return elapsed
+
     def _require_time_left(self) -> None:
         elapsed = self._clock() - self._started
         # Negative elapsed time means the clock went backwards, which would make
@@ -298,6 +465,103 @@ class RunDeadline(BaseCallbackHandler):
         self._require_time_left()
 
 
+class RunTokenBudget(BaseCallbackHandler):
+    """Stops a run once it has spent the tokens `RunBounds.token_limit` allowed.
+
+    The same shape as `RunDeadline`, deliberately: it accumulates on the hook
+    that reports a completed call and refuses on the hook that starts the next
+    one, so the spend that crossed the line is paid for and the one after it is
+    not. That is the only granularity available — a token count exists once the
+    call has returned.
+
+    Counts every model call the run makes, subagents included: langgraph's
+    `ensure_config` seeds a subagent's run from the ambient parent config, so
+    the handlers reach it. That matters more here than for the wall clock,
+    because a `task` dispatch is where the tokens actually go.
+    """
+
+    run_inline = True
+    """Count on the main thread, so the total is accumulated in call order."""
+
+    raise_error = True
+    """The default (`False`) makes LangChain swallow exceptions raised in here
+    (F12). A budget that degraded silently would be worse than no budget."""
+
+    def __init__(self, allowance: int) -> None:
+        require(allowance >= 1, f"allowance must permit at least one token, got {allowance}")
+        self._allowance = allowance
+        self._tokens = 0
+        self._unmeasured_calls = 0
+
+    @property
+    def allowance(self) -> int:
+        """What this invocation was given. On a resume it is the turn's
+        remainder, and a resume that silently got a fresh allowance is the
+        defect this property exists to catch."""
+        return self._allowance
+
+    @property
+    def tokens(self) -> int:
+        """Tokens reported so far. What `TurnResult.tokens` accumulates."""
+        return self._tokens
+
+    @property
+    def unmeasured_calls(self) -> int:
+        """Model calls that reported no usage at all, and are therefore not in
+        `tokens`.
+
+        A provider that omits usage makes this bound blind, and a blind bound
+        that says nothing is worse than none. The router does report it — the
+        live F2 check refuses to grade itself without `output_tokens` — so this
+        is the counter that would make a silent change visible rather than a
+        cause for crashing a turn over someone else's response shape.
+        """
+        return self._unmeasured_calls
+
+    @override
+    def on_chat_model_start(
+        self,
+        serialized: dict[str, Any],
+        messages: list[list[BaseMessage]],
+        *,
+        run_id: UUID,
+        parent_run_id: UUID | None = None,
+        **kwargs: Any,
+    ) -> None:
+        if self._tokens > self._allowance:
+            raise TokenLimitExceeded(
+                f"run spent {self._tokens} tokens of the {self._allowance} its token_limit "
+                f"allowed, and was about to make another model call; raise "
+                f"RunBounds.token_limit or lower step_limit"
+            )
+
+    @override
+    def on_llm_end(
+        self,
+        response: LLMResult,
+        *,
+        run_id: UUID,
+        parent_run_id: UUID | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Add up what the call reported.
+
+        `usage_metadata` on the message rather than `response.llm_output`:
+        langchain normalises the former across providers and `mirror.py` reads
+        the same field, so the number this bounds is the number the log shows.
+        """
+        measured = False
+        for batch in response.generations:
+            for generation in batch:
+                usage = getattr(getattr(generation, "message", None), "usage_metadata", None)
+                if not usage:
+                    continue
+                measured = True
+                self._tokens += int(usage.get("total_tokens", 0))
+        if not measured:
+            self._unmeasured_calls += 1
+
+
 _UNKNOWN = object()
 """Sentinel for "this object has no `checkpointer` attribute at all".
 
@@ -327,34 +591,47 @@ def _unanswered_tool_calls(messages: Sequence[BaseMessage]) -> list[str]:
 
 
 def _run_config(
+    deadline: RunDeadline,
+    budget: RunTokenBudget,
     bounds: RunBounds,
     callbacks: Sequence[BaseCallbackHandler],
     thread_id: str | None,
 ) -> RunnableConfig:
     """The config every invocation goes out with, bounds attached.
 
-    The deadline goes ahead of the caller's own handlers so a step that never
-    runs is never recorded as though it had. A `RunnableConfig` rather than a
-    bare dict, so a misspelled key is a type error here instead of a silently
-    ignored bound at run time.
+    The two bounds go ahead of the caller's own handlers so a step that never
+    runs is never recorded as though it had, and both are built by the caller
+    rather than here: on a resume its budget is the turn's *remainder*, which
+    this function has no way to know. A `RunnableConfig` rather than a bare
+    dict, so a misspelled key is a type error here instead of a silently ignored
+    bound at run time.
 
     `thread_id` is omitted entirely when there is none, rather than sent as
     `None`: a checkpointer-less graph does not want the key, and a checkpointed
     one rejects a null thread rather than inventing a thread of its own.
     """
-    handlers: list[BaseCallbackHandler] = [RunDeadline(bounds.deadline_s), *callbacks]
+    handlers: list[BaseCallbackHandler] = [deadline, budget, *callbacks]
     config: RunnableConfig = {"recursion_limit": bounds.step_limit, "callbacks": handlers}
     if thread_id is not None:
         config["configurable"] = {"thread_id": thread_id}
     return config
 
 
-def _invoke(
+def _invoke(  # noqa: PLR0913 — one parameter per thing an invocation carries:
+    # what runs it, what it is sent, how it is configured, what it may consume,
+    # which thread it belongs to, the clock the bound is enforced against, and
+    # the counter the token bound is enforced against, and what the turn had
+    # already spent before this half of it. Folding any pair into an object
+    # would hide one of them, the same reason `run_turn` carries its own six.
     agent: Invokable,
     payload: Any,
     config: RunnableConfig,
+    *,
     bounds: RunBounds,
     thread_id: str | None,
+    deadline: RunDeadline,
+    budget: RunTokenBudget,
+    spent: TurnResult | None = None,
 ) -> TurnResult:
     """Invoke `agent`, translate the step limit, and check what came back.
 
@@ -401,7 +678,18 @@ def _invoke(
             "never be resumed; pass a checkpointer to create_deep_agent or drop the "
             "interrupt-mode permission rules"
         )
-    return TurnResult(messages=messages, interrupts=interrupts, thread_id=thread_id)
+    # Elapsed accumulates across the halves of one turn; the resume count is
+    # incremented by `resume_turn`, which is the only thing that knows a resume
+    # happened. Read off the deadline rather than measured again here, so the
+    # number a caller sees is the same one the bound was enforced against.
+    return TurnResult(
+        messages=messages,
+        interrupts=interrupts,
+        thread_id=thread_id,
+        elapsed_s=(spent.elapsed_s if spent is not None else 0.0) + deadline.elapsed_s,
+        tokens=(spent.tokens if spent is not None else 0) + budget.tokens,
+        resumes=spent.resumes + 1 if spent is not None else 0,
+    )
 
 
 def run_turn(  # noqa: PLR0913 — six is the whole surface: what to run, what to
@@ -475,8 +763,16 @@ def run_turn(  # noqa: PLR0913 — six is the whole surface: what to run, what t
     )
 
     sent: list[BaseMessage] = [*prior, HumanMessage(prompt)]
+    deadline = RunDeadline(bounds.deadline_s)
+    budget = RunTokenBudget(bounds.token_limit)
     result = _invoke(
-        agent, {"messages": sent}, _run_config(bounds, callbacks, thread), bounds, thread
+        agent,
+        {"messages": sent},
+        _run_config(deadline, budget, bounds, callbacks, thread),
+        bounds=bounds,
+        thread_id=thread,
+        deadline=deadline,
+        budget=budget,
     )
 
     # Postcondition, relative to what was sent rather than a fixed floor: with a
@@ -547,8 +843,49 @@ def resume_turn(
             f"each decision needs a type (approve, reject, edit, respond), got {decision!r}",
         )
 
-    config = _run_config(bounds, callbacks, thread_id)
+    # The two bounds a resume used to reset.
+    #
+    # `resume_limit` first, because it is the one that can refuse outright. The
+    # wall clock and the token allowance are then the *remainders* of the turn's
+    # budgets rather than fresh ones: a turn paused and approved ten times used
+    # to get ten complete 600s budgets, which made "pause, then approve" the way
+    # around the bound `_invoke`'s own comment claims a resume cannot drop.
+    if paused.resumes >= bounds.resume_limit:
+        raise ResumeLimitExceeded(
+            f"this turn has already been resumed {paused.resumes} time(s), which is every "
+            f"resume RunBounds.resume_limit ({bounds.resume_limit}) allows. Each half gets a "
+            f"full step_limit of its own — langgraph restarts the count — so an unbounded "
+            f"number of resumes is an unbounded turn. Start a new turn, or raise resume_limit"
+        )
+
+    remaining_s = bounds.deadline_s - paused.elapsed_s
+    if remaining_s <= 0.0:
+        raise DeadlineExceeded(
+            f"the turn spent its whole {bounds.deadline_s}s deadline ({paused.elapsed_s}s) "
+            f"before it was resumed, so there is no budget left to finish it in. Time a human "
+            f"spent deciding is not counted here; this is the agent's own wall clock"
+        )
+
+    remaining_tokens = bounds.token_limit - paused.tokens
+    if remaining_tokens <= 0:
+        raise TokenLimitExceeded(
+            f"the turn spent its whole {bounds.token_limit}-token allowance ({paused.tokens}) "
+            f"before it was resumed, so there is no budget left to finish it in"
+        )
+
+    deadline = RunDeadline(remaining_s)
+    budget = RunTokenBudget(remaining_tokens)
+    config = _run_config(deadline, budget, bounds, callbacks, thread_id)
     # `{"decisions": [...]}`, not a bare list: the middleware subscripts the
     # resume value by name, so a list raises `TypeError: list indices must be
     # integers` from inside langchain (verified 2026-09-18).
-    return _invoke(agent, Command(resume={"decisions": list(decisions)}), config, bounds, thread_id)
+    return _invoke(
+        agent,
+        Command(resume={"decisions": list(decisions)}),
+        config,
+        bounds=bounds,
+        thread_id=thread_id,
+        deadline=deadline,
+        budget=budget,
+        spent=paused,
+    )
