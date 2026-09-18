@@ -12,6 +12,7 @@ request, and `tests/conftest.py` fails any test that opens a socket anyway.
 
 from __future__ import annotations
 
+import dataclasses
 import inspect
 from typing import Any
 
@@ -24,7 +25,7 @@ from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from pydantic import SecretStr
 
-from my_agent.agent import AgentConfig, _agent_kwargs, build_agent
+from my_agent.agent import KNOWN_CREATE_DEEP_AGENT_PARAMS, AgentConfig, _agent_kwargs, build_agent
 from my_agent.capabilities import DEFAULT_FILESYSTEM_TOOLS, SHELL_TOOL_NAME, compiled_tool_names
 from my_agent.model import ModelConfig, build_model
 from my_agent.negative_space import CheckFailed
@@ -259,3 +260,22 @@ def test_adding_a_setting_needs_no_factory_change() -> None:
     kwargs = {**extended.as_kwargs(), "skills": ["./skills/"], "memory": ["./AGENTS.md"]}
 
     assert set(kwargs) <= set(inspect.signature(create_deep_agent).parameters)
+
+
+def test_create_deep_agent_parameters_are_pinned() -> None:
+    """A new upstream parameter must fail the import, not be inherited.
+
+    `check_config_contract` only asserts our fields are real parameters; it
+    cannot see a new one appear. That is the door the shell `execute` tool came
+    through (F4), so the parameter set is pinned the way the tool list is."""
+    assert frozenset(
+        inspect.signature(create_deep_agent).parameters
+    ) == KNOWN_CREATE_DEEP_AGENT_PARAMS
+
+
+def test_agent_config_covers_only_what_is_needed() -> None:
+    """Deliberate YAGNI, pinned so the gap is a decision rather than an accident:
+    the rest are reachable by adding a field, and `build_agent` does not change."""
+    configured = {f.name for f in dataclasses.fields(AgentConfig)}
+    assert configured == {"name", "system_prompt", "tools", "middleware", "permissions"}
+    assert configured < KNOWN_CREATE_DEEP_AGENT_PARAMS

@@ -15,7 +15,7 @@ when this module loads, by name.
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, fields
 from typing import Any
 
@@ -23,18 +23,22 @@ from langchain_openai import ChatOpenAI
 from pydantic import SecretStr
 
 from my_agent.contracts import check_config_contract, pydantic_param_names
-from my_agent.negative_space import require
+from my_agent.negative_space import CheckFailed, require
 
 __all__ = [
     "API_KEY_ENV_VAR",
+    "BASE_URL_ENV_VAR",
     "DEFAULT_MAX_RETRIES",
     "DEFAULT_MODEL",
     "DEFAULT_TEMPERATURE",
     "DEFAULT_TIMEOUT_S",
     "HF_ROUTER_BASE_URL",
+    "MAX_RETRIES_ENV_VAR",
     "MODEL_ENV_VAR",
     "REASONING_EFFORTS",
     "REASONING_EFFORT_ENV_VAR",
+    "TEMPERATURE_ENV_VAR",
+    "TIMEOUT_ENV_VAR",
     "USE_RESPONSES_API",
     "ModelConfig",
     "build_model",
@@ -65,6 +69,10 @@ DEFAULT_MAX_RETRIES = 2
 API_KEY_ENV_VAR = "HF_TOKEN"
 MODEL_ENV_VAR = "MODEL_ID"
 REASONING_EFFORT_ENV_VAR = "REASONING_EFFORT"
+BASE_URL_ENV_VAR = "MODEL_BASE_URL"
+TEMPERATURE_ENV_VAR = "MODEL_TEMPERATURE"
+TIMEOUT_ENV_VAR = "MODEL_TIMEOUT_S"
+MAX_RETRIES_ENV_VAR = "MODEL_MAX_RETRIES"
 
 REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh"})
 """Values the router documents for `reasoning_effort` (Chat Completions body).
@@ -172,39 +180,132 @@ class ModelConfig:
     def from_env(cls, env: Mapping[str, str] | None = None) -> ModelConfig:
         """Read the config from the environment.
 
-        Absent or malformed environment is an *operating* error — the outside
-        world failed to supply something, which is not a bug in this code — so it
-        raises `ValueError` to be handled at the edge rather than tripping a check.
+        Every field is reachable — `_ENV_FIELDS` is checked against the dataclass
+        at import, so a new field that nobody wired up fails the load rather than
+        being quietly unreachable.
+
+        **Everything here is an operating error.** Absent, blank, unparseable, or
+        out-of-range values all came from the outside world, so all of them raise
+        `ValueError` for the edge to report. That includes contract violations:
+        constructing the config can trip a `require()`, and this catches that
+        `CheckFailed` and re-raises it in the right category. Without that,
+        `MODEL_TEMPERATURE=5` would crash with an `AssertionError` traceback
+        implying a bug in this code, rather than telling the user to fix their
+        environment.
 
         `env` is injectable so tests never touch the real process environment.
         """
         source: Mapping[str, str] = os.environ if env is None else env
+        kwargs: dict[str, Any] = {}
 
-        api_key = source.get(API_KEY_ENV_VAR, "").strip()
-        if not api_key:
-            raise ValueError(
-                f"{API_KEY_ENV_VAR} is unset or empty. Set it in .env "
-                f"(see .env.example) or export it before starting the agent."
-            )
+        for spec in _ENV_FIELDS:
+            raw = source.get(spec.env_var)
+            if raw is None:
+                if spec.required:
+                    raise ValueError(
+                        f"{spec.env_var} is unset or empty. Set it in .env "
+                        f"(see .env.example) or export it before starting the agent."
+                    )
+                continue
 
-        model = source.get(MODEL_ENV_VAR, DEFAULT_MODEL).strip()
-        if not model:
-            raise ValueError(f"{MODEL_ENV_VAR} is set but empty; unset it to use the default.")
+            value = raw.strip()
+            if not value:
+                # Set-but-blank is a broken .env line, not a request for the
+                # default. Saying so beats silently ignoring what someone wrote.
+                if spec.required:
+                    raise ValueError(
+                        f"{spec.env_var} is unset or empty. Set it in .env "
+                        f"(see .env.example) or export it before starting the agent."
+                    )
+                raise ValueError(
+                    f"{spec.env_var} is set but empty; unset it to use the default."
+                )
 
-        # Absent means "provider's default", which is the behaviour every run had
-        # before this field existed. A *wrong* value came from the outside world,
-        # so it is an operating error reported at the edge, not a CheckFailed.
-        effort = source.get(REASONING_EFFORT_ENV_VAR, "").strip() or None
-        if effort is not None and effort not in REASONING_EFFORTS:
-            raise ValueError(
-                f"{REASONING_EFFORT_ENV_VAR}={effort!r} is not one of "
-                f"{sorted(REASONING_EFFORTS)}; unset it to use the provider's default."
-            )
+            try:
+                kwargs[spec.name] = spec.parse(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"{spec.env_var}={value!r} is not a valid {spec.name}: {exc}"
+                ) from exc
 
-        return cls(api_key=SecretStr(api_key), model=model, reasoning_effort=effort)
+        try:
+            return cls(**kwargs)
+        except CheckFailed as exc:
+            raise ValueError(f"{_blame(exc, kwargs)}{exc}") from exc
 
 
 check_config_contract(ModelConfig, _CHAT_OPENAI_PARAMS, "ChatOpenAI", _MODEL_INJECTED_PARAMS)
+
+
+# --------------------------------------------------------------------------
+# The environment -> ModelConfig table, and the check that keeps it complete
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class _EnvField:
+    """One field, the variable that sets it, and how to read it."""
+
+    name: str
+    """A `ModelConfig` field name. Checked against the dataclass at import."""
+    env_var: str
+    parse: Callable[[str], Any]
+    required: bool = False
+
+
+_ENV_FIELDS: tuple[_EnvField, ...] = (
+    _EnvField("api_key", API_KEY_ENV_VAR, SecretStr, required=True),
+    _EnvField("model", MODEL_ENV_VAR, str),
+    _EnvField("base_url", BASE_URL_ENV_VAR, str),
+    _EnvField("temperature", TEMPERATURE_ENV_VAR, float),
+    _EnvField("timeout", TIMEOUT_ENV_VAR, float),
+    _EnvField("max_retries", MAX_RETRIES_ENV_VAR, int),
+    _EnvField("reasoning_effort", REASONING_EFFORT_ENV_VAR, str),
+)
+"""Data, not code, so adding a setting stays one new field plus one row here.
+
+A table rather than reflection over annotations on purpose: inferred variable
+names would be implicit and inferred parsers would produce generic errors, and
+this module pays for explicitness everywhere else.
+"""
+
+# The point of the table. `from_env` was hand-maintained and drifted: it read
+# three of seven fields, so `base_url` was unreachable from the environment while
+# this module's own docstring promised a dedicated endpoint needed "no code
+# change". Defining the mapping as data lets a check assert it covers the
+# dataclass, the same way DEFAULT_FILESYSTEM_TOOLS is defined by subtraction and
+# then asserted. A new field now fails the import instead of being forgotten.
+_MODEL_CONFIG_FIELDS = {f.name for f in fields(ModelConfig)}
+_ENV_FIELD_NAMES = {spec.name for spec in _ENV_FIELDS}
+
+require(
+    not (_MODEL_CONFIG_FIELDS - _ENV_FIELD_NAMES),
+    f"ModelConfig fields unreachable from the environment: "
+    f"{sorted(_MODEL_CONFIG_FIELDS - _ENV_FIELD_NAMES)}; add a row to _ENV_FIELDS",
+)
+require(
+    not (_ENV_FIELD_NAMES - _MODEL_CONFIG_FIELDS),
+    f"_ENV_FIELDS names that are not ModelConfig fields: "
+    f"{sorted(_ENV_FIELD_NAMES - _MODEL_CONFIG_FIELDS)}",
+)
+require(
+    len({spec.env_var for spec in _ENV_FIELDS}) == len(_ENV_FIELDS),
+    "two _ENV_FIELDS rows share an environment variable; one would shadow the other",
+)
+
+
+def _blame(exc: CheckFailed, kwargs: dict[str, Any]) -> str:
+    """Name the variable at fault, when the failed check names its field.
+
+    Every `require()` message in `__post_init__` starts with the field name, so
+    this maps the failure back to the variable the user actually has to edit.
+    A heuristic for the message only — correctness does not depend on it, and it
+    degrades to no prefix when it cannot tell.
+    """
+    for spec in _ENV_FIELDS:
+        if spec.name in kwargs and str(exc).startswith(spec.name):
+            return f"{spec.env_var}: "
+    return ""
 
 
 # --------------------------------------------------------------------------

@@ -67,6 +67,56 @@ DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant."
 
 _CREATE_DEEP_AGENT_PARAMS = frozenset(inspect.signature(create_deep_agent).parameters)
 
+KNOWN_CREATE_DEEP_AGENT_PARAMS = frozenset(
+    {
+        "model",
+        "tools",
+        "system_prompt",
+        "middleware",
+        "subagents",
+        "skills",
+        "memory",
+        "permissions",
+        "backend",
+        "interrupt_on",
+        "response_format",
+        "state_schema",
+        "context_schema",
+        "checkpointer",
+        "store",
+        "debug",
+        "name",
+        "cache",
+    }
+)
+"""Every parameter `create_deep_agent` had when this code was reviewed (0.7.15).
+
+`check_config_contract` asserts our *fields* are real parameters. It cannot
+notice a **new** parameter appearing — and a new parameter is exactly how the
+shell `execute` tool arrived switched on with no opt-in (F4). Least privilege
+says a capability is off unless something turns it on deliberately, so an
+upstream addition has to be reviewed rather than inherited.
+
+Pinning the set makes that review mandatory: a deepagents upgrade that adds a
+parameter fails this import, by name, instead of changing behaviour quietly.
+Adding the name here is the deliberate acceptance.
+"""
+
+_NEW_PARAMS = _CREATE_DEEP_AGENT_PARAMS - KNOWN_CREATE_DEEP_AGENT_PARAMS
+require(
+    not _NEW_PARAMS,
+    f"create_deep_agent gained parameters {sorted(_NEW_PARAMS)}. Review each for what it "
+    f"enables by default before adding it to KNOWN_CREATE_DEEP_AGENT_PARAMS — this is the "
+    f"same door the shell `execute` tool came through (F4).",
+)
+
+_REMOVED_PARAMS = KNOWN_CREATE_DEEP_AGENT_PARAMS - _CREATE_DEEP_AGENT_PARAMS
+require(
+    not _REMOVED_PARAMS,
+    f"create_deep_agent no longer accepts {sorted(_REMOVED_PARAMS)}; "
+    f"AgentConfig and this pin must change together",
+)
+
 _AGENT_INJECTED_PARAMS = frozenset({"model"})
 
 # --------------------------------------------------------------------------

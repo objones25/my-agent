@@ -11,6 +11,7 @@ All offline: `ChatOpenAI` builds lazily and makes no request.
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any
 
 import pytest
@@ -18,12 +19,20 @@ from langchain_openai import ChatOpenAI
 from pydantic import SecretStr
 
 from my_agent.model import (
+    _ENV_FIELDS,
     API_KEY_ENV_VAR,
+    BASE_URL_ENV_VAR,
+    DEFAULT_MAX_RETRIES,
     DEFAULT_MODEL,
+    DEFAULT_TEMPERATURE,
+    DEFAULT_TIMEOUT_S,
     HF_ROUTER_BASE_URL,
+    MAX_RETRIES_ENV_VAR,
     MODEL_ENV_VAR,
     REASONING_EFFORT_ENV_VAR,
     REASONING_EFFORTS,
+    TEMPERATURE_ENV_VAR,
+    TIMEOUT_ENV_VAR,
     USE_RESPONSES_API,
     ModelConfig,
     build_model,
@@ -251,3 +260,94 @@ def test_from_env_rejects_an_invalid_reasoning_effort(valid_key: str) -> None:
 
 def test_from_env_leaves_reasoning_effort_unset_when_absent(valid_key: str) -> None:
     assert ModelConfig.from_env({API_KEY_ENV_VAR: valid_key}).reasoning_effort is None
+
+
+# --------------------------------------------------------------------------
+# from_env reaches every field (F19)
+# --------------------------------------------------------------------------
+
+
+def test_every_field_is_reachable_from_the_environment() -> None:
+    """The check that `from_env` cannot drift again. It previously read three of
+    seven fields, leaving `base_url` unreachable while this module's docstring
+    promised a dedicated endpoint needed no code change."""
+    assert {f.name for f in dataclasses.fields(ModelConfig)} == {
+        spec.name for spec in _ENV_FIELDS
+    }
+
+
+def test_env_var_names_are_unique() -> None:
+    """Two rows sharing a variable would mean one silently shadows the other."""
+    names = [spec.env_var for spec in _ENV_FIELDS]
+    assert len(set(names)) == len(names)
+
+
+def test_from_env_reads_the_base_url(valid_key: str) -> None:
+    """The bug this fixes: pointing at a dedicated Inference Endpoint used to
+    require editing source, despite the docstring promising otherwise."""
+    endpoint = "https://abc123.us-east-1.aws.endpoints.huggingface.cloud/v1"
+    config = ModelConfig.from_env({API_KEY_ENV_VAR: valid_key, BASE_URL_ENV_VAR: endpoint})
+    assert config.base_url == endpoint
+
+
+def test_from_env_reads_the_numeric_fields(valid_key: str) -> None:
+    config = ModelConfig.from_env(
+        {
+            API_KEY_ENV_VAR: valid_key,
+            TEMPERATURE_ENV_VAR: "0.7",
+            TIMEOUT_ENV_VAR: "30.5",
+            MAX_RETRIES_ENV_VAR: "5",
+        }
+    )
+    assert (config.temperature, config.timeout, config.max_retries) == (0.7, 30.5, 5)
+
+
+@pytest.mark.parametrize(
+    ("env_var", "value"),
+    [
+        (TEMPERATURE_ENV_VAR, "warm"),
+        (TIMEOUT_ENV_VAR, "soon"),
+        (MAX_RETRIES_ENV_VAR, "2.5"),
+    ],
+)
+def test_from_env_rejects_an_unparseable_value(valid_key: str, env_var: str, value: str) -> None:
+    """Naming the variable matters: the user has to know which line to edit."""
+    with pytest.raises(ValueError, match=env_var):
+        ModelConfig.from_env({API_KEY_ENV_VAR: valid_key, env_var: value})
+
+
+def test_from_env_reports_an_out_of_range_value_as_an_operating_error(valid_key: str) -> None:
+    """The taxonomy fix. `MODEL_TEMPERATURE=5` parses fine and then trips a
+    `require()` — but the value came from the environment, so it must surface as
+    a ValueError for the edge to report, not an AssertionError traceback."""
+    with pytest.raises(ValueError, match="temperature") as caught:
+        ModelConfig.from_env({API_KEY_ENV_VAR: valid_key, TEMPERATURE_ENV_VAR: "5"})
+    assert not isinstance(caught.value, CheckFailed)
+
+
+def test_an_out_of_range_value_names_the_variable_at_fault(valid_key: str) -> None:
+    with pytest.raises(ValueError, match=TEMPERATURE_ENV_VAR):
+        ModelConfig.from_env({API_KEY_ENV_VAR: valid_key, TEMPERATURE_ENV_VAR: "5"})
+
+
+@pytest.mark.parametrize(
+    "env_var", [MODEL_ENV_VAR, BASE_URL_ENV_VAR, TEMPERATURE_ENV_VAR, REASONING_EFFORT_ENV_VAR]
+)
+def test_from_env_rejects_a_blank_optional_variable(valid_key: str, env_var: str) -> None:
+    """A blank line in .env is a broken line, not a request for the default."""
+    with pytest.raises(ValueError, match="set but empty"):
+        ModelConfig.from_env({API_KEY_ENV_VAR: valid_key, env_var: ""})
+
+
+def test_from_env_still_falls_back_to_every_default(valid_key: str) -> None:
+    config = ModelConfig.from_env({API_KEY_ENV_VAR: valid_key})
+    assert (config.model, config.base_url, config.temperature) == (
+        DEFAULT_MODEL,
+        HF_ROUTER_BASE_URL,
+        DEFAULT_TEMPERATURE,
+    )
+    assert (config.timeout, config.max_retries, config.reasoning_effort) == (
+        DEFAULT_TIMEOUT_S,
+        DEFAULT_MAX_RETRIES,
+        None,
+    )

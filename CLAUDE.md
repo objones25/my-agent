@@ -218,7 +218,7 @@ Two different things; keep them apart.
 Recorded from `inspect` against the installed wheels on 2026-09-17. Re-verify after any `uv sync`
 that moves these versions.
 
-**`docs/findings.md` is the full record** — eighteen verified library and tooling behaviours (F1–F18), each with
+**`docs/findings.md` is the full record** — nineteen verified library and tooling behaviours (F1–F19), each with
 how it was checked, what the code does about it, and what is still unverified. Read it before
 debugging anything that looks like a library bug, and add to it when you verify something new. The
 summary below covers only what is needed to write code day to day.
@@ -411,7 +411,7 @@ tests/                # deterministic, offline by default — one file per sourc
   test_tracing.py  test_mirror.py
 evals/                # model-dependent, -m eval
 docs/
-  findings.md         # F1-F18: verified library/tooling behaviour and what the code does
+  findings.md         # F1-F19: verified library/tooling behaviour and what the code does
 scripts/
   audit_negative_space.py   # VENDORED from the negative-space-programming skill; do not hand-edit.
                             # Refresh by re-copying from the skill; excluded from ruff and mypy.

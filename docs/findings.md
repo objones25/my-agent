@@ -509,6 +509,50 @@ chars, and `chain_*` fell from 77% to 39% of a file less than a quarter the size
 
 ---
 
+## F19 — a hand-maintained mapping drifts; only a check that reads the dataclass stops it
+
+**Severity: important.** `ModelConfig.from_env` read three of seven fields, and one of the four
+omissions made this module's own docstring false.
+
+`model.py` states its thesis at the top: adding a setting is "one new field with a default: no
+factory signature change, no factory body change, no call site change." That holds for
+`build_model` and `as_kwargs()`. It did **not** hold for `from_env`, which needed a constant, a
+lookup, a parse, a validation and a new keyword per field — the growing argument list the
+parameter-object design exists to eliminate, inside the file that argues against it. Adding
+`reasoning_effort` (F17) touched four places in that one method.
+
+The consequence was not merely inelegant. `HF_ROUTER_BASE_URL`'s docstring promises that pointing
+at a dedicated Inference Endpoint needs "no code change", while `main.py` builds its config only
+through `from_env()` — which never read `base_url`. **Using a dedicated endpoint required editing
+source.** Nothing caught it because nothing compared the mapping to the dataclass.
+
+*What the code does:* the mapping is now `_ENV_FIELDS`, a table of
+`(field, env var, parser, required)` rows, and three load-time checks assert it against
+`dataclasses.fields(ModelConfig)`: no field unreachable, no row naming a non-field, no two rows
+sharing a variable. Removing the `base_url` row now fails the import with
+`ModelConfig fields unreachable from the environment: ['base_url']`. A table rather than reflection
+over annotations, deliberately: inferred variable names would be implicit and inferred parsers
+would give generic errors.
+
+The same reasoning produced a second pin, in `agent.py`. `check_config_contract` asserts our
+*fields* are real `create_deep_agent` parameters, but it cannot notice a **new** parameter
+appearing — and a new parameter is exactly how the shell `execute` tool arrived switched on with
+no opt-in (F4). `KNOWN_CREATE_DEEP_AGENT_PARAMS` pins the set at 18, so a deepagents upgrade that
+adds one fails the import by name and has to be reviewed for what it enables before being
+accepted.
+
+**Taxonomy note.** Everything `from_env` reads is outside input, so every failure is an operating
+error: absent, blank, unparseable, *and* out-of-range. The last one used to leak — `MODEL_TEMPERATURE=5`
+parses fine and then trips a `require()`, which would have crashed with an `AssertionError`
+traceback implying a bug in this code. `from_env` now constructs inside a `try`, catches
+`CheckFailed`, and re-raises it as a `ValueError` naming the variable at fault.
+
+*Still unverified:* whether `AgentConfig` wants the same treatment. It deliberately covers 5 of 18
+parameters (YAGNI), so completeness is the wrong property for it — but nothing records *which*
+omissions were considered and rejected.
+
+---
+
 ## Live verification
 
 `uv run my-agent` runs one check per finding against the real router and prints PASS/FAIL. As of
