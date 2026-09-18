@@ -1,7 +1,7 @@
 # CLAUDE.md
 
 Guidance for Claude Code in this repository. `README.md` says what the project is; this is the
-contributor's contract, and **`docs/findings.md` (F1–F29) is the evidence behind it** — read it
+contributor's contract, and **`docs/findings.md` (F1–F30) is the evidence behind it** — read it
 before debugging anything that looks like a library bug, and add to it when you verify something
 new.
 
@@ -114,7 +114,15 @@ matching tool call through a human, on the parent and every subagent.
 
 The domain is TBD on purpose. Do not invent tools, retrievers or subagents to "make it useful":
 build a seam, prove it with a test, stop. `deepagents` already ships filesystem tools, shell
-execution and subagent delegation — do not reimplement them. Its default toolset at 0.7.15, read off
+execution and subagent delegation — do not reimplement them.
+
+**A tool has a standing price, and it is now measured.** The eight bound tools serialize to ~10.5 KB
+and cost **~2,090 input tokens on every turn**, sent whether or not any tool is called — a one-line
+prompt that used no tools still paid for all of them. `grep` (2,383 B), `task` (1,957 B) and `glob`
+(1,633 B) are 57% of it. The mirror records the breakdown per run, so "let's add a tool" is a
+question with a number attached (F30). The levers for when the count grows —
+`LLMToolSelectorMiddleware`, `ProviderToolSearchMiddleware` — are written up there too; neither pays
+at eight tools, and subtraction is cheaper than either. Its default toolset at 0.7.15, read off
 the compiled graph and pinned by `tests/test_main.py`, is exactly:
 
     delete  edit_file  execute  glob  grep  ls  read_file  task  write_file
@@ -195,6 +203,18 @@ Bugs live in the states the code was never written to handle. Write those down a
 - Both bounds fail the same way at the edge. `run.StepLimitExceeded` translates langgraph's
   `GraphRecursionError`; before it existed the wall clock was a handled ceiling and the step count
   was a traceback.
+- **A step is not a call.** langgraph's tool node runs every call in one `AIMessage`, so a fan-out
+  does ten times the work per step and `step_limit` sees one step either way.
+  `capabilities.call_limits()` installs the two bounds that can see it: `TOOL_CALL_LIMIT` (24,
+  all tools) and `TASK_DISPATCH_LIMIT` (3, `task` only — `SUBAGENT_STEP_LIMIT` bounds how far one
+  dispatch runs, this bounds how many there are). Both `exit_behavior="continue"`: the exceeded
+  call is blocked and the agent answers with what it has, which beats crashing a turn already
+  bounded twice over. Installed by `build_agent`, not offered through `AgentConfig` — a bound a
+  caller has to remember is a bound that will be forgotten.
+- **`AgentConfig.middleware` reaches the parent only.** deepagents inherits caller middleware into
+  the general-purpose subagent only when its `.name` shadows a default slot, which is why our
+  `FilesystemMiddleware` gets there and a call limit does not. Anything relied on as a *global*
+  ceiling must be checked on both graphs (F30).
 - **A bound belongs to the thing it bounds, not to the call site.** `RECURSION_LIMIT` lived in
   `main.py`, so every other caller of `build_agent` inherited langchain-core's default by accident —
   and that default is *also* 25, which is what made it look like a decision. A postcondition must be
@@ -357,12 +377,12 @@ Everything in this table lives in `src/my_agent/`.
 | `main.py` | `uv run my-agent` — the composition root, and the live checks (one per finding). |
 | `negative_space.py` | `require`/`unreachable`/`bounded`, and the only doctests in `src/`. |
 | `tracing.py` | `TracingBackend`, `LangSmithTracing`, `WeaveTracing`, `available_backends`, `langchain_tracer_names`. |
-| `mirror.py` | `JsonlMirror`, `run_log_path`, `mirror_to_file` — the always-on local JSONL mirror of every agent event. |
+| `mirror.py` | `JsonlMirror`, `run_log_path`, `mirror_to_file` — the always-on local JSONL mirror of every agent event, including the per-call request size and a per-run per-tool byte breakdown (F30). |
 
 `tests/` mirrors that one file per module, offline by default, plus `conftest.py` for shared
 fixtures and the socket guard. The only `-m live` tests are one each at the end of `test_tracing.py`
 (calls the real `weave.init()` and hits the router) and `test_run.py` (proves multi-turn history
-against a real graph, which a fake cannot show). `evals/` is empty. `docs/findings.md` holds F1–F29
+against a real graph, which a fake cannot show). `evals/` is empty. `docs/findings.md` holds F1–F30
 plus the repo-gates, deepagents-surface, test-infrastructure and observability appendices;
 `scripts/audit_negative_space.py` is **vendored** from the negative-space-programming skill — do not
 hand-edit it, refresh by re-copying (it is excluded from ruff and mypy).

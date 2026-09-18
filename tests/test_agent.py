@@ -40,6 +40,8 @@ from my_agent.capabilities import (
     SHELL_TOOL_NAME,
     SUBAGENT_STEP_LIMIT,
     SUBAGENT_TASK_TOOL_NAME,
+    TASK_DISPATCH_LIMIT,
+    call_limits,
     compiled_tool_names,
     compiled_tools,
     least_privilege_filesystem,
@@ -73,6 +75,44 @@ class AlwaysDispatchesSubagents(BaseChatModel):
             "name": SUBAGENT_TASK_TOOL_NAME,
             "args": {"description": "keep going", "subagent_type": "general-purpose"},
             "id": f"c{self.calls}",
+        }
+        message = AIMessage(content="", tool_calls=[call])
+        return ChatResult(generations=[ChatGeneration(message=message)])
+
+
+class DispatchesUntilBlocked(BaseChatModel):
+    """Always delegates as the parent; answers immediately as the subagent.
+
+    Which role it is playing is read off the system prompt, because one model
+    instance drives both graphs and `bind_tools` is called once per compile —
+    the last bind would win and tell us nothing. deepagents' general-purpose
+    prompt is the discriminator.
+    """
+
+    parent_turns: int = 0
+    dispatches: int = 0
+
+    @property
+    def _llm_type(self) -> str:
+        return "dispatches-until-blocked"
+
+    def bind_tools(self, tools: Any, **kwargs: Any) -> BaseChatModel:
+        return self
+
+    def _generate(self, messages: Any, stop: Any = None, run_manager: Any = None, **kw: Any) -> Any:
+        # `_generate` receives a flat list of messages; iterating a single
+        # message would yield its pydantic fields as tuples instead.
+        prompts = [m.text for m in messages if m.type == "system"]
+        is_subagent = any("only sees your final assistant message" in p for p in prompts)
+        if is_subagent:
+            self.dispatches += 1
+            return ChatResult(generations=[ChatGeneration(message=AIMessage(content="done"))])
+
+        self.parent_turns += 1
+        call = {
+            "name": SUBAGENT_TASK_TOOL_NAME,
+            "args": {"description": "again", "subagent_type": "general-purpose"},
+            "id": f"d{self.parent_turns}",
         }
         message = AIMessage(content="", tool_calls=[call])
         return ChatResult(generations=[ChatGeneration(message=message)])
@@ -198,7 +238,8 @@ def test_agent_kwargs_puts_the_least_privilege_middleware_before_the_callers() -
     kwargs = _agent_kwargs(AgentConfig(middleware=[extra]))
 
     assert isinstance(kwargs["middleware"][0], FilesystemMiddleware)
-    assert kwargs["middleware"][1:] == [extra]
+    assert [m.name for m in kwargs["middleware"][1:-1]] == [m.name for m in call_limits()]
+    assert kwargs["middleware"][-1] is extra
 
 
 def test_agent_kwargs_passes_no_rules_as_none_rather_than_an_empty_list() -> None:
@@ -700,3 +741,45 @@ def test_a_runaway_subagent_cannot_outlive_the_turn_that_dispatched_it() -> None
         run_turn(agent, "go", bounds=RunBounds(step_limit=25, deadline_s=30))
 
     assert model.calls < 2 * SUBAGENT_STEP_LIMIT
+
+
+# --------------------------------------------------------------------------
+# Call limits are installed, not offered (F30)
+# --------------------------------------------------------------------------
+
+
+def test_build_agent_installs_both_call_limits_without_being_asked() -> None:
+    """A bound a caller has to remember is a bound that will be forgotten, so
+    these go in beside the least-privilege filesystem rather than into
+    `AgentConfig.middleware` where a caller could drop them."""
+    nodes = set(build_agent(ParrotFakeChatModel()).nodes)
+
+    assert "ToolCallLimitMiddleware.after_model" in nodes
+    assert f"ToolCallLimitMiddleware[{SUBAGENT_TASK_TOOL_NAME}].after_model" in nodes
+
+
+def test_the_task_dispatch_limit_actually_stops_the_dispatches() -> None:
+    """Read back, not assumed. A limit installed by name but counting the wrong
+    tool looks identical from the graph.
+
+    The subagent here answers immediately, so every dispatch *succeeds* and the
+    parent is free to ask again — which is what makes the count meaningful. The
+    parent asks on every one of its turns and is granted exactly three.
+    """
+    model = DispatchesUntilBlocked()
+    agent = build_agent(model)
+
+    with pytest.raises(StepLimitExceeded, match="step_limit"):
+        run_turn(agent, "go", bounds=RunBounds(step_limit=25, deadline_s=30))
+
+    assert model.parent_turns > TASK_DISPATCH_LIMIT  # it kept asking
+    assert model.dispatches == TASK_DISPATCH_LIMIT  # and was granted three
+
+
+def test_a_bare_deep_agent_has_no_call_limits() -> None:
+    """The discriminator. Without it the test above keeps passing if deepagents
+    starts installing limits of its own, and a bound we inherited would read as
+    a bound we set."""
+    nodes = set(create_deep_agent(model=ParrotFakeChatModel()).nodes)
+
+    assert not any("ToolCallLimit" in n for n in nodes)

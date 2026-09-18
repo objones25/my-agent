@@ -545,3 +545,83 @@ def test_tool_end_flags_an_artifact_without_copying_it(
     output = records(stream)[0]["output"]
     assert output["has_artifact"] is True
     assert "999" not in stream.getvalue()
+
+
+# --------------------------------------------------------------------------
+# Request size (F30)
+# --------------------------------------------------------------------------
+
+
+def _chat_model_start(mirror: JsonlMirror, tools: list[dict[str, Any]]) -> None:
+    mirror.on_chat_model_start(
+        {"name": "ChatOpenAI"},
+        [[HumanMessage("hi")]],
+        run_id=uuid4(),
+        invocation_params={"model": "openai/gpt-oss-120b", "tools": tools},
+    )
+
+
+def _tool_schema(name: str, description: str) -> dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {"name": name, "description": description, "parameters": {}},
+    }
+
+
+def test_the_mirror_records_how_big_the_request_was() -> None:
+    """A two-line prompt cost 2086 input tokens and nothing in the log said
+    why. Tool schemas are sent on every turn whether or not a tool is used, so
+    the number that explains the bill has to be in the record."""
+    stream = io.StringIO()
+    mirror = JsonlMirror(stream)
+
+    _chat_model_start(mirror, [_tool_schema("grep", "x" * 500)])
+
+    size = json.loads(stream.getvalue().splitlines()[0])["size"]
+    assert size["tools_bytes"] > 500
+    assert size["tool_count"] == 1
+    assert size["total_bytes"] >= size["tools_bytes"] + size["messages_bytes"]
+
+
+def test_the_mirror_names_which_tool_the_bytes_went_to() -> None:
+    """An aggregate says the request is big; the breakdown says which schema to
+    go and shorten."""
+    stream = io.StringIO()
+    mirror = JsonlMirror(stream)
+
+    _chat_model_start(mirror, [_tool_schema("grep", "x" * 900), _tool_schema("ls", "y" * 20)])
+
+    size = json.loads(stream.getvalue().splitlines()[0])["size"]
+    assert size["tool_bytes"]["grep"] > size["tool_bytes"]["ls"]
+    assert sorted(size["tool_bytes"]) == ["grep", "ls"]
+
+
+def test_the_tool_breakdown_is_written_once_per_run_not_once_per_call() -> None:
+    """The schemas are static across a run. Repeating the breakdown on every
+    model call would be the same bytes, logged forever, for no new information
+    — while the aggregate still has to be per call, because messages grow."""
+    stream = io.StringIO()
+    mirror = JsonlMirror(stream)
+    tools = [_tool_schema("grep", "x" * 100)]
+
+    _chat_model_start(mirror, tools)
+    _chat_model_start(mirror, tools)
+
+    first, second = (json.loads(line)["size"] for line in stream.getvalue().splitlines())
+    assert "tool_bytes" in first
+    assert "tool_bytes" not in second
+    assert second["tools_bytes"] == first["tools_bytes"]
+
+
+def test_a_request_with_no_tools_still_records_a_size() -> None:
+    """The comparison that makes the tool cost legible: the same turn without
+    the schemas."""
+    stream = io.StringIO()
+    mirror = JsonlMirror(stream)
+
+    _chat_model_start(mirror, [])
+
+    size = json.loads(stream.getvalue().splitlines()[0])["size"]
+    assert size["tools_bytes"] == 0
+    assert size["tool_count"] == 0
+    assert size["messages_bytes"] > 0

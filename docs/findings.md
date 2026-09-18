@@ -902,6 +902,102 @@ Proven end to end offline in `tests/test_run.py`: an interrupt rule pauses a rea
 tool runs, approving runs the held tool, **rejecting leaves the write undone**, and an agent with no
 interrupt rule never pauses.
 
+## F30 — tool schemas are the request; the conversation is a rounding error
+
+**Severity: important.** ~2,090 input tokens on every turn, paid whether or not a tool is used.
+
+A one-line prompt (`"What defines an AI Agent?"`, system prompt `"You are a helpful assistant."`)
+reported **2,086 input tokens** and called no tools. Captured on the wire 2026-09-18 with an httpx
+event hook, prompt `"hi"`, `max_tokens=8`:
+
+```
+10,508 bytes sent;  router counted input_tokens: 2,092
+```
+
+| tool | bytes on the wire |
+|---|---|
+| `grep` | 2,383 |
+| `task` | 1,957 |
+| `read_file` | 1,680 |
+| `glob` | 1,633 |
+| `edit_file` | 1,103 |
+| `write_file` | 735 |
+| `delete` | 636 |
+| `ls` | 466 |
+| **total** | **~10.5 KB — effectively the whole request** |
+
+The conversation was 12 tokens. `grep`, `task` and `glob` alone are 57% of it. **This is a fixed
+per-turn cost that scales with the tool count, not with the work** — and it is the number to put
+against any future "let's add a tool".
+
+### Capturing what is actually sent
+
+Three layers, increasing fidelity:
+
+1. `OPENAI_LOG=debug` — zero code, exists in openai 3.14.1, redacts `authorization`. Goes to stdlib
+   logging, not the mirror.
+2. `ChatOpenAI._get_request_payload(messages, **bound.kwargs)` — what langchain builds, offline, no
+   network. Note the `**bound.kwargs`: calling it on the `RunnableBinding` that `bind_tools`
+   returns silently omits the tools and reports a request with none.
+3. An httpx event hook — byte truth:
+   ```python
+   client = httpx.Client(event_hooks={"request": [lambda r: sink(r.read())]})
+   ChatOpenAI(**cfg.as_kwargs(), use_responses_api=USE_RESPONSES_API, http_client=client)
+   ```
+   **It must be passed at construction.** `model_copy(update={"http_client": ...})` is silently
+   ignored — the openai client is built during field validation, so a field replaced afterwards
+   never reaches it. The hook simply never fires, which looks identical to a request that was never
+   made.
+
+*What we do:* `mirror._request_size` records `total_bytes`, `tools_bytes`, `messages_bytes` and
+`tool_count` on every `chat_model_start`, plus a per-tool `tool_bytes` breakdown **once per run** —
+the schemas are static within a run, while the messages grow. It serializes the langchain-level
+request rather than hooking HTTP, and the error is measured rather than assumed: 10,593 bytes
+against 10,508 on the wire, **+0.8%**, all of it `json.dumps` whitespace the body omits. Closing
+F18's gap properly would mean an HTTP hook that sees the whole conversation; the estimate is enough
+to act on and costs nothing.
+
+### Bounds added here
+
+`capabilities.call_limits()` installs two `ToolCallLimitMiddleware` instances on every agent:
+
+- `TOOL_CALL_LIMIT` (24, all tools) — **not covered by `step_limit`.** That bounds graph *steps*,
+  and langgraph's tool node executes every call in one `AIMessage`, so a model that fans out ten
+  calls a turn does ten times the work per step and the step limit sees one step either way.
+- `TASK_DISPATCH_LIMIT` (3, `task` only) — `SUBAGENT_STEP_LIMIT` bounds how far one dispatch runs;
+  nothing bounded how many there are. Twelve parent round trips times a 25-step subagent is ~144
+  model calls inside a turn bounded at 25 steps. Three caps the worst case near 37.
+
+`exit_behavior="continue"`, not `"error"`: the exceeded call is blocked and the agent answers with
+what it has, which is better than crashing a turn that is already bounded twice over by the step
+limit and the deadline. The blocked call is visible in the mirror as a tool message. The two
+instances take distinct names (`ToolCallLimitMiddleware` and `ToolCallLimitMiddleware[task]`) —
+asserted, because deepagents merges middleware by `.name` and a collision would mean one silently
+replacing the other, and the names are the library's to choose.
+
+**`AgentConfig.middleware` reaches the parent only.** Measured: a `ModelCallLimitMiddleware` passed
+there appears as `before_model`/`after_model` nodes on the parent graph and **not** on the subagent.
+deepagents inherits caller middleware into the general-purpose subagent only when its `.name`
+shadows one of the default slots — which is why our `FilesystemMiddleware` gets there and a call
+limit does not. Anything relied on as a global ceiling has to be checked on both graphs.
+
+### Not done, and why it is written down
+
+The real fix for 2,090 tokens is fewer or leaner tools, not more middleware. Two library levers are
+worth revisiting **when the tool count grows**, and neither pays today at eight tools:
+
+- `LLMToolSelectorMiddleware(model=…, max_tools=…, always_include=…)` — picks a subset per turn.
+  Spends an extra model call to save input tokens, which are the cheap ones; it trades latency for
+  the wrong currency at this scale.
+- `ProviderToolSearchMiddleware(searchable_tools=…)` — hides tools behind provider-side search.
+  Needs provider support, which the router's selection does not guarantee (F25 is the same
+  problem: providers differ).
+
+The cheaper move remains subtraction: `grep`, `glob` and `task` cost ~6 KB per request and none has
+a consumer yet.
+
+---
+
 ---
 
 ## Observability API reference

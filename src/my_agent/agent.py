@@ -51,6 +51,7 @@ from my_agent.capabilities import (
     SHELL_TOOL_NAME,
     SUBAGENT_STEP_LIMIT,
     bound_step_limit,
+    call_limits,
     compiled_tool_names,
     least_privilege_filesystem,
     require_withheld,
@@ -299,8 +300,12 @@ def _agent_kwargs(config: AgentConfig) -> dict[str, Any]:
     # two filesystems (F21). `.get` rather than `[...]` because `AgentConfig`
     # has no such field today — this is what makes adding it the one-line change
     # the class docstring promises.
+    # Order matters only in that ours go first: deepagents merges a caller's
+    # middleware by `.name`, so a caller who wants different bounds supplies
+    # middleware of the same name deliberately rather than by accident.
     kwargs["middleware"] = [
         least_privilege_filesystem(permissions, kwargs.get("backend")),
+        *call_limits(),
         *config.middleware,
     ]
 
