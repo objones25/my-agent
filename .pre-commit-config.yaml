@@ -1,6 +1,18 @@
-# One hook, calling the one script. Deliberately not a list of ruff/mypy hooks:
-# that would be a second copy of the gate sequence, free to drift from
-# scripts/check.sh and from CI.
+# Two kinds of hook, kept apart on purpose.
+#
+# The local hook is the gate: one entry calling scripts/check.sh, which is the
+# only place the gate's command list lives. Deliberately NOT a list of
+# ruff/mypy/pytest hooks -- that would be a second copy of the sequence, free
+# to drift from the script and from CI.
+#
+# The rest are a different concern: cheap file-level checks the gate does not
+# and should not do. They are sub-second and they catch the classes of mistake
+# that are invisible to a Python test suite -- malformed YAML in a workflow, a
+# key pasted into a tracked file, a stray blob.
+#
+# Deliberately absent: trailing-whitespace and end-of-file-fixer. They rewrite
+# files mid-commit and would churn every existing file on first run for no
+# correctness gain.
 repos:
   - repo: local
     hooks:
@@ -10,3 +22,25 @@ repos:
         language: system
         pass_filenames: false
         always_run: true
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      # pyproject.toml and the two workflow files are all config this project
+      # cannot test from Python. A malformed one fails in CI, or silently.
+      - id: check-toml
+      - id: check-yaml
+      # This repo is public. .env is gitignored, but a key pasted into a
+      # tracked file would not be.
+      - id: detect-private-key
+      # logs/ is gitignored; this catches the blob that lands somewhere else.
+      - id: check-added-large-files
+        args: [--maxkb=512]
+      - id: check-merge-conflict
+
+  - repo: https://github.com/rhysd/actionlint
+    rev: v1.7.12
+    hooks:
+      # ci.yml was the one artifact in this repo written without verification,
+      # and it needed a review pass to fix. This is that pass, automated.
+      - id: actionlint

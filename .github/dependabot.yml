@@ -1,0 +1,28 @@
+# Keeps the two things this project cannot notice on its own up to date.
+#
+# `github-actions` is the one that matters most immediately: ci.yml pins
+# astral-sh/setup-uv to a full commit SHA (that action publishes no major tags),
+# and a SHA pin cannot self-update. Without this file it would silently rot.
+#
+# `uv` support exists in dependabot-core but is absent from GitHub's published
+# ecosystem table, so treat it as unconfirmed until the Dependabot config status
+# for this repo reports it valid. CLAUDE.md requires the recorded version block
+# in its "Verified API facts" section to be re-verified after any dependency
+# move -- a Dependabot PR is the prompt to do that, not a reason to skip it.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "Bump"
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "Bump"
+    open-pull-requests-limit: 5
