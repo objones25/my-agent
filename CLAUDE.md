@@ -274,6 +274,16 @@ Two different things; keep them apart.
   nothing else re-checks any of it. It skips rather than fails when `HF_TOKEN` is absent, so an
   unconfigured clone does not produce a weekly red X that means nothing. It never gates a commit:
   it needs the network and costs money per run.
+- **`main` is protected, so nothing lands on it without a green gate.** A repository ruleset
+  requires a pull request, requires the `gate` check to pass, requires the branch to be up to date
+  with `main` first, and blocks force-pushes and branch deletion. Approvals are set to zero on
+  purpose: a solo author cannot approve their own pull request, so requiring one would mean
+  bypassing the rule every time instead of satisfying it. **A direct `git push` to `main` is
+  rejected** — work goes on a branch and merges through a PR, which is also the only path that can
+  run the gate before the merge rather than after it. The required check is named exactly `gate`
+  (the job id in `ci.yml`); if that job is ever renamed, the rule must be updated in the same
+  change or every pull request becomes unmergeable, because a required check that never reports can
+  never be satisfied.
 - **`dependabot.yml` covers `github-actions` and `uv`.** The first is not optional housekeeping:
   `ci.yml` pins `astral-sh/setup-uv` to a full commit SHA because that action publishes no major
   tags, and a SHA pin cannot self-update. A Dependabot PR that moves a dependency is the prompt to
