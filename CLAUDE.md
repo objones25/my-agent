@@ -157,8 +157,15 @@ Rules for protocols here:
   gets its own narrower contract.
 
 **Composition root.** Concrete classes are chosen in exactly one place — the app/CLI entry point.
-Nothing below it constructs a `ChatOpenAI`, reads `os.environ`, or imports `weave`. If a test has
-to set an env var to reach the line under test, the wiring is in the wrong place.
+Nothing below it *decides which backend to use* by inspecting `os.environ` — that decision is made
+once, in `main`. A `*.from_env(env=None)` classmethod (`ModelConfig.from_env`, `LangSmithTracing.
+from_env`, `WeaveTracing.from_env`) may read `os.environ` as its own documented default, exactly
+the way an injectable default argument reads anything else — the caller can always override it with
+an explicit mapping, and every one of these lives beside a construction path that takes a config or
+a mapping directly and never touches the environment itself. `tracing.py` likewise imports `weave`
+to call `weave.init()`, `get_weave_client()`, and to type its own return values against
+`WeaveTracing` — an import used to *activate* one already-chosen backend, not to choose it. If a
+test has to set an env var to reach the line under test, the wiring is in the wrong place.
 
 ## Negative space programming
 
@@ -210,7 +217,7 @@ Two different things; keep them apart.
 Recorded from `inspect` against the installed wheels on 2026-09-17. Re-verify after any `uv sync`
 that moves these versions.
 
-**`docs/findings.md` is the full record** — fourteen verified library behaviours (F1–F14), each with
+**`docs/findings.md` is the full record** — fifteen verified library behaviours (F1–F15), each with
 how it was checked, what the code does about it, and what is still unverified. Read it before
 debugging anything that looks like a library bug, and add to it when you verify something new. The
 summary below covers only what is needed to write code day to day.
@@ -368,7 +375,7 @@ full mechanism, including why the more obvious fix (`WeaveClient.finish()`) was 
 ```
 src/my_agent/
   model.py            # ModelConfig, build_model, router/model defaults, USE_RESPONSES_API.
-                      # The only module that reads os.environ or knows the router exists.
+                      # Reads os.environ (via ModelConfig.from_env) and knows the router exists.
   agent.py            # AgentConfig, build_agent. Takes a BaseChatModel; imports nothing
                       # from model.py — main.py is the only place the two meet.
   capabilities.py     # DEFAULT_FILESYSTEM_TOOLS, least_privilege_filesystem,
@@ -382,13 +389,15 @@ src/my_agent/
                       # available_backends, langchain_tracer_names.
   mirror.py           # JsonlMirror, run_log_path, mirror_to_file — the local,
                       # always-on JSONL mirror of every agent event.
-tests/                # deterministic, offline — one file per source module
+tests/                # deterministic, offline by default — one file per source module. One
+                      # exception: test_tracing.py ends with a single -m live test that calls
+                      # the real weave.init() and hits the router.
   conftest.py         # shared fixtures + the autouse guard that blocks sockets
   test_model.py  test_agent.py  test_capabilities.py  test_contracts.py  test_main.py
   test_tracing.py  test_mirror.py
 evals/                # model-dependent, -m eval
 docs/
-  findings.md         # F1-F14: verified library behaviour and what the code does about it
+  findings.md         # F1-F15: verified library behaviour and what the code does about it
 scripts/
   audit_negative_space.py   # VENDORED from the negative-space-programming skill; do not hand-edit.
                             # Refresh by re-copying from the skill; excluded from ruff and mypy.

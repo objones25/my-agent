@@ -276,8 +276,9 @@ run carried on with that one hook silently degraded for the rest of the run.
 
 *What the code does:* `JsonlMirror` pins `raise_error = True` (a broken mirror must be loud) and
 `run_inline = True` (so recorded order is call order), and keeps its own body incapable of raising
-on data — `_clip` round-trips every value through `json.dumps(..., default=str)` so nothing
-unserializable (a `UUID`, a `BaseMessage`, an arbitrary tool return) can throw. `main()` asserts
+on data — `_clip` round-trips every value through `json.dumps(..., default=str, allow_nan=False)`,
+catching `TypeError`/`ValueError` and degrading to `repr(value)` when that round trip itself cannot
+succeed (a non-str-keyed dict, a circular reference, a non-finite float — see F15). `main()` asserts
 `mirror.records > 0` after every run, which is what actually catches "the callbacks were never
 attached" — `raise_error=True` alone only catches a handler that ran and threw.
 
@@ -322,6 +323,51 @@ path, fires `BaseCallbackHandler.on_chat_model_start`, not the legacy plain-LLM 
 *What the code does:* `JsonlMirror` implements `on_chat_model_start` and deliberately has no
 `on_llm_start` handler — this measurement is what justifies the omission rather than it being an
 oversight.
+
+## F15 — `json.dumps(default=...)` applies only to values, never to dict keys, and does not cover cycles or non-finite floats
+
+**Severity: important.** With `raise_error = True` pinned on `JsonlMirror`, this let a logging
+callback kill an agent run — the exact failure F12's fix was supposed to make impossible.
+
+`_clip`'s original implementation was `json.loads(json.dumps(value, default=str))`, and both this
+file's own comment at the time and F12 above asserted that the round trip made the body incapable
+of raising on data — "nothing unserializable (a `UUID`, a `BaseMessage`, an arbitrary tool return)
+can throw." **That claim was false**, and it was false in the approved spec before it was false in
+the implementation: the spec asserted the `default=str` round trip as sufficient, and the code
+inherited the claim along with the round trip, unverified against `json.dumps`'s actual contract.
+
+`default=` is a callback `json.dumps` invokes only for values it cannot otherwise serialize — never
+for dict keys, which must already be `str`, `int`, `float`, `bool`, or `None`. Reproduced directly
+against the installed CPython 3.13 stdlib:
+
+```python
+>>> json.dumps({(1, 2): "x"}, default=str)
+TypeError: keys must be str, int, float, bool or None, not tuple
+```
+
+`on_tool_end(output: Any)` takes an arbitrary tool return, and `on_chain_start`/`on_chain_end` take
+arbitrary graph state — a `dict` with a non-`str` key (a tuple, a frozenset, an enum member without
+`str` mixed in) is squarely inside what those hooks are documented to receive, not a contrived edge
+case.
+
+Two further gaps in the same round trip, found while fixing the first:
+
+- `json.dumps` does not detect circular references through `default=` either — a self-referential
+  structure (`d["self"] = d`, which a naive `dict(state)` copy of an agent's own working state can
+  produce) raises `ValueError: Circular reference detected`, not a call to `default`.
+- `json.dumps`'s default `allow_nan=True` serializes a non-finite float as a bare `NaN`/`Infinity`
+  token. Python's own reader accepts that token back, so the original round trip did not fail on
+  it — but it is not valid JSON by the interchange-format spec, and `jq`, Go's `encoding/json`, and
+  Rust's `serde_json` all reject it. This file's contract is one valid JSON object per line, so a
+  silently-accepted bare `NaN` was a correctness bug even though `_clip` itself never raised on it.
+
+*What the code does:* `_clip` wraps the round trip in `try`/`except (TypeError, ValueError)` and
+degrades to `repr(value)` on failure, and passes `allow_nan=False` so a non-finite float now raises
+`ValueError` into the same `except` instead of round-tripping silently. `raise_error = True` is now
+actually safe against data, rather than assumed safe against data. Covering tests exercise all
+three shapes: a tuple-keyed dict, a self-referential dict, and a payload containing `float("nan")`
+(asserting no bare `NaN` token appears in the written line). F12 above is corrected to describe
+this fixed behaviour rather than the original, false claim.
 
 ---
 
