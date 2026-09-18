@@ -36,10 +36,11 @@ def require(condition: object, message: str = "") -> None:
     """Fail unless ``condition`` is truthy.
 
     >>> require(1 < 2)
-    >>> require(2 < 1, "ordering broken")
-    Traceback (most recent call last):
-        ...
-    negative_space.CheckFailed: ordering broken
+    >>> try:
+    ...     require(2 < 1, "ordering broken")
+    ... except CheckFailed as exc:
+    ...     print(exc)
+    ordering broken
 
     Keep one predicate per call: ``require(a); require(b)`` reports which half
     failed, ``require(a and b)`` does not.
@@ -62,20 +63,14 @@ def bounded[T](iterable: Iterable[T], limit: int, name: str = "loop") -> Iterato
 
     >>> list(bounded(range(3), 5))
     [0, 1, 2]
-    >>> list(bounded(range(10), 3, name="retries"))
-    Traceback (most recent call last):
-        ...
-    negative_space.CheckFailed: retries exceeded its bound of 3 iterations
+    >>> try:
+    ...     list(bounded(range(10), 3, name="retries"))
+    ... except CheckFailed as exc:
+    ...     print(exc)
+    retries exceeded its bound of 3 iterations
     """
     require(limit >= 1, f"{name}: bound must be at least 1, got {limit}")
     for count, item in enumerate(iterable, start=1):
         if count > limit:
             raise CheckFailed(f"{name} exceeded its bound of {limit} iterations")
         yield item
-
-
-if __name__ == "__main__":
-    import doctest
-
-    failures, _ = doctest.testmod(optionflags=doctest.IGNORE_EXCEPTION_DETAIL)
-    raise SystemExit(1 if failures else 0)

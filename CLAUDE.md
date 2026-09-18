@@ -30,7 +30,6 @@ uv run my-agent "your prompt here"        # one ordinary turn instead
 uv run ruff check . --fix                 # lint
 uv run mypy                               # type check (strict; src + tests)
 uv run pyright                            # second type checker (standard; see F16)
-uv run python -m doctest src/my_agent/negative_space.py   # contract helpers' doctests
 
 # Negative-space audit. First command is the CI gate, second is advisory.
 uv run python scripts/audit_negative_space.py src/ --select NSP002,NSP003,NSP005,NSP006,NSP007
@@ -252,6 +251,11 @@ Two different things; keep them apart.
   source module; a new module gets a new file rather than an extra section in an existing one.
   They test the harness: protocol conformance, wiring, bounds, error paths. For each `require()`,
   a test that trips it — that is what turns a contract into a tested contract.
+- **The `src/` doctests run in the default suite** (`--doctest-modules`, with `src` in
+  `testpaths`). They are written as `try/except` + `print` rather than as `Traceback` blocks,
+  because the expected exception line differs between runners: pytest imports the module as
+  `my_agent.negative_space`, `python -m doctest` as `negative_space`. The `try/except` form also
+  asserts the message exactly, where `...` elides it.
 - **Assert the claim and its discriminator.** A test that pins library behaviour needs a sibling
   showing the behaviour is really ours: `test_build_agent_withholds_the_shell_tool_from_every_subagent`
   is worthless without `test_a_bare_deep_agent_does_grant_the_shell_tool_to_its_subagent`, because

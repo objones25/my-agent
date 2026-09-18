@@ -35,8 +35,8 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
-addopts = "-ra --strict-markers --strict-config -m 'not live and not eval'"
-testpaths = ["tests"]
+addopts = "-ra --strict-markers --strict-config --doctest-modules -m 'not live and not eval'"
+testpaths = ["tests", "src"]
 asyncio_mode = "auto"
 markers = [
     "live: hits a real network endpoint (HF router, LangSmith, W&B). Deselected by default.",
