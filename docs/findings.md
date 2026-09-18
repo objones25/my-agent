@@ -171,6 +171,128 @@ project `.env`, for the same reason in reverse. Pass an explicit path from anywh
 `check_shape` in `negative_space.py` and `compiled_tool_names` in `capabilities.py` are the worked
 examples.
 
+## F11 — LangSmith and Weave coexist over the same deepagents run
+
+**Severity: informational.** Resolves the "not verified end to end" caveat CLAUDE.md carried
+since Task 1.
+
+Checked by `tests/test_tracing.py::test_langsmith_and_weave_trace_the_same_run` (`-m live`): both
+backends' `.from_env()` configure from the real environment, both `.activate()` without raising,
+and `langchain_tracer_names()` reports `{'LangChainTracer', 'WeaveTracer'}` both *before* and
+*after* a real `agent.invoke()` turn against the router — neither backend's global install
+displaced the other's. Confirmed passing on multiple separate live runs, e.g.
+`1 passed, 33 deselected in 1.69s` and `1 passed, 128 deselected in 2.01s` when run as part of the
+full `-m live` invocation.
+
+*What the code does:* `available_backends()` activates every configured backend rather than
+selecting one (`main._activate_tracing()` loops over all of them), so this policy is safe to
+keep — LangSmith's ambient env-var tracing and Weave's global LangChain callback hook do not
+conflict.
+
+*Wrinkles found on the way there, not part of the coexistence question itself, all in weave's own
+SDK:*
+
+1. `weave.init()` unconditionally calls `ensure_project_exists`, which calls into `gql` using the
+   library's old `execute(..., variable_values=..., operation_name=...)` calling convention on
+   every invocation. That convention itself emits a `DeprecationWarning` from inside `gql`, and
+   under this project's `filterwarnings = ["error"]` it aborted the call before weave ever reported
+   whether project access succeeded — masquerading in the traceback as
+   `weave.wandb_interface.project_creator`'s "Unable to access `<entity>/<project>`" error path,
+   which logs and re-raises whatever exception the call raised (confirmed by reading
+   `weave/wandb_interface/project_creator.py`; it fires on every `weave.init()` call, live or not).
+2. `weave.init()`'s async HTTP client leaves at least one `ssl.SSLSocket` for GC to close, which
+   pytest's unraisable-exception hook promotes to a `PytestUnraisableExceptionWarning` — also fatal
+   under `filterwarnings = ["error"]`. When this fired *during* the test's own call phase it made
+   the live test itself flaky before it was understood: one early run failed on the `gql` warning
+   (1), a run after fixing that passed cleanly, a further repeat run failed on the socket warning
+   with the real assertions never having executed, and a subsequent run — with both warnings
+   scoped out on the test — passed.
+
+Both (1) and (2), scoped to the test itself, are fixed with two narrowly-targeted
+`@pytest.mark.filterwarnings(...)` marks, one per warning — per CLAUDE.md's rule for a new
+deprecation warning from a fast-moving dependency ("fix it or scope an ignore, do not widen the
+setting"). Neither is caused by this repo's own code, and the project-wide gate is untouched.
+
+**Residual, unresolved risk, left open rather than papered over:** the same unclosed socket can
+instead survive until the pytest *session's* teardown (`pytest_unconfigure`, which runs after
+every test has already reported its result) — reproduced once running the full `uv run pytest -m
+live`: the single live test printed `1 passed, 128 deselected`, and the process then crashed with
+an uncaught `PytestUnraisableExceptionWarning` traceback during `gc_collect_harder` at
+`pytest_unconfigure`. No per-test `@pytest.mark.filterwarnings` can reach a warning raised at
+session teardown, so this is not fixable from `tests/test_tracing.py` alone. Explicitly closing
+the client (`WeaveClient.finish(use_progress_bar=False)`) in a `finally` block at the end of the
+test was tried as a fix and reverted: a follow-up live run with that change hung — `finish()`
+blocks until its send queue drains, and a queue stuck behind an earlier run's failed writes (see
+the `weave.trace_server_bindings` 404 "no start found in project" errors observed during this same
+investigation) never drains, turning an occasional teardown warning into a reliable hang, which is
+a strictly worse failure mode than the one it was meant to fix. Closing this fully would need
+either a project-wide `pyproject.toml` `filterwarnings` entry (e.g.
+`"ignore::pytest.PytestUnraisableExceptionWarning"`) or a session-scoped `conftest.py` hook — both
+outside this task's licensed file list (`tests/test_tracing.py`, `docs/findings.md`, `CLAUDE.md`),
+so left as a documented follow-up rather than done here.
+
+## F12 — LangChain swallows exceptions raised inside a callback handler
+
+**Severity: medium.** A broken handler otherwise fails in silence.
+
+`BaseCallbackHandler.raise_error` and `BaseCallbackHandler.run_inline` both default to `False`
+(confirmed via `inspect` against langchain-core 1.6.3). By default, an exception raised inside a
+hook is caught by `CallbackManager`'s own dispatch machinery and (depending on `run_inline`) may
+also run off the main thread — so a broken handler stops mirroring, or reorders its own output,
+without the run itself failing. Seen live, unprompted: the F11 live run logged `WARNING
+langchain_core.callbacks.manager:manager.py:341 Error in WeaveTracer.on_llm_end callback:
+PydanticDeprecatedSince20(...)` — Weave's own callback raised, LangChain caught it, and the agent
+run carried on with that one hook silently degraded for the rest of the run.
+
+*What the code does:* `JsonlMirror` pins `raise_error = True` (a broken mirror must be loud) and
+`run_inline = True` (so recorded order is call order), and keeps its own body incapable of raising
+on data — `_clip` round-trips every value through `json.dumps(..., default=str)` so nothing
+unserializable (a `UUID`, a `BaseMessage`, an arbitrary tool return) can throw. `main()` asserts
+`mirror.records > 0` after every run, which is what actually catches "the callbacks were never
+attached" — `raise_error=True` alone only catches a handler that ran and threw.
+
+## F13 — `LANGSMITH_TRACING` must be exactly `"true"`; the check is cached and still honours `LANGCHAIN_*`
+
+**Severity: high.** Live in this repo's own `.env` right now (`LANGSMITH_TRACING=True`, capital T).
+
+`langsmith.utils.tracing_is_enabled()` computes
+`get_env_var("TRACING_V2", default=get_env_var("TRACING", default="")) == "true"` — a literal
+string comparison, no `.strip()`, no `.lower()`, no truthy-word mapping (`True`, `1`, `yes`, `on`
+all leave tracing off). Confirmed by reading `tracing_is_enabled`'s source off the installed wheel.
+
+`get_env_var` is `@functools.lru_cache(maxsize=100)`-wrapped and, per its actual default
+`namespaces=("LANGSMITH", "LANGCHAIN")`, searches both prefixes — so the legacy
+`LANGCHAIN_TRACING`/`LANGCHAIN_API_KEY`/`LANGCHAIN_PROJECT` names still enable tracing and still
+resolve the project. Reproduced live: with only `LANGCHAIN_*` set and no `LANGSMITH_*` variable at
+all, `tracing_is_enabled()` → `True`, `get_tracer_project()` → the value from `LANGCHAIN_PROJECT`,
+and `CallbackManager.configure().handlers` includes a `LangChainTracer`. This directly disproves
+the older claim in CLAUDE.md that the legacy names "no longer work" — re-run 2026-09-17 as part of
+this task, same result as originally observed.
+
+The `lru_cache` means a lookup made before `load_dotenv()` runs — anything importing `langsmith`
+early, or a prior call in the same process — is remembered for the rest of the process; a stale
+`""` default caches as "tracing off" no matter what `.env` says afterward.
+
+*What the code does:* `LangSmithTracing.activate()` calls `get_env_var.cache_clear()` before
+checking `tracing_is_enabled()`, and raises `TracingMisconfigured` naming the exact offending
+value when langsmith disagrees with what `from_env`'s more permissive `_TRUTHY` set accepted.
+Tests that exercise this path clear the cache too (the autouse `_clear_langsmith_cache` fixture),
+and the F11 live test explicitly forces `LANGSMITH_TRACING=true` after `load_dotenv()` for exactly
+this reason — the repo's own `.env` would otherwise fail it.
+
+## F14 — chat models emit `on_chat_model_start`, never `on_llm_start`
+
+**Severity: low.** Would silently produce an incomplete mirror if assumed otherwise.
+
+A live run's JSONL (`logs/20260917T213525Z-ace27da3.jsonl`, 8 records) contains `chain_start`×3,
+`chain_end`×3, `chat_model_start`×1, `llm_end`×1 — no `llm_start` event at all. Confirmed by direct
+inspection: `'llm_start' in events` is `False`. `ChatOpenAI`, called through deepagents' chat-model
+path, fires `BaseCallbackHandler.on_chat_model_start`, not the legacy plain-LLM `on_llm_start`.
+
+*What the code does:* `JsonlMirror` implements `on_chat_model_start` and deliberately has no
+`on_llm_start` handler — this measurement is what justifies the omission rather than it being an
+oversight.
+
 ---
 
 ## Live verification
@@ -194,6 +316,3 @@ it go red.
 
 - Whether a **provider-pinned** model id (`org/model:groq`) behaves identically on the token cap
   (F2). Only the router's default selection is covered.
-- Whether LangSmith and Weave tracing can run simultaneously over the same deepagents run.
-  LangSmith traces via env var and Weave installs a LangChain callback globally, so it *should*
-  work — not confirmed end to end.

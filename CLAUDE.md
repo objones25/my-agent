@@ -210,10 +210,10 @@ Two different things; keep them apart.
 Recorded from `inspect` against the installed wheels on 2026-09-17. Re-verify after any `uv sync`
 that moves these versions.
 
-**`docs/findings.md` is the full record** — ten verified library behaviours (F1–F10), each with how
-it was checked, what the code does about it, and what is still unverified. Read it before debugging
-anything that looks like a library bug, and add to it when you verify something new. The summary
-below covers only what is needed to write code day to day.
+**`docs/findings.md` is the full record** — fourteen verified library behaviours (F1–F14), each with
+how it was checked, what the code does about it, and what is still unverified. Read it before
+debugging anything that looks like a library bug, and add to it when you verify something new. The
+summary below covers only what is needed to write code day to day.
 
 ```
 deepagents 0.7.15   langchain 1.4.1        langchain-core 1.6.3   langgraph 1.2.11
@@ -251,6 +251,29 @@ mode` (`mode` is `Literal["isolated", "fork"]`). `CompiledSubAgent` requires
 - `skills=[...]` needs a real backend (e.g. `FilesystemBackend`); it silently loads nothing otherwise.
 - Skills are **not** inherited by subagents — pass `skills` on each subagent spec.
 - A consistent `config={"configurable": {"thread_id": ...}}` is what makes turns share a conversation.
+
+**Callbacks and tracing** (verified against langchain-core 1.6.3, langsmith 0.12.6, weave 0.53.9):
+
+- `BaseCallbackHandler.raise_error` and `.run_inline` both default to `False`. A hook that raises
+  is caught by `CallbackManager`'s dispatch and, unless `run_inline=True`, may run off the main
+  thread — so a broken handler degrades silently by default. `JsonlMirror` overrides both (F12).
+- `CallbackManager.configure(...) -> CallbackManager` (all args optional) is how to read back which
+  tracers are actually installed on a run right now: `{type(h).__name__ for h in
+  CallbackManager.configure().handlers}`. Builds and discards a manager; no network, no side effects.
+- `langsmith.utils.tracing_is_enabled(ctx: dict | None = None) -> bool | Literal["local"]` is the
+  literal-`"true"`-comparison function behind LangSmith's ambient activation (F13).
+- `langsmith.utils.get_env_var` is `@functools.lru_cache(maxsize=100)`-wrapped with signature
+  `(name, default=None, *, namespaces=("LANGSMITH", "LANGCHAIN"))` (F13). mypy sees it as an
+  `Overload` over the cached wrapper rather than a single `_lru_cache_wrapper`, so it does not see
+  `.cache_clear` even though it exists at runtime — every call site needs
+  `# type: ignore[attr-defined]`, confirmed present and working via `inspect` on the installed wheel.
+- `weave.trace.context.weave_client_context.get_weave_client() -> WeaveClient | None` reads back
+  the installed client without triggering a new `weave.init()`; `WeaveTracing.activate()` uses it
+  to make re-activation idempotent.
+- Weave's LangChain integration is gated on the `WEAVE_TRACE_LANGCHAIN` environment variable and
+  installed via `register_configure_hook` (`weave/integrations/langchain/langchain.py`) — a Weave
+  client can exist with no LangChain hook installed, which is why `WeaveTracing.activate()` checks
+  `langchain_tracer_names()` for `"WeaveTracer"` rather than just checking the client is non-`None`.
 
 ### Hugging Face router via `langchain-openai`
 
@@ -297,8 +320,15 @@ containing `codex`) and from the payload (`reasoning`, `include`, `truncation`, 
 ### Observability
 
 **LangSmith** is ambient: set `LANGSMITH_TRACING=true`, `LANGSMITH_API_KEY`, `LANGSMITH_PROJECT`
-and the whole LangChain/LangGraph/deepagents stack traces with no code change. (Older `LANGCHAIN_*`
-names no longer work.) Eval API: `langsmith.evaluate(target, /, data=, evaluators=,
+and the whole LangChain/LangGraph/deepagents stack traces with no code change.
+`LANGSMITH_TRACING` must be the exact literal string `"true"` — `langsmith.utils
+.tracing_is_enabled()` compares it directly, with no stripping or case-folding, so `True`, `1`,
+`yes`, `on` all leave tracing off (F13; this is live in this repo's own `.env` right now).
+`langsmith.utils.get_env_var` searches `namespaces=("LANGSMITH", "LANGCHAIN")` by default, so the
+older `LANGCHAIN_*` names still enable tracing and still resolve the project — prefer
+`LANGSMITH_*` for new work, but do not assume the legacy prefix is inert. That function is also
+`@functools.lru_cache`d, so a lookup made before `load_dotenv()` runs is remembered for the life
+of the process (F13). Eval API: `langsmith.evaluate(target, /, data=, evaluators=,
 summary_evaluators=, max_concurrency=, num_repetitions=, upload_results=, blocking=)`, plus
 `aevaluate`. `upload_results=False` runs an eval fully locally.
 
@@ -318,8 +348,18 @@ named argument, and the dataset dict keys must match both the scorer args and th
 Weave's background thread pool and silently ignore the `settings=` argument. Configure those with
 `WEAVE_*` environment variables instead.
 
-Running both at once should work — LangSmith traces via env var, Weave via its LangChain callback —
-but **this has not been verified end to end in this repo yet**. Verify it before relying on it.
+**Running both at once is verified end to end (F11).** `available_backends()` activates every
+configured backend rather than selecting one; a live run confirmed `langchain_tracer_names()`
+reports both `LangChainTracer` and `WeaveTracer` before and after a real agent turn, and neither
+backend's global install displaced the other's. The live test that proves this
+(`tests/test_tracing.py::test_langsmith_and_weave_trace_the_same_run`) needed two narrowly-scoped
+`@pytest.mark.filterwarnings` marks for warnings that `weave.init()` raises from inside its own
+SDK (an old-style `gql` call, and an unclosed-socket `ResourceWarning`) — both orthogonal to
+coexistence and fatal only because of this project's `filterwarnings = ["error"]`; see F11.
+**Known gap:** that same socket can instead surface its `ResourceWarning` at pytest's own *session*
+teardown rather than during the test, which no per-test mark can reach and which has been observed
+to crash a full `uv run pytest -m live` invocation after the test itself already reported passing —
+see F11 for why the obvious fix (`WeaveClient.finish()`) was tried and reverted (it can hang).
 
 ## Repo layout
 
@@ -336,12 +376,17 @@ src/my_agent/
   main.py             # `uv run my-agent` — composition root. Live checks against the
                       # router, one per finding.
   negative_space.py   # contract helpers: require/unreachable/bounded/check_shape/check_finite
+  tracing.py          # TracingBackend protocol, LangSmithTracing, WeaveTracing,
+                      # available_backends, langchain_tracer_names.
+  mirror.py           # JsonlMirror, run_log_path, mirror_to_file — the local,
+                      # always-on JSONL mirror of every agent event.
 tests/                # deterministic, offline — one file per source module
   conftest.py         # shared fixtures + the autouse guard that blocks sockets
   test_model.py  test_agent.py  test_capabilities.py  test_contracts.py  test_main.py
+  test_tracing.py  test_mirror.py
 evals/                # model-dependent, -m eval
 docs/
-  findings.md         # F1-F10: verified library behaviour and what the code does about it
+  findings.md         # F1-F14: verified library behaviour and what the code does about it
 scripts/
   audit_negative_space.py   # VENDORED from the negative-space-programming skill; do not hand-edit.
                             # Refresh by re-copying from the skill; excluded from ruff and mypy.

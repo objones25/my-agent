@@ -12,9 +12,12 @@ from collections.abc import Iterator
 
 import pytest
 import weave
+from dotenv import load_dotenv
 from langsmith.utils import get_env_var
 
 import my_agent.tracing as tracing_module
+from my_agent.agent import build_agent
+from my_agent.model import ModelConfig, build_model
 from my_agent.tracing import (
     DEFAULT_WEAVE_PROJECT,
     LANGSMITH_API_KEY_ENV_VAR,
@@ -27,6 +30,7 @@ from my_agent.tracing import (
     TracingMisconfigured,
     WeaveTracing,
     available_backends,
+    langchain_tracer_names,
 )
 
 LANGSMITH_ENV = {
@@ -247,3 +251,98 @@ def test_langchain_tracer_names_reports_the_installed_tracers(
     monkeypatch.setenv("LANGSMITH_TRACING", "true")
     monkeypatch.setenv("LANGSMITH_API_KEY", "ls-key-value")
     assert "LangChainTracer" in tracing_module.langchain_tracer_names()
+
+
+@pytest.mark.live
+@pytest.mark.filterwarnings(
+    "ignore:Using variable_values and operation_name arguments.*:DeprecationWarning"
+)
+@pytest.mark.filterwarnings("ignore:unclosed:ResourceWarning")
+def test_langsmith_and_weave_trace_the_same_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The coexistence question CLAUDE.md left open, answered by measurement.
+
+    Asserts on the *installed handlers*, not on either dashboard: what could go
+    wrong is one backend's global install displacing the other's, and that is
+    visible locally.
+
+    The `filterwarnings` mark is unrelated to that question: `weave.init()`
+    unconditionally calls `ensure_project_exists`, which calls into `gql` using
+    the library's old `execute(..., variable_values=..., operation_name=...)`
+    calling convention on every invocation, and that convention itself emits a
+    `DeprecationWarning` from inside `gql`, not from anything this repo calls
+    directly. Under this project's `filterwarnings = ["error"]` it aborts the
+    call before weave ever reports whether the project access it was attempting
+    succeeded — masquerading in the traceback as `weave.wandb_interface
+    .project_creator`'s "Unable to access" error path, which re-raises whatever
+    exception the call raised. Confirmed by reading
+    `weave/wandb_interface/project_creator.py`: this fires on every
+    `weave.init()` call, live or not, so it is orthogonal to coexistence and
+    would otherwise make it impossible to ever exercise this path under this
+    suite's strict warnings policy. See docs/findings.md (the F11 writeup) for
+    the full trace. Per CLAUDE.md's own rule for a new deprecation warning from
+    a fast-moving dependency — "fix it or scope an ignore, do not widen the
+    setting" — this scopes an ignore to the one warning, on the one test that
+    can reach it; the global `filterwarnings` gate is untouched.
+
+    The second ignore covers a different, also-observed source of flakiness:
+    `weave.init()`'s async HTTP client (used for its login/trace-upload
+    background threads) leaves at least one `ssl.SSLSocket` for GC to close,
+    which pytest's unraisable-exception hook promotes to a
+    `PytestUnraisableExceptionWarning` — fatal, again, under this project's
+    `filterwarnings = ["error"]`, and independent of the coexistence
+    assertions below (repeated live runs showed this failing the test with the
+    real assertions never having run). A resource-cleanup quirk in weave's own
+    SDK, not something this repo's code can fix; scoped the same way as above.
+
+    Known residual risk, left unresolved rather than papered over (see F11):
+    the same socket can instead survive until the *session's* teardown
+    (`pytest_unconfigure`, after every test has already reported its result),
+    which no per-test `@pytest.mark.filterwarnings` can reach — that crash was
+    reproduced once running `uv run pytest -m live` end to end. Explicitly
+    closing the client (`WeaveClient.finish()`) in a `finally` block was tried
+    and reverted: `finish()` can block indefinitely flushing a queue that a
+    prior run's failed writes leave stuck, turning an occasional teardown
+    warning into a reliable hang — worse than the problem it was meant to
+    solve. Fixing this fully needs either a project-wide `pyproject.toml`
+    `filterwarnings` entry or a session-scoped `conftest.py` hook, both outside
+    this test file's remit.
+
+    The repo's own `.env` spells the flag `LANGSMITH_TRACING=True` (capital T),
+    and langsmith compares that value to the literal string "true" — so under
+    the environment as committed, LangSmith would not actually trace. That is a
+    real, separate finding (see docs/findings.md), not something this test is
+    for, so the flag is forced to the exact spelling langsmith accepts, after
+    `load_dotenv()` (so the real key/project values are still picked up) and
+    with the lru_cache cleared (a lookup before the setenv would otherwise be
+    remembered for the rest of the process).
+    """
+    load_dotenv()
+    monkeypatch.setenv("LANGSMITH_TRACING", "true")
+    get_env_var.cache_clear()  # type: ignore[attr-defined]
+
+    backends = available_backends()
+    names = {backend.name for backend in backends}
+    assert names == {"langsmith", "weave"}, f"both backends must be configured, got {names}"
+
+    for backend in backends:
+        backend.activate()
+
+    installed = langchain_tracer_names()
+    assert "LangChainTracer" in installed, f"LangSmith tracer missing: {sorted(installed)}"
+    assert "WeaveTracer" in installed, f"Weave tracer missing: {sorted(installed)}"
+
+    agent = build_agent(build_model(ModelConfig.from_env()))
+    result = agent.invoke(
+        {"messages": [{"role": "user", "content": "Reply with exactly the word: pong"}]},
+        config={"recursion_limit": 25},
+    )
+    assert result["messages"][-1].type == "ai"
+
+    still_installed = langchain_tracer_names()
+    assert "LangChainTracer" in still_installed
+    assert "WeaveTracer" in still_installed
+    # Deliberately no `client.finish()`/teardown here: it was tried and reverted
+    # (see docs/findings.md F11) because `WeaveClient.finish()` can block
+    # indefinitely flushing a queue that a prior run's failed writes leave
+    # stuck, which is a worse failure mode than the resource warning it was
+    # meant to silence.
