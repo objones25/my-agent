@@ -1,0 +1,84 @@
+# The suite ci.yml deliberately excludes, run on a schedule instead.
+#
+# Why this exists: docs/findings.md is twenty-three entries of verified library
+# and provider behaviour, and CLAUDE.md requires re-verifying it after anything
+# moves. The `-m live` suite is the only thing that exercises the Hugging Face
+# router, LangSmith and Weave, so without a scheduled run nothing re-checks any
+# of it -- drift would surface whenever someone next happened to run it by hand.
+#
+# It stays out of the offline gate on purpose: it needs the network and costs
+# money per run, so it must not gate a commit or a pull request.
+name: live
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays, 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Never cancel a live run in flight: it has already spent tokens.
+concurrency:
+  group: live-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    # Generous on purpose. The suite itself takes seconds, but weave's atexit
+    # handler waits up to 300s for call starts that were dropped and cannot be
+    # bounded from code -- see docs/findings.md F23.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install
+
+      - name: Install the locked environment
+        run: uv sync --locked
+
+      # Skip rather than fail when the secrets are absent, so an unconfigured
+      # repo does not produce a weekly red X that means nothing.
+      - name: Check for the secrets this suite needs
+        id: secrets
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          if [ -z "${HF_TOKEN}" ]; then
+            {
+              echo "### Live suite skipped"
+              echo
+              echo "\`HF_TOKEN\` is not set. Add \`HF_TOKEN\`, \`LANGSMITH_API_KEY\`"
+              echo "and \`WANDB_API_KEY\` as repository secrets to enable this run."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Live suite
+        if: steps.secrets.outputs.ready == 'true'
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          LANGSMITH_API_KEY: ${{ secrets.LANGSMITH_API_KEY }}
+          # Must be the exact literal "true"; langsmith compares it directly
+          # with no stripping or case-folding (docs/findings.md F13).
+          LANGSMITH_TRACING: "true"
+          LANGSMITH_PROJECT: my-agent
+          WANDB_API_KEY: ${{ secrets.WANDB_API_KEY }}
+          WEAVE_PROJECT: my-agent
+        # Redirect, never pipe: weave's teardown runs after pytest reports, so
+        # `| tail` yields tail's exit status and none of the summary (F23).
+        run: |
+          uv run pytest -m live -q > live.log 2>&1 || {
+            tail -40 live.log
+            exit 1
+          }
+          tail -5 live.log

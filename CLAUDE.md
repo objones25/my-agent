@@ -258,11 +258,27 @@ Two different things; keep them apart.
   `.github/workflows/ci.yml` both call it and re-list nothing, because three copies of a command
   list is three things to forget. The live and eval suites stay out: they need the network and
   cost money.
-- **The pre-commit hook is configured but not installed.** `git rev-parse --git-common-dir` in a
-  worktree resolves to the main checkout's `.git`, and hooks live there — installing it now would
-  make every commit in the main checkout and every other worktree run `scripts/check.sh`, which
-  does not exist on branches that predate this one. Activating it is a deliberate one-time step
-  after this branch merges: `uv run pre-commit install`.
+- **The pre-commit hook is installed** (`uv run pre-commit install`; re-run it in a fresh clone,
+  it is not automatic). It runs the gate plus a handful of file-level hooks that the gate does not
+  and should not do: `check-toml`, `check-yaml`, `detect-private-key`, `check-added-large-files`
+  and `actionlint`. Those are a different concern from the gate, which is why they sit alongside
+  the one local hook rather than inside `scripts/check.sh`. `trailing-whitespace` and
+  `end-of-file-fixer` are deliberately absent — they rewrite files mid-commit.
+  **In a worktree, do not install it.** `git rev-parse --git-common-dir` resolves to the main
+  checkout's `.git` and hooks live there, so installing from a worktree makes every commit in the
+  main checkout run a `scripts/check.sh` that may not exist on the branch checked out there.
+- **Two workflows, and only one of them gates anything.** `.github/workflows/ci.yml` runs
+  `scripts/check.sh` on every push and pull request — that is the gate.
+  `.github/workflows/live.yml` runs `-m live` weekly on a schedule (and on demand), because
+  `docs/findings.md` is twenty-three entries of verified provider and library behaviour and
+  nothing else re-checks any of it. It skips rather than fails when `HF_TOKEN` is absent, so an
+  unconfigured clone does not produce a weekly red X that means nothing. It never gates a commit:
+  it needs the network and costs money per run.
+- **`dependabot.yml` covers `github-actions` and `uv`.** The first is not optional housekeeping:
+  `ci.yml` pins `astral-sh/setup-uv` to a full commit SHA because that action publishes no major
+  tags, and a SHA pin cannot self-update. A Dependabot PR that moves a dependency is the prompt to
+  re-verify the recorded version block in "Verified API facts" above — it is not a reason to skip
+  that step.
 - **Unit tests** (`tests/`, default selection) are deterministic and offline. One test file per
   source module; a new module gets a new file rather than an extra section in an existing one.
   They test the harness: protocol conformance, wiring, bounds, error paths. For each `require()`,
