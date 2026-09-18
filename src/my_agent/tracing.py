@@ -134,11 +134,21 @@ class LangSmithTracing:
         get_env_var.cache_clear()  # type: ignore[attr-defined]
         if tracing_is_enabled():
             return
-        raw = os.environ.get(LANGSMITH_TRACING_ENV_VAR, "")
+        # langsmith resolves the flag across *both* the LANGSMITH and LANGCHAIN
+        # namespaces (`get_env_var`'s actual default is
+        # `namespaces=("LANGSMITH", "LANGCHAIN")`), preferring LANGSMITH_TRACING
+        # but falling back to LANGCHAIN_TRACING. Reading only
+        # `os.environ.get(LANGSMITH_TRACING_ENV_VAR, "")` can name the wrong
+        # variable: with `LANGCHAIN_TRACING=yes` and no `LANGSMITH_*` set, that
+        # read comes back `""` while the value langsmith actually used was
+        # `"yes"`. `get_env_var("TRACING", default="")` reads the exact value
+        # `tracing_is_enabled()` compared, across both namespaces, and the cache
+        # was just cleared above so this read is fresh.
+        raw = get_env_var("TRACING", default="")
         raise TracingMisconfigured(
-            f"{LANGSMITH_TRACING_ENV_VAR} is {raw!r}, but langsmith enables tracing "
-            f'only for the exact string "true" (it compares literally, without '
-            f"stripping or case-folding)"
+            f"LANGSMITH_TRACING/LANGCHAIN_TRACING resolved to {raw!r}, but langsmith "
+            f'enables tracing only for the exact string "true" (it compares literally, '
+            f"without stripping or case-folding)"
         )
 
 
@@ -182,14 +192,29 @@ class WeaveTracing:
 
         weave.init(self.project)
 
+        # A programmer error: this asserts what the library did in direct
+        # response to our own `weave.init()` call above, not anything read from
+        # the environment.
         require(get_weave_client() is not None, "weave.init returned without installing a client")
-        # A client without the LangChain hook means Weave is on and the agent is
-        # still untraced. Checking only for the client would pass in that state.
-        require(
-            WEAVE_LANGCHAIN_TRACER in langchain_tracer_names(),
-            f"weave.init ran but no {WEAVE_LANGCHAIN_TRACER} is installed; "
-            f"the agent would not be traced (is WEAVE_TRACE_LANGCHAIN disabled?)",
-        )
+
+        # An operating error, not a programmer error: whether the `WeaveTracer`
+        # hook installed depends on the `WEAVE_TRACE_LANGCHAIN` environment
+        # variable, not on anything this code controls. Verified against the
+        # installed wheels: `weave/integrations/langchain/langchain.py`
+        # preserves a user-set `WEAVE_TRACE_LANGCHAIN` and passes it to
+        # `register_configure_hook`, and `langchain_core/callbacks/manager.py`
+        # creates the handler only when that env var is set. A `require()` here
+        # would crash the whole CLI over an environment variable
+        # (`main._activate_tracing`'s `except CheckFailed: raise` re-raises it)
+        # instead of letting the composition root report "tracing: weave
+        # FAILED" and keep running, which is the documented policy. A client
+        # without the LangChain hook means Weave is on and the agent is still
+        # untraced — checking only for the client would pass in that state.
+        if WEAVE_LANGCHAIN_TRACER not in langchain_tracer_names():
+            raise TracingMisconfigured(
+                f"weave.init ran but no {WEAVE_LANGCHAIN_TRACER} is installed; the agent "
+                f"would not be traced (is WEAVE_TRACE_LANGCHAIN set to a falsey value?)"
+            )
 
 
 _BACKEND_SOURCES: tuple[Callable[[Mapping[str, str] | None], TracingBackend | None], ...] = (

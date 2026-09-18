@@ -125,6 +125,44 @@ def test_unserialisable_payloads_do_not_raise(
     assert len(records(stream)) == 1
 
 
+def test_tuple_keyed_dict_does_not_raise(mirror: JsonlMirror, stream: io.StringIO) -> None:
+    """`json.dumps(default=...)` applies `default=` to values only, never to
+    dict keys, so a non-str-keyed dict still raises `TypeError` out of the
+    plain `default=str` round trip. `raise_error = True` is pinned, so this
+    would otherwise kill the run it is meant to be logging. See F15."""
+    mirror.on_tool_end({(1, 2): "x"}, run_id=RUN_ID)
+    written = records(stream)[0]
+    assert written["event"] == "tool_end"
+    assert "(1, 2)" in written["output"]
+
+
+def test_circular_reference_does_not_raise(mirror: JsonlMirror, stream: io.StringIO) -> None:
+    """`json.dumps` does not handle circular references; a self-referential
+    dict raises `ValueError` ("Circular reference detected") straight out of
+    the plain `default=str` round trip. See F15."""
+    payload: dict[str, Any] = {}
+    payload["self"] = payload
+    mirror.on_chain_end(payload, run_id=RUN_ID)
+    written = records(stream)[0]
+    assert written["event"] == "chain_end"
+    assert isinstance(written["outputs"], str)
+
+
+def test_nan_payload_writes_strict_json_with_no_bare_nan_token(
+    mirror: JsonlMirror, stream: io.StringIO
+) -> None:
+    """`allow_nan=False` (folded into the same try as the dict-key/circular-ref
+    fix) means a non-finite float raises `ValueError`, caught by the same
+    `except` and degraded to a `repr`. Without it, `json.dumps` would emit a
+    bare `NaN` token: valid to Python's own reader but not to `jq`, Go, or
+    Rust, and this file's contract is one valid JSON object per line."""
+    mirror.on_tool_end({"score": float("nan")}, run_id=RUN_ID)
+    line = stream.getvalue().splitlines()[0]
+    assert "NaN" not in line
+    written = json.loads(line)  # strict: raises on a bare NaN token
+    assert written["event"] == "tool_end"
+
+
 def test_the_serialized_blob_is_never_written(
     mirror: JsonlMirror, stream: io.StringIO
 ) -> None:

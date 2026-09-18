@@ -1,8 +1,14 @@
-"""Offline tests for the tracing seam.
+"""Tests for the tracing seam.
 
 `weave.init` and LangSmith's env-var cache are both process-global, so every
 test here either injects a mapping or monkeypatches, and the cache fixture
 guarantees no test leaks its environment into the next one.
+
+Deterministic and offline by default (`-m "not live"`, the suite's default
+selection). One exception: the module ends with a single `-m live` test that
+calls the real `weave.init()` and hits the router — see that test's own
+docstring, and do not run `-m live` without expecting a real network call and
+a real cost.
 """
 
 from __future__ import annotations
@@ -134,6 +140,24 @@ def test_langsmith_activate_fails_loudly_when_langsmith_disagrees(
         LangSmithTracing(project="my-project").activate()
 
 
+def test_langsmith_activate_names_the_real_value_from_the_langchain_namespace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """langsmith resolves the flag across *both* the LANGSMITH and LANGCHAIN
+    namespaces (`get_env_var`'s real default is
+    `namespaces=("LANGSMITH", "LANGCHAIN")`). With only `LANGCHAIN_TRACING` set
+    and no `LANGSMITH_*` variable at all, the message must name the value
+    langsmith actually saw (`"yes"`), not the empty string that reading only
+    `os.environ.get("LANGSMITH_TRACING", "")` would report.
+    """
+    monkeypatch.delenv("LANGSMITH_TRACING", raising=False)
+    monkeypatch.delenv("LANGSMITH_TRACING_V2", raising=False)
+    monkeypatch.delenv("LANGCHAIN_TRACING_V2", raising=False)
+    monkeypatch.setenv("LANGCHAIN_TRACING", "yes")
+    with pytest.raises(TracingMisconfigured, match=re.escape("'yes'")):
+        LangSmithTracing(project="my-project").activate()
+
+
 def test_langsmith_activate_survives_a_poisoned_env_var_cache(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -215,9 +239,19 @@ def test_weave_activate_fails_when_the_langchain_tracer_is_missing(
     monkeypatch: pytest.MonkeyPatch, weave_spy: list[str]
 ) -> None:
     """A Weave client with no LangChain hook means Weave is on and the agent is
-    still untraced — the exact silent failure this postcondition exists for."""
+    still untraced — the exact silent failure this postcondition exists for.
+
+    This must be `TracingMisconfigured`, not a bare `require()`/`AssertionError`:
+    whether the hook installed depends on `WEAVE_TRACE_LANGCHAIN`, an environment
+    variable, so it is an operating error per CLAUDE.md's rule (decided by where
+    the value came from), and `main._activate_tracing`'s `except CheckFailed:
+    raise` would otherwise let a bare env var crash the whole CLI.
+    `pytest.raises(TracingMisconfigured, ...)` is strictly stronger than the
+    `AssertionError` this replaced — any stray `assert` would satisfy the old
+    check, but only this specific exception type satisfies the new one.
+    """
     monkeypatch.setattr(tracing_module, "langchain_tracer_names", frozenset)
-    with pytest.raises(AssertionError, match="WeaveTracer"):
+    with pytest.raises(TracingMisconfigured, match="WeaveTracer"):
         WeaveTracing(project="weave-project").activate()
 
 

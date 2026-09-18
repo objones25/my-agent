@@ -8,6 +8,10 @@ that crashed.
 
 It is a plain object that writes to a stream. Nothing here is global, nothing
 here is installed, and nothing here knows a tracing backend exists.
+
+`*_end` and `*_error` records carry no `name` field — only `*_start` records do
+— so reading a component's name back requires joining an end or error record to
+its start record by `run_id`.
 """
 
 from __future__ import annotations
@@ -45,11 +49,26 @@ DEFAULT_LOG_DIR = Path("logs")
 def _clip(value: Any) -> tuple[Any, bool]:
     """A JSON-safe value, bounded, and whether the bound bit.
 
-    The round trip through `default=str` is what makes `raise_error = True` safe:
-    a `UUID`, a `BaseMessage`, or a tool returning an arbitrary object degrades
-    to a string instead of raising inside a callback.
+    The round trip through `default=str` is what makes `raise_error = True` safe
+    for most payloads: a `UUID`, a `BaseMessage`, or a tool returning an
+    arbitrary object degrades to a string instead of raising inside a callback.
+
+    `default=str` alone is not enough, though: `json.dumps` applies `default=`
+    to *values* only, never to dict keys, and it does not handle circular
+    references. A non-str-keyed dict (`{(1, 2): "x"}`) still raises `TypeError`,
+    and a self-referential structure still raises `ValueError`, straight out of
+    this function and into a `raise_error = True` handler — see docs/findings.md
+    F15. `allow_nan=False` is folded into the same try: `json.dumps` otherwise
+    emits a bare `NaN`/`Infinity` token that Python reads back but `jq`, Go and
+    Rust do not, and this file's contract is one valid JSON object per line; a
+    non-finite float now raises `ValueError` too and is caught by the same
+    `except`. Whatever cannot round-trip degrades to `repr(value)` instead of
+    propagating, so the claim in `raise_error`'s docstring and F12 stays true.
     """
-    safe = json.loads(json.dumps(value, default=str))
+    try:
+        safe = json.loads(json.dumps(value, default=str, allow_nan=False))
+    except (TypeError, ValueError):
+        safe = repr(value)
     text = safe if isinstance(safe, str) else json.dumps(safe)
     if len(text) <= MAX_FIELD_CHARS:
         return safe, False
