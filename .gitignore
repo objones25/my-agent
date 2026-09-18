@@ -26,3 +26,6 @@ htmlcov/
 
 # Local JSONL run mirrors
 logs/
+
+# Subagent-driven-development scratch (ledger, briefs, review packages)
+.superpowers/
