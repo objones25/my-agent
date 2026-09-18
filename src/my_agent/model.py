@@ -74,13 +74,36 @@ TEMPERATURE_ENV_VAR = "MODEL_TEMPERATURE"
 TIMEOUT_ENV_VAR = "MODEL_TIMEOUT_S"
 MAX_RETRIES_ENV_VAR = "MODEL_MAX_RETRIES"
 
-REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh"})
-"""Values the router documents for `reasoning_effort` (Chat Completions body).
+REASONING_EFFORTS = frozenset({"low", "medium", "high"})
+"""Values `reasoning_effort` may take (Chat Completions body).
 
-Verified on the wire 2026-09-17 with `openai/gpt-oss-120b`: one prompt answered
-identically at every setting, while reasoning tokens went 6 (`low`), 50 (unset),
-93 (`high`). See `docs/findings.md` F17. Unset is *not* zero effort — it is the
-provider's default, which sat between `low` and `high`.
+**Three, not six.** gpt-oss was post-trained on exactly three reasoning efforts —
+low, medium and high — carried in the system message by the harmony format
+(OpenAI, *Introducing gpt-oss*, 5 Aug 2025). The router documents more, and this
+set used to list them; measured on the wire 2026-09-18 against
+`openai/gpt-oss-120b`, the extras are rejected rather than mapped:
+
+    effort=low       reasoning=10  output=21
+    effort=medium    reasoning=63  output=74
+    effort=high      reasoning=80  output=91
+    effort=None      reasoning=63  output=74     <- identical to medium
+    effort=minimal   400  "Input should be 'none', 'low', 'medium' or 'high'"
+    effort=xhigh     400  same
+    effort=none      400  "Failed to apply chat template ... Unsupported reasoning effort"
+
+`none` is the interesting one: the provider's schema accepts it and the model's
+own chat template then refuses it, which is what "provider-side mapping onto a
+three-level model" looks like from the outside. Listing it here would mean this
+precondition passing a value the request is guaranteed to fail on — the one
+thing a precondition exists to prevent (F26).
+
+Unset is *not* zero effort. It is the provider's default, and that default
+measured token-for-token identical to `medium`.
+
+This set is a property of the *model*, not of `ModelConfig`: a model with more
+levels means widening it deliberately, the way `DEFAULT_FILESYSTEM_TOOLS` is
+widened deliberately. Failing here is still better than the alternative, which
+is discovering it as a 400 from inside the provider.
 
 `reasoning_effort` is the Chat Completions knob. `ChatOpenAI` also has a
 `reasoning` *dict* field, which is the Responses API's; do not use it here.

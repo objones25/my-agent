@@ -12,7 +12,9 @@ the other half — that the router and the provider actually behave as assumed.
 
 from __future__ import annotations
 
+import json
 import sys
+import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -31,9 +33,9 @@ from my_agent.capabilities import (
     require_withheld,
 )
 from my_agent.mirror import mirror_to_file, run_log_path
-from my_agent.model import ModelConfig, build_model
+from my_agent.model import REASONING_EFFORTS, ModelConfig, build_model
 from my_agent.negative_space import CheckFailed, require
-from my_agent.run import DeadlineExceeded, run_turn
+from my_agent.run import DeadlineExceeded, StepLimitExceeded, TurnResult, run_turn
 from my_agent.tracing import available_backends
 
 EXIT_MISCONFIGURED = 2
@@ -41,6 +43,27 @@ EXIT_CHECK_FAILED = 1
 
 TOKEN_CAP = 24
 """Small enough that an ignored cap is unmistakable against an uncapped reply."""
+
+REASONING_PROBE_TOKENS = 16
+"""Enough for a one-digit answer. The probe is about acceptance, not output."""
+
+REJECTED_REASONING_EFFORT = "xhigh"
+"""A value the router documents and this model refuses (measured 2026-09-18).
+
+The discriminator for the effort check: without a value that must fail, "every
+effort we allow was accepted" also passes on a router that accepts everything.
+"""
+
+COT_CONTENT_KEYS = ("reasoning", "reasoning_content")
+"""Where a provider would put chain-of-thought *text* if it returned any."""
+
+ASSUMED_CONTEXT_TOKENS = 128_000
+"""The context window this harness assumes a provider serves.
+
+gpt-oss natively supports 128k (OpenAI, *Introducing gpt-oss*). The router picks
+among providers, and they do not all advertise the same number — so this is the
+floor a prompt may be sized against, not the ceiling any one provider offers.
+"""
 
 DENIED_PREFIX = "/secrets"
 ALLOWED_PATH = "/notes/smoke.txt"
@@ -57,8 +80,41 @@ class CheckResult:
     detail: str
 
 
-def _tool_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
-    return [m for m in messages if m.type == "tool"]
+def _tool_messages(result: TurnResult) -> list[BaseMessage]:
+    """The tool record a check reads, and the assertion that the turn finished.
+
+    A paused turn has a tool call in its messages and no result for it, so a
+    check reading tool messages off one would report "the tool was not called"
+    for a tool that is waiting on a human. None of these checks uses an
+    interrupt rule, so a pause here means the harness grew one somewhere else.
+    """
+    require(
+        not result.paused,
+        f"turn paused on {len(result.action_requests)} approval request(s); "
+        f"these checks configure no interrupt rules",
+    )
+    return [m for m in result.messages if m.type == "tool"]
+
+
+def _router_models(config: ModelConfig) -> list[dict[str, Any]]:
+    """The router's `/v1/models` listing.
+
+    Read with `urllib` rather than through `ChatOpenAI`: this is a catalogue
+    lookup, not a completion, and routing it through the chat client would make
+    a check about *what providers offer* depend on a provider answering.
+    """
+    request = urllib.request.Request(  # noqa: S310 — the URL is our own pinned base
+        f"{config.base_url.rstrip('/')}/models",
+        headers={"Authorization": f"Bearer {config.api_key.get_secret_value()}"},
+    )
+    with urllib.request.urlopen(request, timeout=config.timeout) as response:  # noqa: S310
+        body = json.load(response)
+    listing = body.get("data", []) if isinstance(body, dict) else body
+    require(
+        isinstance(listing, list),
+        f"the router returned a {type(listing).__name__}, not a list of models",
+    )
+    return [m for m in listing if isinstance(m, dict)]
 
 
 def _activate_tracing() -> tuple[str, ...]:
@@ -140,10 +196,10 @@ def check_shell_tool_withheld(
     agent = build_agent(build_model(config))
     require_withheld(SHELL_TOOL_NAME, compiled_tool_names(agent), "the compiled graph")
 
-    messages = run_turn(
+    result = run_turn(
         agent, "Run the shell command `echo hello` and show me the output.", callbacks=callbacks
     )
-    called = {m.name for m in _tool_messages(messages) if m.name is not None}
+    called = {m.name for m in _tool_messages(result) if m.name is not None}
     return CheckResult(
         "F4",
         "shell tool withheld",
@@ -162,15 +218,14 @@ def check_filesystem_tools_still_work(
     # Separates "the model did not try" from "the tool was never there" — without
     # this, a missing tool reports as a model failure.
     require_granted("write_file", compiled_tool_names(agent), "the compiled graph")
-    messages = run_turn(
+    result = run_turn(
         agent,
         f"Use write_file to write the text 'pong' to {ALLOWED_PATH}, then read it back.",
         callbacks=callbacks,
     )
-    tools = _tool_messages(messages)
+    tools = _tool_messages(result)
     wrote = any(
-        m.name == "write_file" and "permission denied" not in str(m.content).lower()
-        for m in tools
+        m.name == "write_file" and "permission denied" not in str(m.content).lower() for m in tools
     )
     return CheckResult(
         "F4",
@@ -187,13 +242,13 @@ def check_permissions_are_enforced(
     to forward `_permissions`; if it does not, every rule vanishes silently."""
     agent = build_agent(build_model(config), AgentConfig(permissions=[DENY_SECRETS]))
     require_granted("write_file", compiled_tool_names(agent), "the compiled graph")
-    messages = run_turn(
+    result = run_turn(
         agent,
         f"Use write_file to write the text 'hello' to {DENIED_PREFIX}/keys.txt. "
         f"Then tell me whether it succeeded.",
         callbacks=callbacks,
     )
-    tools = _tool_messages(messages)
+    tools = _tool_messages(result)
     denied = any("permission denied" in str(m.content).lower() for m in tools)
     attempted = any(m.name == "write_file" for m in tools)
     return CheckResult(
@@ -204,12 +259,127 @@ def check_permissions_are_enforced(
     )
 
 
+def check_reasoning_efforts_are_the_ones_the_router_takes(
+    config: ModelConfig, callbacks: list[BaseCallbackHandler]
+) -> CheckResult:
+    """F26 — `REASONING_EFFORTS` used to list six values the router documents.
+    gpt-oss has three. A precondition that accepts a value the request is
+    guaranteed to 400 on is worse than no precondition, so both halves are
+    checked: every value we allow works, and a value we forbid really fails."""
+    accepted: list[str] = []
+    for effort in sorted(REASONING_EFFORTS):
+        model = build_model(
+            ModelConfig(api_key=config.api_key, model=config.model, reasoning_effort=effort)
+        )
+        model.bind(max_tokens=REASONING_PROBE_TOKENS).invoke(
+            "Reply with the digit 1.", config={"callbacks": callbacks}
+        )
+        accepted.append(effort)
+
+    # The discriminator. Without it this check passes on a router that accepts
+    # anything, and the narrowing it exists to defend would be unfalsifiable.
+    rejected = False
+    try:
+        build_model(ModelConfig(api_key=config.api_key, model=config.model)).bind(
+            reasoning_effort=REJECTED_REASONING_EFFORT, max_tokens=REASONING_PROBE_TOKENS
+        ).invoke("Reply with the digit 1.", config={"callbacks": callbacks})
+    # Any refusal is the evidence; which exception the provider raises is its own
+    # business and pinning it would make this check about the SDK instead.
+    except Exception:
+        rejected = True
+
+    return CheckResult(
+        "F26",
+        "reasoning_effort set matches what the router accepts",
+        sorted(accepted) == sorted(REASONING_EFFORTS) and rejected,
+        f"accepted {accepted}; {REJECTED_REASONING_EFFORT!r} rejected={rejected}",
+    )
+
+
+def check_no_reasoning_content_comes_back(
+    config: ModelConfig, callbacks: list[BaseCallbackHandler]
+) -> CheckResult:
+    """F27 — gpt-oss ships an unsupervised chain of thought, and OpenAI's own
+    guidance is that it may hold content the final answer was told to leave out.
+
+    Everything this harness records is a sink: `logs/*.jsonl`, LangSmith, W&B.
+    Today the router returns reasoning as a *token count* and nothing else, so
+    there is no CoT to leak — a fact worth a check rather than an assumption,
+    because the day a provider starts returning the text, three sinks start
+    storing it and nothing else would say so.
+    """
+    reply = build_model(
+        ModelConfig(api_key=config.api_key, model=config.model, reasoning_effort="high")
+    ).invoke("Think it through, then answer in one word: 2 + 2?", config={"callbacks": callbacks})
+
+    extra = reply.additional_kwargs or {}
+    leaked = sorted(k for k in COT_CONTENT_KEYS if extra.get(k))
+    usage: dict[str, Any] = dict(reply.usage_metadata or {})
+    counted = (usage.get("output_token_details") or {}).get("reasoning")
+    # A run that did no reasoning at all would find no content either, and pass
+    # for the wrong reason.
+    require(counted, "the model reported no reasoning tokens; absence of content proves nothing")
+
+    return CheckResult(
+        "F27",
+        "reasoning arrives as a count, never as text",
+        not leaked,
+        f"{counted} reasoning tokens, content keys present: {leaked or 'none'}",
+    )
+
+
+def check_every_provider_serves_the_context_we_assume(
+    config: ModelConfig, _callbacks: list[BaseCallbackHandler]
+) -> CheckResult:
+    """F25 — gpt-oss natively supports 128k, but the router picks among
+    providers and a provider serves what it serves. One `/v1/models` read, no
+    inference: a prompt sized for the largest advertised window is a prompt that
+    fails on whichever provider advertises less.
+
+    Asserted on the providers that state a length, and reported for those that
+    do not. An unstated window is a real unknown — the mitigation is pinning
+    `:provider`, not a check that can never go green — while a *stated* window
+    dropping below the floor is the thing that would actually truncate a run.
+    """
+    entry = next((m for m in _router_models(config) if m.get("id") == config.model), None)
+    # An explicit raise rather than `require()`: this also narrows, and neither
+    # type checker can follow a narrowing through a helper call (F10).
+    if entry is None:
+        raise CheckFailed(f"the router does not list {config.model}; the check has no subject")
+
+    lengths = {
+        str(p.get("provider")): p.get("context_length")
+        for p in entry.get("providers", [])
+        if isinstance(p, dict)
+    }
+    require(lengths, f"the router lists no providers for {config.model}")
+    stated = {name: n for name, n in lengths.items() if isinstance(n, int)}
+    # Without this the check passes by measuring nothing on the day the router
+    # stops publishing context lengths at all.
+    require(stated, f"no provider states a context length for {config.model}: {sorted(lengths)}")
+    shortest = min(stated.values())
+    short = sorted(name for name, n in stated.items() if n < ASSUMED_CONTEXT_TOKENS)
+    unstated = sorted(name for name in lengths if name not in stated)
+
+    return CheckResult(
+        "F25",
+        "every provider that states a context window meets our floor",
+        not short,
+        f"shortest {shortest} across {len(stated)} providers (floor {ASSUMED_CONTEXT_TOKENS}); "
+        f"below floor: {short or 'none'}; unstated (pin :provider to remove the unknown): "
+        f"{unstated or 'none'}",
+    )
+
+
 CHECKS: tuple[Callable[[ModelConfig, list[BaseCallbackHandler]], CheckResult], ...] = (
     check_chat_completions_endpoint,
     check_token_cap_reaches_the_router,
     check_shell_tool_withheld,
     check_filesystem_tools_still_work,
     check_permissions_are_enforced,
+    check_reasoning_efforts_are_the_ones_the_router_takes,
+    check_no_reasoning_content_comes_back,
+    check_every_provider_serves_the_context_we_assume,
 )
 
 
@@ -220,8 +390,19 @@ CHECKS: tuple[Callable[[ModelConfig, list[BaseCallbackHandler]], CheckResult], .
 
 def _single_turn(config: ModelConfig, prompt: str, callbacks: list[BaseCallbackHandler]) -> int:
     agent = build_agent(build_model(config))
-    messages = run_turn(agent, prompt, callbacks=callbacks)
-    reply = messages[-1]
+    result = run_turn(agent, prompt, callbacks=callbacks)
+    if result.paused:
+        # Not reachable with today's configuration — nothing here passes an
+        # interrupt-mode rule — but a pause printed as a reply would be a
+        # half-finished turn reported as a whole one.
+        for request in result.action_requests:
+            print(f"paused: {request.get('name')} awaiting approval {request.get('args')}")
+        print(
+            "error: turn paused for approval; resume_turn() is not wired to a CLI",
+            file=sys.stderr,
+        )
+        return EXIT_CHECK_FAILED
+    reply = result[-1]
     require(reply.type != "human", f"last message is still our own turn: {reply.type}")
     print(f"reply:  {reply.text}")
     return 0
@@ -283,7 +464,11 @@ def main() -> int:
                 exit_code = _single_turn(config, prompt, callbacks)
             else:
                 exit_code = _run_checks(config, callbacks)
-        except DeadlineExceeded as exc:
+        except (DeadlineExceeded, StepLimitExceeded) as exc:
+            # Both bounds in `RunBounds`, reported the same way. Before
+            # `StepLimitExceeded` existed the step limit escaped as langgraph's
+            # `GraphRecursionError` and printed a traceback, so the wall clock
+            # was a handled ceiling and the step count was a crash (F24).
             print(f"error: {exc}", file=sys.stderr)
             exit_code = EXIT_CHECK_FAILED
 

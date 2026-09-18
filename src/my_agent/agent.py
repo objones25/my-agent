@@ -29,10 +29,13 @@ from dataclasses import dataclass, fields
 from typing import Any
 
 from deepagents import (
+    CompiledSubAgent,
     FilesystemMiddleware,
     FilesystemPermission,
+    SubAgent,
     create_deep_agent,
 )
+from deepagents.middleware.subagents import GENERAL_PURPOSE_SUBAGENT
 from langchain.agents.middleware.types import (
     AgentMiddleware,
     AgentState,
@@ -44,14 +47,17 @@ from langchain_core.tools import BaseTool
 from langgraph.graph.state import CompiledStateGraph
 
 from my_agent.capabilities import (
+    GENERAL_PURPOSE_SUBAGENT_NAME,
     SHELL_TOOL_NAME,
+    SUBAGENT_STEP_LIMIT,
+    bound_step_limit,
     compiled_tool_names,
     least_privilege_filesystem,
     require_withheld,
     subagent_graphs,
 )
 from my_agent.contracts import check_config_contract
-from my_agent.negative_space import require
+from my_agent.negative_space import CheckFailed, require
 
 __all__ = [
     "DEFAULT_AGENT_NAME",
@@ -152,7 +158,31 @@ class AgentConfig:
     and the permission rules from then on.
     """
     permissions: Sequence[FilesystemPermission] = ()
-    """Filesystem access rules. Empty by default — no rules, not "deny all"."""
+    """Filesystem access rules. Empty by default — no rules, not "deny all".
+
+    A rule with `mode="interrupt"` is how a tool call is routed through a human,
+    and deepagents turns those into `interrupt_on` entries for the parent *and*
+    every subagent. Pausing needs `checkpointer` to also be set, or the pause
+    can never be resumed — `run.run_turn` refuses that combination rather than
+    handing back a turn nobody can finish.
+    """
+    subagents: Sequence[SubAgent | CompiledSubAgent] = ()
+    """Subagent specs. Empty by default, which is *not* the same as no subagents.
+
+    deepagents adds a general-purpose one behind `task` unless a caller supplies
+    a spec of that name, and it compiles at langchain's `recursion_limit` of
+    9999 (F24). `build_agent` therefore supplies one: deepagents' own subagent,
+    rebound to `SUBAGENT_STEP_LIMIT`. A spec named `general-purpose` here
+    replaces that, limit included — it is then the caller's graph and the
+    caller's bound.
+    """
+    checkpointer: Any = None
+    """langgraph checkpointer, or `None` for a graph that persists nothing.
+
+    Only needed to resume an interrupted turn today. Typed `Any` because
+    deepagents accepts `None | bool | BaseCheckpointSaver` and narrowing it here
+    would make this field a different contract from the parameter it splats to.
+    """
 
     def __post_init__(self) -> None:
         # Coerce before validating. `frozen=True` stops a field being rebound but
@@ -181,6 +211,7 @@ class AgentConfig:
         object.__setattr__(self, "tools", tuple(self.tools))
         object.__setattr__(self, "middleware", tuple(self.middleware))
         object.__setattr__(self, "permissions", tuple(self.permissions))
+        object.__setattr__(self, "subagents", tuple(self.subagents))
 
         require(self.name != "", "name must not be empty")
         require(self.system_prompt.strip() != "", "system_prompt must not be blank")
@@ -222,6 +253,19 @@ def _replaces_filesystem_middleware(config: AgentConfig) -> bool:
     return any(isinstance(m, FilesystemMiddleware) for m in config.middleware)
 
 
+def _supplies_general_purpose_subagent(config: AgentConfig) -> bool:
+    """Whether the caller replaced deepagents' default subagent themselves.
+
+    An explicit spec of that name is how deepagents lets a caller override it,
+    so one here means the subagent — and its step limit — is the caller's.
+    """
+    return any(
+        spec.get("name") == GENERAL_PURPOSE_SUBAGENT_NAME
+        for spec in config.subagents
+        if isinstance(spec, dict)
+    )
+
+
 def _agent_kwargs(config: AgentConfig) -> dict[str, Any]:
     """`create_deep_agent` keywords, with the middleware list assembled.
 
@@ -244,6 +288,10 @@ def _agent_kwargs(config: AgentConfig) -> dict[str, Any]:
     permissions = list(config.permissions) or None
     kwargs = config.as_kwargs()
     kwargs["permissions"] = permissions
+    # deepagents spells "no subagents" `None` too, and an empty list would stop
+    # it adding the general-purpose one — which is the graph `build_agent` needs
+    # to exist before it can bind a step limit onto it.
+    kwargs["subagents"] = list(config.subagents) or None
 
     # `backend` is read the same way, and for the same reason: deepagents wires
     # it into skills and summarisation while our middleware owns the filesystem
@@ -268,6 +316,60 @@ def _agent_kwargs(config: AgentConfig) -> dict[str, Any]:
         "assembled middleware is on a different backend than create_deep_agent will use",
     )
     return kwargs
+
+
+def _bounded_general_purpose_subagent(
+    agent: CompiledStateGraph[Any, Any, Any, Any],
+) -> CompiledSubAgent:
+    """deepagents' own general-purpose subagent, rebound to our step limit.
+
+    Its `runnable` is the graph deepagents just compiled, not one assembled
+    here. That matters: the default subagent carries summarisation, tool-call
+    patching and whatever else deepagents decides it needs, and a hand-rolled
+    replacement would silently drop whichever of those moved next. Taking the
+    real graph and putting one config key on it keeps the behaviour and changes
+    only the number.
+
+    Two `with_config` calls then apply to the same graph — ours here, and
+    deepagents' own `{metadata, run_name}` when it accepts the spec. Verified
+    2026-09-18 that the later call does not clear `recursion_limit`, which is
+    what makes this route work at all.
+    """
+    graph = subagent_graphs(agent).get(GENERAL_PURPOSE_SUBAGENT_NAME)
+    if graph is None:
+        raise CheckFailed(
+            f"deepagents did not add a {GENERAL_PURPOSE_SUBAGENT_NAME!r} subagent to bind a "
+            f"step limit onto; it is added by default, so this means the name or the "
+            f"default changed and `task` is running unbounded"
+        )
+    bounded = graph.with_config({"recursion_limit": SUBAGENT_STEP_LIMIT})
+    # Postcondition: `with_config` returns a copy, so an assertion on `graph`
+    # would pass while the thing actually handed over kept the old limit.
+    require(
+        bound_step_limit(bounded) == SUBAGENT_STEP_LIMIT,
+        f"rebinding the subagent step limit did not take: wanted {SUBAGENT_STEP_LIMIT}, "
+        f"graph carries {bound_step_limit(bounded)}",
+    )
+    return {
+        "name": GENERAL_PURPOSE_SUBAGENT_NAME,
+        "description": GENERAL_PURPOSE_SUBAGENT["description"],
+        "runnable": bounded,
+    }
+
+
+def _require_subagents_bounded(agent: CompiledStateGraph[Any, Any, Any, Any]) -> None:
+    """Assert no subagent runs to the library's limit instead of ours.
+
+    Read back rather than assumed, for the same reason the tool allowlist is:
+    the limit is applied by handing deepagents a spec, and whether it survives
+    the round trip is deepagents' behaviour, not ours.
+    """
+    limit = bound_step_limit(subagent_graphs(agent)[GENERAL_PURPOSE_SUBAGENT_NAME])
+    require(
+        limit == SUBAGENT_STEP_LIMIT,
+        f"the {GENERAL_PURPOSE_SUBAGENT_NAME!r} subagent runs to {limit} steps, not "
+        f"{SUBAGENT_STEP_LIMIT}; one `task` dispatch would outlive every bound run_turn sends",
+    )
 
 
 def _require_shell_withheld(agent: CompiledStateGraph[Any, Any, Any, Any]) -> None:
@@ -326,9 +428,26 @@ def build_agent(
         f"expected an AgentConfig, got {type(agent_config).__name__}",
     )
 
-    agent = create_deep_agent(model=model, **_agent_kwargs(agent_config))
-
+    # Computed once and reused by both builds. Rebuilding the kwargs would call
+    # `least_privilege_filesystem` a second time and put the two graphs on two
+    # different `StateBackend`s — the same split F21 was about, arrived at from
+    # the other direction.
+    kwargs = _agent_kwargs(agent_config)
+    agent = create_deep_agent(model=model, **kwargs)
     require(agent is not None, "create_deep_agent returned None")
+
+    # The second build is what bounds `task`. deepagents' general-purpose
+    # subagent only exists once it has compiled one, and the only lever over its
+    # step limit is the config bound to the graph itself — so the graph has to
+    # be built before it can be handed back as a spec. A caller who supplied
+    # their own spec of that name owns it, limit included.
+    if not _supplies_general_purpose_subagent(agent_config):
+        bounded = _bounded_general_purpose_subagent(agent)
+        agent = create_deep_agent(
+            model=model, **{**kwargs, "subagents": [bounded, *agent_config.subagents]}
+        )
+        require(agent is not None, "create_deep_agent returned None on the bounded rebuild")
+        _require_subagents_bounded(agent)
 
     # A caller-supplied FilesystemMiddleware owns the allowlist from then on, so
     # there is no allowlist of ours left to assert.

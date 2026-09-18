@@ -227,11 +227,26 @@ def test_reasoning_effort_accepts_every_documented_value(
     assert ModelConfig(api_key=valid_secret, reasoning_effort=effort).reasoning_effort == effort
 
 
-def test_reasoning_effort_rejects_an_undocumented_value(valid_secret: SecretStr) -> None:
+def test_reasoning_effort_offers_exactly_the_three_levels_the_model_has() -> None:
+    """gpt-oss was post-trained on three efforts, and the provider rejects the
+    rest with a 400 (measured 2026-09-18, F26). A set wider than that is a
+    precondition that passes values the request is guaranteed to fail on."""
+    assert {"low", "medium", "high"} == REASONING_EFFORTS
+
+
+@pytest.mark.parametrize(
+    "effort",
+    ["none", "minimal", "xhigh", "maximum"],
+    ids=["chat-template-refuses", "schema-refuses", "schema-refuses-too", "never-existed"],
+)
+def test_reasoning_effort_rejects_a_value_the_router_would_400_on(
+    valid_secret: SecretStr, effort: str
+) -> None:
     """A caller we own passed it, so this is a programmer error and crashes.
-    The router answers 400 for an unknown effort; failing here names the field."""
+    `none`, `minimal` and `xhigh` are the ones that matter: the router documents
+    them, this set used to list them, and every one of them fails on the wire."""
     with pytest.raises(CheckFailed, match="reasoning_effort"):
-        ModelConfig(api_key=valid_secret, reasoning_effort="maximum")
+        ModelConfig(api_key=valid_secret, reasoning_effort=effort)
 
 
 def test_reasoning_effort_reaches_the_model(valid_secret: SecretStr) -> None:
