@@ -101,6 +101,43 @@ def test_agent_config_accepts_real_middleware_and_permissions(
     assert len(config.permissions) == 1
 
 
+def test_agent_config_freezes_the_rules_it_was_given(
+    deny_secrets: FilesystemPermission,
+) -> None:
+    """`frozen=True` stops the field being rebound, not the list behind it being
+    mutated. Without coercion a caller passes validation and then appends
+    anything they like, and `_agent_kwargs` forwards it to create_deep_agent."""
+    rules = [deny_secrets]
+    config = AgentConfig(permissions=rules)
+
+    rules.append("not a permission at all")  # type: ignore[arg-type]
+
+    assert config.permissions == (deny_secrets,)
+
+
+def test_agent_config_freezes_the_middleware_it_was_given() -> None:
+    entries = [TodoListMiddleware()]
+    config = AgentConfig(middleware=entries)
+
+    entries.append("not middleware")  # type: ignore[arg-type]
+
+    assert len(config.middleware) == 1
+
+
+def test_agent_config_freezes_the_tools_it_was_given() -> None:
+    @tool
+    def echo(text: str) -> str:
+        """Echo the input back."""
+        return text
+
+    tools = [echo]
+    config = AgentConfig(tools=tools)
+
+    tools.append("not a tool")  # type: ignore[arg-type]
+
+    assert config.tools == (echo,)
+
+
 # --------------------------------------------------------------------------
 # _agent_kwargs — the assembly build_agent does not pass straight through
 # --------------------------------------------------------------------------

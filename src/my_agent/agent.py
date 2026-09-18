@@ -155,6 +155,16 @@ class AgentConfig:
     """Filesystem access rules. Empty by default — no rules, not "deny all"."""
 
     def __post_init__(self) -> None:
+        # Coerce before validating. `frozen=True` stops a field being rebound but
+        # not the sequence behind it being mutated, so validating the caller's own
+        # list leaves every check below defeatable by a later append -- and for
+        # `permissions` and `middleware` that means a capability decision that
+        # can be changed after it was reviewed. `object.__setattr__` is how a
+        # frozen dataclass assigns; it works with `slots=True`.
+        object.__setattr__(self, "tools", tuple(self.tools))
+        object.__setattr__(self, "middleware", tuple(self.middleware))
+        object.__setattr__(self, "permissions", tuple(self.permissions))
+
         require(self.name != "", "name must not be empty")
         require(self.system_prompt.strip() != "", "system_prompt must not be blank")
         for entry in self.middleware:
