@@ -71,12 +71,22 @@ class TracingMisconfigured(RuntimeError):
 class TracingBackend(Protocol):
     """One consumer's needs: the composition root turns a backend on and names it.
 
-    A read-only property rather than an attribute, so an implementation is free
-    to satisfy it with a `ClassVar`, a field, or a computed property.
+    `name` is a `ClassVar` because mypy and pyright disagree about what satisfies
+    a protocol variable, and only two spellings satisfy both (verified 2026-09-17,
+    mypy 2.3.1 / pyright latest — see `docs/findings.md` F16):
+
+    - this one: a `ClassVar` member, implemented by a `ClassVar`;
+    - a read-only `@property` member, implemented by an instance attribute.
+
+    A read-only `@property` here implemented by a `ClassVar` — the obvious
+    spelling, and what this protocol used to say — passes mypy and fails pyright.
+    The `ClassVar` form is the one that keeps `name` out of the implementations'
+    generated `__init__`, so no caller can construct a backend with a name of
+    their choosing. The cost is that an implementation must use a `ClassVar` too:
+    an instance attribute no longer conforms.
     """
 
-    @property
-    def name(self) -> str: ...
+    name: ClassVar[str]
 
     def activate(self) -> None: ...
 

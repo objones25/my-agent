@@ -371,6 +371,47 @@ this fixed behaviour rather than the original, false claim.
 
 ---
 
+## F16 — mypy and pyright disagree about what satisfies a protocol variable
+
+**Severity: moderate.** The repo's CI type checker is mypy; the editor most likely to open this
+code runs pyright (Pylance). A spelling that passes one and fails the other means a clean CI run
+and a file full of red squiggles, which is how a protocol ends up quietly re-shaped by whoever's
+IDE complained loudest.
+
+`TracingBackend` originally declared `name` as a read-only `@property` and both adapters satisfied
+it with a `ClassVar[str]`. mypy accepts that. pyright rejects it:
+
+    "LangSmithTracing" is incompatible with protocol "TracingBackend"
+      "name" is not defined as a ClassVar in protocol
+
+*How it was checked.* All four combinations, against mypy 2.3.1 (`--strict`) and pyright (latest,
+via `npx pyright`), on 2026-09-17:
+
+| Protocol declares | Implementation uses | mypy | pyright |
+|---|---|---|---|
+| read-only `@property` | `ClassVar[str]` | pass | **fail** |
+| `name: ClassVar[str]` | `ClassVar[str]` | pass | pass |
+| read-only `@property` | instance attribute | pass | pass |
+| `name: ClassVar[str]` | instance attribute | **fail** | **fail** |
+
+Only two spellings satisfy both checkers, and they are not interchangeable: the `ClassVar` form
+requires implementations to use a `ClassVar`, and the `@property` form requires them not to.
+
+*What the code does:* `TracingBackend` declares `name: ClassVar[str]`, and both adapters keep their
+`ClassVar`. That form was chosen over the read-only-property one because a `ClassVar` stays out of
+a dataclass's generated `__init__`, so no caller can construct a backend with a name of their
+choosing — `name` identifies the backend rather than describing an instance. The protocol's
+docstring records the constraint so the next implementation does not reach for an instance
+attribute and fail pyright in the other direction.
+
+*Still unverified:* whether other protocol members in this repo have the same divergence. Nothing
+else here declares a protocol variable, so there is nothing else to check yet — but any new
+protocol with a non-method member should be run past both checkers before it is relied on. pyright
+is not currently in the dev dependencies or any gate; `npx pyright src tests` is a one-line manual
+check.
+
+---
+
 ## Live verification
 
 `uv run my-agent` runs one check per finding against the real router and prints PASS/FAIL. As of
