@@ -75,6 +75,100 @@ def _clip(value: Any) -> tuple[Any, bool]:
     return text[:MAX_FIELD_CHARS], True
 
 
+_RESPONSE_METADATA_KEYS = (
+    "finish_reason",
+    "model_name",
+    "model_provider",
+    "system_fingerprint",
+    "service_tier",
+)
+"""Response fields worth keeping, named rather than copied wholesale.
+
+`finish_reason` separates a complete answer from one that hit a token cap, and
+the router picks a provider per request — so without `model_provider` a log
+cannot say who actually served a call.
+"""
+
+
+def _tool_call_summary(call: Any) -> dict[str, Any]:
+    """A tool call as name, arguments and id.
+
+    Tool calls are the half of an assistant turn that `.text` does not carry: a
+    turn that requested a tool has empty text, and without this a tool-calling
+    turn and an empty reply look identical in the log.
+    """
+    if not isinstance(call, dict):
+        return {"raw": call}
+    return {"name": call.get("name"), "args": call.get("args"), "id": call.get("id")}
+
+
+def _message_summary(message: BaseMessage) -> dict[str, Any]:
+    """Role, text, and any tool calls the message asked for."""
+    summary: dict[str, Any] = {"type": message.type, "text": message.text}
+    calls = getattr(message, "tool_calls", None)
+    if calls:
+        summary["tool_calls"] = [_tool_call_summary(c) for c in calls]
+    return summary
+
+
+def _invocation_params(kwargs: dict[str, Any]) -> dict[str, Any]:
+    """What was actually sent: model, temperature, caps, reasoning effort, tools.
+
+    Unlike `serialized` — which carries constructor kwargs and is never written —
+    `ChatOpenAI._get_invocation_params()` was verified on 2026-09-17 to contain no
+    credential: `model`, `model_name`, `temperature`, `stream`, `stop`, `_type`.
+
+    Tool *definitions* are reduced to their names. The schemas are static, and
+    repeating them on every model call would dominate the file.
+    """
+    params = kwargs.get("invocation_params")
+    if not isinstance(params, dict):
+        return {}
+
+    summary = {k: v for k, v in params.items() if k != "tools"}
+    tools = params.get("tools")
+    if isinstance(tools, list):
+        summary["tools"] = [_tool_definition_name(t) for t in tools]
+    return summary
+
+
+def _tool_definition_name(tool: Any) -> Any:
+    if isinstance(tool, dict):
+        function = tool.get("function")
+        if isinstance(function, dict) and "name" in function:
+            return function["name"]
+        if "name" in tool:
+            return tool["name"]
+    return tool
+
+
+def _state_summary(value: Any) -> Any:
+    """What a graph step carried, without repeating the whole conversation.
+
+    `chain_*` payloads are the agent's entire state, every time. Written in full
+    they were 77% of a real run's bytes and within 6% of `MAX_FIELD_CHARS` on a
+    five-check smoke run — and because deepagents passes `Command` objects here
+    rather than the `dict` the signature promises, `default=str` turned them into
+    Python reprs that no JSON reader can query.
+
+    The content is already recorded structurally by `chat_model_start`, `llm_end`
+    and the tool records. What is worth keeping here is the *shape*: which keys a
+    step passed and how the message list grew.
+    """
+    if isinstance(value, dict):
+        summary: dict[str, Any] = {"keys": sorted(str(k) for k in value)}
+        messages = value.get("messages")
+        if isinstance(messages, list):
+            summary["messages"] = len(messages)
+            summary["message_types"] = [
+                getattr(m, "type", type(m).__name__) for m in messages
+            ]
+        return summary
+    if isinstance(value, list):
+        return {"items": len(value), "types": sorted({type(v).__name__ for v in value})}
+    return {"type": type(value).__name__}
+
+
 def _component_name(serialized: dict[str, Any] | None, kwargs: dict[str, Any]) -> str:
     """The component's name, and *only* the name.
 
@@ -156,7 +250,7 @@ class JsonlMirror(BaseCallbackHandler):
             run_id,
             parent_run_id,
             name=_component_name(serialized, kwargs),
-            inputs=inputs,
+            inputs=_state_summary(inputs),
         )
 
     @override
@@ -168,7 +262,7 @@ class JsonlMirror(BaseCallbackHandler):
         parent_run_id: UUID | None = None,
         **kwargs: Any,
     ) -> None:
-        self._write("chain_end", run_id, parent_run_id, outputs=outputs)
+        self._write("chain_end", run_id, parent_run_id, outputs=_state_summary(outputs))
 
     @override
     def on_chain_error(
@@ -252,11 +346,8 @@ class JsonlMirror(BaseCallbackHandler):
             run_id,
             parent_run_id,
             name=_component_name(serialized, kwargs),
-            messages=[
-                {"type": message.type, "text": message.text}
-                for batch in messages
-                for message in batch
-            ],
+            params=_invocation_params(kwargs),
+            messages=[_message_summary(message) for batch in messages for message in batch],
         )
 
     @override
@@ -270,15 +361,47 @@ class JsonlMirror(BaseCallbackHandler):
         **kwargs: Any,
     ) -> None:
         outputs: list[str] = []
+        tool_calls: list[dict[str, Any]] = []
         usage: dict[str, Any] | None = None
+        metadata: dict[str, Any] = {}
+        extra: dict[str, Any] = {}
+
         for batch in response.generations:
             for generation in batch:
                 outputs.append(generation.text)
                 message = getattr(generation, "message", None)
-                metadata = getattr(message, "usage_metadata", None)
-                if metadata:
-                    usage = dict(metadata)
-        self._write("llm_end", run_id, parent_run_id, outputs=outputs, usage=usage)
+                if message is None:
+                    continue
+
+                calls = getattr(message, "tool_calls", None)
+                if calls:
+                    tool_calls.extend(_tool_call_summary(call) for call in calls)
+
+                response_metadata = getattr(message, "response_metadata", None) or {}
+                for key in _RESPONSE_METADATA_KEYS:
+                    if key in response_metadata:
+                        metadata[key] = response_metadata[key]
+
+                # Where a provider would put reasoning content if it returned any.
+                # None does today — the token count is all we get — so this is
+                # empty in practice and omitted rather than written as `{}`.
+                for key, value in (getattr(message, "additional_kwargs", None) or {}).items():
+                    if value:
+                        extra[key] = value
+
+                token_usage = getattr(message, "usage_metadata", None)
+                if token_usage:
+                    usage = dict(token_usage)
+
+        payload: dict[str, Any] = {
+            "outputs": outputs,
+            "tool_calls": tool_calls,
+            "usage": usage,
+            "metadata": metadata,
+        }
+        if extra:
+            payload["extra"] = extra
+        self._write("llm_end", run_id, parent_run_id, **payload)
 
     @override
     def on_llm_error(

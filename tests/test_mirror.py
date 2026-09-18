@@ -138,14 +138,30 @@ def test_tuple_keyed_dict_does_not_raise(mirror: JsonlMirror, stream: io.StringI
 
 def test_circular_reference_does_not_raise(mirror: JsonlMirror, stream: io.StringIO) -> None:
     """`json.dumps` does not handle circular references; a self-referential
-    dict raises `ValueError` ("Circular reference detected") straight out of
-    the plain `default=str` round trip. See F15."""
+    structure raises `ValueError` ("Circular reference detected") straight out
+    of the plain `default=str` round trip. See F15.
+
+    Driven through `on_tool_end` because that is where raw, arbitrary data now
+    reaches `_clip`: a tool returns whatever it returns. Chain payloads take the
+    `_state_summary` path instead (F18) and never hand a cycle to `json.dumps` —
+    covered separately below."""
+    payload: dict[str, Any] = {}
+    payload["self"] = payload
+    mirror.on_tool_end(payload, run_id=RUN_ID)
+    written = records(stream)[0]
+    assert written["event"] == "tool_end"
+    assert isinstance(written["output"], str)
+
+
+def test_a_cyclic_chain_payload_is_summarised_rather_than_stringified(
+    mirror: JsonlMirror, stream: io.StringIO
+) -> None:
+    """The same cycle through a chain hook: summarising the shape sidesteps the
+    serialisation problem instead of falling back to a repr."""
     payload: dict[str, Any] = {}
     payload["self"] = payload
     mirror.on_chain_end(payload, run_id=RUN_ID)
-    written = records(stream)[0]
-    assert written["event"] == "chain_end"
-    assert isinstance(written["outputs"], str)
+    assert records(stream)[0]["outputs"] == {"keys": ["self"]}
 
 
 def test_nan_payload_writes_strict_json_with_no_bare_nan_token(
@@ -275,3 +291,163 @@ def test_mirror_to_file_closes_the_file_even_when_the_run_raises(tmp_path: Path)
         mirror.on_chain_start({"name": "agent"}, {}, run_id=RUN_ID)
         raise RuntimeError("the agent exploded")
     assert json.loads(path.read_text().strip())["name"] == "agent"
+
+
+# --------------------------------------------------------------------------
+# Request and response shape (F18)
+# --------------------------------------------------------------------------
+
+TOOL_CALL = {
+    "name": "write_file",
+    "args": {"path": "/notes.txt"},
+    "id": "call_1",
+    "type": "tool_call",
+}
+
+
+def _llm_result(message: AIMessage) -> LLMResult:
+    return LLMResult(generations=[[ChatGeneration(message=message)]])
+
+
+def test_chat_model_start_records_what_was_sent(mirror: JsonlMirror, stream: io.StringIO) -> None:
+    """Without this the log cannot answer "what did we ask for?" — no model id,
+    no temperature, no cap, no reasoning effort."""
+    mirror.on_chat_model_start(
+        {"name": "ChatOpenAI"},
+        [[HumanMessage("ping")]],
+        run_id=RUN_ID,
+        invocation_params={
+            "model": "openai/gpt-oss-120b",
+            "temperature": 0.0,
+            "reasoning_effort": "low",
+            "max_completion_tokens": 24,
+        },
+    )
+    params = records(stream)[0]["params"]
+    assert params["model"] == "openai/gpt-oss-120b"
+    assert params["reasoning_effort"] == "low"
+    assert params["max_completion_tokens"] == 24
+
+
+def test_chat_model_start_reduces_tool_definitions_to_names(
+    mirror: JsonlMirror, stream: io.StringIO
+) -> None:
+    """Tool schemas are static and would dominate every single record."""
+    mirror.on_chat_model_start(
+        {"name": "ChatOpenAI"},
+        [[HumanMessage("ping")]],
+        run_id=RUN_ID,
+        invocation_params={
+            "model": "m",
+            "tools": [
+                {"type": "function", "function": {"name": "write_file", "parameters": {"x": "y"}}},
+                {"type": "function", "function": {"name": "read_file", "parameters": {"x": "y"}}},
+            ],
+        },
+    )
+    assert records(stream)[0]["params"]["tools"] == ["write_file", "read_file"]
+    assert "parameters" not in stream.getvalue()
+
+
+def test_chat_model_start_keeps_tool_calls_in_the_history(
+    mirror: JsonlMirror, stream: io.StringIO
+) -> None:
+    """An assistant turn that called a tool has empty text; without its
+    tool_calls the replayed history is wrong, not merely thin."""
+    history = [HumanMessage("go"), AIMessage(content="", tool_calls=[TOOL_CALL])]
+    mirror.on_chat_model_start({"name": "ChatOpenAI"}, [history], run_id=RUN_ID)
+    messages = records(stream)[0]["messages"]
+    assert messages[1]["tool_calls"] == [
+        {"name": "write_file", "args": {"path": "/notes.txt"}, "id": "call_1"}
+    ]
+
+
+def test_llm_end_records_the_tool_calls_the_model_asked_for(
+    mirror: JsonlMirror, stream: io.StringIO
+) -> None:
+    """The defect this fixes: a tool-calling turn logged outputs [""] and was
+    indistinguishable from an empty reply."""
+    mirror.on_llm_end(_llm_result(AIMessage(content="", tool_calls=[TOOL_CALL])), run_id=RUN_ID)
+    record = records(stream)[0]
+    assert record["outputs"] == [""]
+    assert record["tool_calls"] == [
+        {"name": "write_file", "args": {"path": "/notes.txt"}, "id": "call_1"}
+    ]
+
+
+def test_llm_end_records_finish_reason_and_which_model_answered(
+    mirror: JsonlMirror, stream: io.StringIO
+) -> None:
+    """`length` vs `stop` is the difference between a complete answer and a
+    truncated one — and the router picks a provider per request."""
+    message = AIMessage(
+        content="pong",
+        response_metadata={
+            "finish_reason": "length",
+            "model_name": "openai/gpt-oss-120b",
+            "model_provider": "groq",
+            "system_fingerprint": "fp_abc",
+        },
+    )
+    mirror.on_llm_end(_llm_result(message), run_id=RUN_ID)
+    metadata = records(stream)[0]["metadata"]
+    assert metadata["finish_reason"] == "length"
+    assert metadata["model_name"] == "openai/gpt-oss-120b"
+    assert metadata["model_provider"] == "groq"
+
+
+def test_llm_end_records_reasoning_tokens(mirror: JsonlMirror, stream: io.StringIO) -> None:
+    """Reasoning is most of the output on this model; the count is the only part
+    of it the provider returns."""
+    message = AIMessage(
+        content="pong",
+        usage_metadata={
+            "input_tokens": 74,
+            "output_tokens": 47,
+            "total_tokens": 121,
+            "output_token_details": {"reasoning": 36},
+        },
+    )
+    mirror.on_llm_end(_llm_result(message), run_id=RUN_ID)
+    assert records(stream)[0]["usage"]["output_token_details"]["reasoning"] == 36
+
+
+def test_llm_end_keeps_reasoning_content_when_a_provider_returns_it(
+    mirror: JsonlMirror, stream: io.StringIO
+) -> None:
+    """No provider we use returns it today. If one starts, it lands here rather
+    than being dropped on the floor."""
+    message = AIMessage(content="pong", additional_kwargs={"reasoning_content": "step 1..."})
+    mirror.on_llm_end(_llm_result(message), run_id=RUN_ID)
+    assert records(stream)[0]["extra"]["reasoning_content"] == "step 1..."
+
+
+def test_llm_end_omits_extra_when_there_is_nothing_in_it(
+    mirror: JsonlMirror, stream: io.StringIO
+) -> None:
+    mirror.on_llm_end(_llm_result(AIMessage(content="pong")), run_id=RUN_ID)
+    assert "extra" not in records(stream)[0]
+
+
+def test_chain_records_summarise_state_instead_of_dumping_reprs(
+    mirror: JsonlMirror, stream: io.StringIO
+) -> None:
+    """Chain payloads were 77% of a real run's bytes, as Python reprs no JSON
+    reader can query. The content lives in the model and tool records."""
+    state = {"messages": [HumanMessage("go"), AIMessage(content="", tool_calls=[TOOL_CALL])],
+             "todos": []}
+    mirror.on_chain_start({"name": "agent"}, state, run_id=RUN_ID)
+    inputs = records(stream)[0]["inputs"]
+    assert inputs["keys"] == ["messages", "todos"]
+    assert inputs["messages"] == 2
+    assert inputs["message_types"] == ["human", "ai"]
+    assert "AIMessage(" not in stream.getvalue()
+
+
+def test_chain_end_summarises_a_non_dict_payload(
+    mirror: JsonlMirror, stream: io.StringIO
+) -> None:
+    """deepagents returns `Command` objects here, not the dict the signature
+    promises — that is what produced the repr blobs."""
+    mirror.on_chain_end(["not-a-dict"], run_id=RUN_ID)  # type: ignore[arg-type]
+    assert records(stream)[0]["outputs"]["items"] == 1

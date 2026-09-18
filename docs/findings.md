@@ -419,6 +419,96 @@ protocol with a non-method member should be run past both checkers before it is 
 
 ---
 
+## F17 — reasoning is most of the output, and the only dial is `reasoning_effort`
+
+**Severity: important.** It is a cost lever that was running at the provider's default, and it
+silently changes what a token cap means.
+
+`openai/gpt-oss-120b` reasons on essentially every call. From a real `uv run my-agent` run
+(`logs/20260918T021743Z-b8cf1012.jsonl`), reasoning tokens as a share of output:
+
+| check | reasoning | output |
+|---|---|---|
+| F1 "pong" | 36 | 47 |
+| F2 token cap | **21** | **24** |
+| F4 shell refusal | 74 | 146 |
+
+The F2 row is the one that matters: with `TOKEN_CAP = 24`, reasoning consumed 21 of the 24 tokens
+and the visible answer got 3, which is why that record's text is empty. **A token cap on a
+reasoning model is mostly a reasoning cap.** The check still verifies what it claims — the cap is
+honoured — but it is not evidence that 24 tokens buys 24 tokens of answer.
+
+*How it was checked.* `reasoning_effort` is documented by the router as an optional Chat Completions
+body parameter (`none, minimal, low, medium, high, xhigh`). Verified on the wire 2026-09-17, one
+prompt, three settings:
+
+```
+effort=None   reasoning=50   output=61    text='9'
+effort=low    reasoning= 6   output=17    text='9'
+effort=high   reasoning=93   output=104   text='9'
+```
+
+Identical answers, a ~15x spread in reasoning tokens. Unset is *not* "off" — it is the provider's
+default, which sat between `low` and `high`.
+
+**Use `reasoning_effort` (str), not `reasoning` (dict).** Both are `ChatOpenAI` fields.
+`reasoning` is the Responses API's parameter, and `BaseChatOpenAI._use_responses_api` returns
+`True` whenever `self.reasoning is not None` — so on a default `use_responses_api=None` instance,
+setting it would silently reroute every request to `/v1/responses`, which the router does not
+serve (F1). Our pinned `USE_RESPONSES_API = False` short-circuits that check before it is reached,
+so the pin protects us — but the parameter would then be sent in a Chat Completions body, where it
+does not belong.
+
+*What the code does:* `ModelConfig.reasoning_effort` (default `None`, i.e. unchanged behaviour),
+validated against `REASONING_EFFORTS`. A bad value from a caller is a `CheckFailed`; a bad value
+from `REASONING_EFFORT` in the environment is a `ValueError` at the edge. Verified end to end:
+`REASONING_EFFORT=low uv run my-agent ...` put `reasoning_effort: "low"` in the request params and
+produced 8/4/0 reasoning tokens where the same three-call shape had produced 16/11/11 at default.
+
+*Still unverified:* whether every provider the router may select honours the parameter, and whether
+`none`/`minimal` differ from `low` on this model.
+
+---
+
+## F18 — the mirror recorded the conversation three times and the request not at all
+
+**Severity: important.** The log could not answer either of the two questions it exists for.
+
+Measured on a real 5-check run (52 records, 36KB):
+
+- **`llm_end` dropped the half of a response that matters.** No tool calls, so a tool-calling turn
+  logged `outputs: [""]` and was indistinguishable from an empty reply — four of eight records
+  looked empty. No `finish_reason`, so "finished" and "hit the cap" were the same record. No
+  `model_name` or `model_provider`, though the router picks a provider per request.
+- **`chat_model_start` recorded no request at all** — `{type, text}` per message and nothing else.
+  No model id, temperature, token cap, tool list, or reasoning effort. Assistant messages lost
+  their `tool_calls`, so the history was not replayable.
+- **`chain_start`/`chain_end` were 77% of the bytes**, as Python `repr` strings: deepagents passes
+  `Command` objects where the signature promises `dict`, and `default=str` stringified them. Not
+  queryable by `jq`, not a stable format, and a duplicate of content already recorded elsewhere.
+  The largest field was 3745 chars against `MAX_FIELD_CHARS = 4000` — **94% of the truncation
+  bound on a smoke test**, so a slightly longer conversation would have truncated a repr blob into
+  an unparseable fragment.
+
+*How it was checked.* Every field of every record in a real run, plus a callback probe confirming
+the missing data is all reachable: `on_chat_model_start` receives `invocation_params` in `kwargs`,
+and `on_llm_end` has `generation.message.tool_calls`, `.response_metadata` and
+`.additional_kwargs`. `ChatOpenAI._get_invocation_params()` was checked for credential leakage and
+carries none — unlike `serialized`, which is why that one is still never written.
+
+*What the code does:* `llm_end` records `tool_calls`, `metadata` (`finish_reason`, `model_name`,
+`model_provider`, `system_fingerprint`, `service_tier`) and, when non-empty, `extra` from
+`additional_kwargs` — which is where reasoning *content* would land if a provider ever returned
+any. None does today; the token count in `usage.output_token_details.reasoning` is all we get.
+`chat_model_start` records `params`, with tool definitions reduced to their names. `chain_*`
+records a `_state_summary` — the keys a step carried and how the message list grew — because the
+content is already recorded structurally by the model and tool records.
+
+Verified on a live run afterwards: no repr blobs remain, the largest field fell from 3745 to 563
+chars, and `chain_*` fell from 77% to 39% of a file less than a quarter the size per turn.
+
+---
+
 ## Live verification
 
 `uv run my-agent` runs one check per finding against the real router and prints PASS/FAIL. As of

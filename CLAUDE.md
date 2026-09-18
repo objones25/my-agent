@@ -218,7 +218,7 @@ Two different things; keep them apart.
 Recorded from `inspect` against the installed wheels on 2026-09-17. Re-verify after any `uv sync`
 that moves these versions.
 
-**`docs/findings.md` is the full record** — sixteen verified library and tooling behaviours (F1–F16), each with
+**`docs/findings.md` is the full record** — eighteen verified library and tooling behaviours (F1–F18), each with
 how it was checked, what the code does about it, and what is still unverified. Read it before
 debugging anything that looks like a library bug, and add to it when you verify something new. The
 summary below covers only what is needed to write code day to day.
@@ -311,6 +311,18 @@ alias runs the same direction, so there is no way to send `max_tokens` through t
 router with a `-m live` test first, since whether a given provider also accepts
 `max_completion_tokens` is unverified here.
 
+**Reasoning is on by default and costs real tokens.** `openai/gpt-oss-120b` spends most of its
+output budget reasoning — 36 of 47 tokens on a one-word answer, and 21 of 24 on the capped F2
+check, which is why that check's visible text is empty. The dial is `reasoning_effort`
+(`none, minimal, low, medium, high, xhigh`), a Chat Completions body parameter the router honours:
+the same prompt cost 6 reasoning tokens at `low`, 50 unset, and 93 at `high`. `ModelConfig` exposes
+it as a field, defaulting to `None` (the provider's default, not "off"), settable per run with the
+`REASONING_EFFORT` env var. **Do not use `ChatOpenAI.reasoning`** — that dict field is the
+Responses API's, and `_use_responses_api` returns `True` whenever it is set; only the pinned
+`USE_RESPONSES_API = False` stops it rerouting the request. See F17.
+
+Because reasoning is spent first, a token cap is mostly a reasoning cap: budget for both.
+
 - Default: `openai/gpt-oss-120b` — 11 live providers (groq, cerebras, together, fireworks-ai,
   novita, nscale, featherless-ai, scaleway, ovhcloud, deepinfra, baseten). Smaller and faster, and
   a harder test of the harness.
@@ -399,7 +411,7 @@ tests/                # deterministic, offline by default — one file per sourc
   test_tracing.py  test_mirror.py
 evals/                # model-dependent, -m eval
 docs/
-  findings.md         # F1-F16: verified library/tooling behaviour and what the code does
+  findings.md         # F1-F18: verified library/tooling behaviour and what the code does
 scripts/
   audit_negative_space.py   # VENDORED from the negative-space-programming skill; do not hand-edit.
                             # Refresh by re-copying from the skill; excluded from ruff and mypy.

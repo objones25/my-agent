@@ -33,6 +33,8 @@ __all__ = [
     "DEFAULT_TIMEOUT_S",
     "HF_ROUTER_BASE_URL",
     "MODEL_ENV_VAR",
+    "REASONING_EFFORTS",
+    "REASONING_EFFORT_ENV_VAR",
     "USE_RESPONSES_API",
     "ModelConfig",
     "build_model",
@@ -62,6 +64,19 @@ DEFAULT_MAX_RETRIES = 2
 
 API_KEY_ENV_VAR = "HF_TOKEN"
 MODEL_ENV_VAR = "MODEL_ID"
+REASONING_EFFORT_ENV_VAR = "REASONING_EFFORT"
+
+REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh"})
+"""Values the router documents for `reasoning_effort` (Chat Completions body).
+
+Verified on the wire 2026-09-17 with `openai/gpt-oss-120b`: one prompt answered
+identically at every setting, while reasoning tokens went 6 (`low`), 50 (unset),
+93 (`high`). See `docs/findings.md` F17. Unset is *not* zero effort — it is the
+provider's default, which sat between `low` and `high`.
+
+`reasoning_effort` is the Chat Completions knob. `ChatOpenAI` also has a
+`reasoning` *dict* field, which is the Responses API's; do not use it here.
+"""
 
 USE_RESPONSES_API = False
 """Pinned, never inferred, and never configurable.
@@ -117,6 +132,11 @@ class ModelConfig:
     timeout: float = DEFAULT_TIMEOUT_S
     """Seconds."""
     max_retries: int = DEFAULT_MAX_RETRIES
+    reasoning_effort: str | None = None
+    """How hard the model thinks before answering, or `None` for the provider's
+    default. On a reasoning model this is a cost dial, not a quality knob: the
+    same answer cost 6 tokens at `low` and 93 at `high` (F17). It is also what a
+    token cap actually constrains — reasoning is spent first."""
 
     def __post_init__(self) -> None:
         # Programmer errors: every one of these is fixed in code, not at runtime.
@@ -138,6 +158,11 @@ class ModelConfig:
         )
         require(self.timeout > 0.0, f"timeout must be positive, got {self.timeout}")
         require(self.max_retries >= 0, f"max_retries must be non-negative, got {self.max_retries}")
+        require(
+            self.reasoning_effort is None or self.reasoning_effort in REASONING_EFFORTS,
+            f"reasoning_effort must be one of {sorted(REASONING_EFFORTS)} or None, "
+            f"got {self.reasoning_effort!r}; the router answers 400 for an unknown effort",
+        )
 
     def as_kwargs(self) -> dict[str, Any]:
         """Constructor keywords for `ChatOpenAI`."""
@@ -166,7 +191,17 @@ class ModelConfig:
         if not model:
             raise ValueError(f"{MODEL_ENV_VAR} is set but empty; unset it to use the default.")
 
-        return cls(api_key=SecretStr(api_key), model=model)
+        # Absent means "provider's default", which is the behaviour every run had
+        # before this field existed. A *wrong* value came from the outside world,
+        # so it is an operating error reported at the edge, not a CheckFailed.
+        effort = source.get(REASONING_EFFORT_ENV_VAR, "").strip() or None
+        if effort is not None and effort not in REASONING_EFFORTS:
+            raise ValueError(
+                f"{REASONING_EFFORT_ENV_VAR}={effort!r} is not one of "
+                f"{sorted(REASONING_EFFORTS)}; unset it to use the provider's default."
+            )
+
+        return cls(api_key=SecretStr(api_key), model=model, reasoning_effort=effort)
 
 
 check_config_contract(ModelConfig, _CHAT_OPENAI_PARAMS, "ChatOpenAI", _MODEL_INJECTED_PARAMS)

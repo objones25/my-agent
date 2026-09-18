@@ -22,6 +22,8 @@ from my_agent.model import (
     DEFAULT_MODEL,
     HF_ROUTER_BASE_URL,
     MODEL_ENV_VAR,
+    REASONING_EFFORT_ENV_VAR,
+    REASONING_EFFORTS,
     USE_RESPONSES_API,
     ModelConfig,
     build_model,
@@ -196,3 +198,56 @@ def test_model_config_does_not_carry_the_factory_injected_parameter(
     """`use_responses_api` is supplied by build_model. A field of that name would
     collide on splat."""
     assert "use_responses_api" not in ModelConfig(api_key=valid_secret).as_kwargs()
+
+
+# --------------------------------------------------------------------------
+# reasoning_effort — the dial (F17)
+# --------------------------------------------------------------------------
+
+
+def test_reasoning_effort_is_unset_by_default(valid_secret: SecretStr) -> None:
+    """Unset means "provider's choice", which is what every run did before this
+    field existed. Adding the dial must not silently change behaviour."""
+    assert ModelConfig(api_key=valid_secret).reasoning_effort is None
+
+
+@pytest.mark.parametrize("effort", sorted(REASONING_EFFORTS))
+def test_reasoning_effort_accepts_every_documented_value(
+    valid_secret: SecretStr, effort: str
+) -> None:
+    assert ModelConfig(api_key=valid_secret, reasoning_effort=effort).reasoning_effort == effort
+
+
+def test_reasoning_effort_rejects_an_undocumented_value(valid_secret: SecretStr) -> None:
+    """A caller we own passed it, so this is a programmer error and crashes.
+    The router answers 400 for an unknown effort; failing here names the field."""
+    with pytest.raises(CheckFailed, match="reasoning_effort"):
+        ModelConfig(api_key=valid_secret, reasoning_effort="maximum")
+
+
+def test_reasoning_effort_reaches_the_model(valid_secret: SecretStr) -> None:
+    """The whole point: it has to survive the splat into ChatOpenAI."""
+    model = build_model(ModelConfig(api_key=valid_secret, reasoning_effort="low"))
+    assert model.reasoning_effort == "low"
+
+
+def test_reasoning_effort_is_absent_from_the_payload_when_unset(valid_secret: SecretStr) -> None:
+    """None must not be sent as a literal null — the router would reject it."""
+    model = build_model(ModelConfig(api_key=valid_secret))
+    assert "reasoning_effort" not in model._default_params
+
+
+def test_from_env_reads_reasoning_effort(valid_key: str) -> None:
+    config = ModelConfig.from_env({API_KEY_ENV_VAR: valid_key, REASONING_EFFORT_ENV_VAR: "high"})
+    assert config.reasoning_effort == "high"
+
+
+def test_from_env_rejects_an_invalid_reasoning_effort(valid_key: str) -> None:
+    """From the environment this is an *operating* error, not a programmer error:
+    the outside world supplied it, so it is reported, not crashed on."""
+    with pytest.raises(ValueError, match="REASONING_EFFORT"):
+        ModelConfig.from_env({API_KEY_ENV_VAR: valid_key, REASONING_EFFORT_ENV_VAR: "maximum"})
+
+
+def test_from_env_leaves_reasoning_effort_unset_when_absent(valid_key: str) -> None:
+    assert ModelConfig.from_env({API_KEY_ENV_VAR: valid_key}).reasoning_effort is None
