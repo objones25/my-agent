@@ -23,6 +23,7 @@ from deepagents import FilesystemMiddleware, FilesystemPermission, create_deep_a
 from deepagents.backends import FilesystemBackend, StateBackend
 from deepagents.backends.protocol import BackendProtocol
 from langchain.agents.middleware import TodoListMiddleware
+from langchain.tools import ToolRuntime
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.language_models.fake_chat_models import ParrotFakeChatModel
 from langchain_core.tools import tool
@@ -36,6 +37,7 @@ from my_agent.capabilities import (
     SHELL_TOOL_NAME,
     SUBAGENT_TASK_TOOL_NAME,
     compiled_tool_names,
+    compiled_tools,
     subagent_graphs,
 )
 from my_agent.model import ModelConfig, build_model
@@ -311,6 +313,84 @@ def test_build_agent_fails_when_the_subagent_reader_finds_nothing(
 
     with pytest.raises(CheckFailed, match="subagent"):
         build_agent(build_model(ModelConfig(api_key=valid_secret)))
+
+
+def _tool_runtime() -> ToolRuntime[None, Any]:
+    """The runtime a filesystem tool is normally handed by the graph.
+
+    A plain dataclass, so it can be built directly. `state` is empty because the
+    permission gate returns before the backend is reached; a call that gets past
+    the gate fails in the backend instead, which is exactly what makes the pair
+    of tests below discriminate.
+    """
+    return ToolRuntime(
+        state={"files": {}},
+        context=None,
+        config={},
+        stream_writer=lambda _chunk: None,
+        tool_call_id="call-1",
+        store=None,
+    )
+
+
+def test_a_subagent_shares_the_parents_filesystem_tool_objects(
+    valid_secret: SecretStr, deny_secrets: FilesystemPermission
+) -> None:
+    """Why the allowlist and the permission rules hold for a subagent at all.
+
+    deepagents builds its general-purpose subagent its own `FilesystemMiddleware`
+    (F20), and what replaces it is *our instance* — so the subagent's tools are
+    literally the parent's tool objects, closing over the same `_permissions` and
+    the same backend. Identity is the mechanism; the two tests below are its
+    observable consequence.
+    """
+    agent = build_agent(
+        build_model(ModelConfig(api_key=valid_secret)), AgentConfig(permissions=[deny_secrets])
+    )
+
+    parent = compiled_tools(agent)
+    subagent = compiled_tools(subagent_graphs(agent)["general-purpose"])
+
+    assert set(subagent) == set(parent) - {SUBAGENT_TASK_TOOL_NAME}
+    assert all(subagent[name] is parent[name] for name in subagent)
+
+
+def test_permission_rules_are_enforced_inside_a_subagent(
+    valid_secret: SecretStr, deny_secrets: FilesystemPermission
+) -> None:
+    """F5 proved the rules survive middleware replacement on the parent. This is
+    the half that was never checked: a subagent is a second place the tools run,
+    and a deny rule that reached only the parent would be a hole with a passing
+    test suite over it.
+    """
+    agent = build_agent(
+        build_model(ModelConfig(api_key=valid_secret)), AgentConfig(permissions=[deny_secrets])
+    )
+    write_file = compiled_tools(subagent_graphs(agent)["general-purpose"])["write_file"]
+
+    denied = write_file.func(file_path="/secrets/keys.txt", content="x", runtime=_tool_runtime())
+
+    assert denied.status == "error"
+    assert "permission denied" in str(denied.content)
+
+
+def test_the_subagents_deny_rule_is_targeted_rather_than_blanket(
+    valid_secret: SecretStr, deny_secrets: FilesystemPermission
+) -> None:
+    """The discriminator. Without it the test above would pass just as well if
+    *every* write were refused, which is not a permission system.
+
+    An allowed path gets past the gate and into `StateBackend`, which refuses to
+    run outside a real graph execution. That refusal is the proof: it can only be
+    reached by a call the permission check let through.
+    """
+    agent = build_agent(
+        build_model(ModelConfig(api_key=valid_secret)), AgentConfig(permissions=[deny_secrets])
+    )
+    write_file = compiled_tools(subagent_graphs(agent)["general-purpose"])["write_file"]
+
+    with pytest.raises(RuntimeError, match="LangGraph graph execution"):
+        write_file.func(file_path="/notes/ok.txt", content="x", runtime=_tool_runtime())
 
 
 def test_build_agent_accepts_tools(valid_secret: SecretStr) -> None:

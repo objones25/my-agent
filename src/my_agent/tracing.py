@@ -195,6 +195,16 @@ class WeaveTracing:
 
         No `settings=`: some of those values are evaluated on Weave's background
         thread pool and silently ignore the argument. Use `WEAVE_*` env vars.
+
+        **Nothing here bounds weave's exit wait, because nothing can.**
+        `weave.init` registers an `atexit` handler that waits up to
+        `FLUSH_TIMEOUT_SECONDS` -- hardcoded at 300s in weave's
+        `CallBatchProcessor` -- for call starts and ends to pair up. A start the
+        server dropped never pairs, so a process can take five minutes to exit
+        while its tests took three seconds. There is no setting and no
+        environment variable for it; `WEAVE_RETRY_*` is the wrong mechanism and
+        `WEAVE_USE_CALLS_COMPLETE=false` gets auto-upgraded back. Measured and
+        written up in F23 -- do not spend the afternoon again.
         """
         if get_weave_client() is not None:
             # weave.init installs global state; doing it twice is not harmless.

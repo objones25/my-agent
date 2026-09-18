@@ -31,6 +31,7 @@ __all__ = [
     "SUBAGENT_TASK_TOOL_NAME",
     "TOOL_RESULT_TOKEN_LIMIT",
     "compiled_tool_names",
+    "compiled_tools",
     "least_privilege_filesystem",
     "require_granted",
     "require_withheld",
@@ -224,8 +225,13 @@ def least_privilege_filesystem(
 
 
 
-def _tools_by_name(agent: CompiledStateGraph[Any, Any, Any, Any]) -> dict[str, Any]:
-    """The compiled graph's tool mapping.
+def compiled_tools(agent: CompiledStateGraph[Any, Any, Any, Any]) -> dict[str, Any]:
+    """The tool objects actually bound in a compiled agent, by name.
+
+    Public because identity matters, not just names: a subagent's filesystem
+    tools are *the same objects* as the parent's, closing over the same
+    middleware — which is why the permission rules and the allowlist reach it at
+    all (F20). A caller that only needs the names wants `compiled_tool_names`.
 
     Reaches through langgraph internals, so the structure is pinned here: if it
     moves, this fails loudly rather than returning nothing and making every
@@ -244,7 +250,7 @@ def _tools_by_name(agent: CompiledStateGraph[Any, Any, Any, Any]) -> dict[str, A
 
 def compiled_tool_names(agent: CompiledStateGraph[Any, Any, Any, Any]) -> frozenset[str]:
     """Tool names actually bound in a compiled agent."""
-    return frozenset(_tools_by_name(agent))
+    return frozenset(compiled_tools(agent))
 
 
 def _closure_values(fn: Callable[..., Any] | None) -> dict[str, Any]:
@@ -278,7 +284,7 @@ def subagent_graphs(
     because reporting "no subagents" for a structure that moved would pass every
     absence check without checking anything.
     """
-    task = _tools_by_name(agent).get(SUBAGENT_TASK_TOOL_NAME)
+    task = compiled_tools(agent).get(SUBAGENT_TASK_TOOL_NAME)
     if task is None:
         return {}
 

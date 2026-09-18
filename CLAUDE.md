@@ -20,9 +20,9 @@ uv sync                                   # install/refresh the locked environme
 uv run pytest                             # unit tests (live + eval cases deselected)
 uv run pytest tests/test_x.py::test_y     # a single test
 uv run pytest -m live > live.log 2>&1     # real HF router / LangSmith / W&B. Redirect, do not
-                                          # pipe: the process can hang in weave teardown *after*
-                                          # pytest reports, and `| tail; echo $?` then yields
-                                          # tail's status and none of the summary (F11).
+                                          # pipe: weave's teardown runs *after* pytest reports, so
+                                          # `| tail; echo $?` yields tail's status and none of the
+                                          # summary. The wait is bounded now (F23), not gone.
 uv run pytest -m eval                     # the eval suite
 uv run pytest --cov                       # coverage report
 uv run my-agent                           # live checks: one per finding in docs/findings.md
@@ -81,6 +81,10 @@ result. Concretely:
   allowlist. Ours reaches it only because deepagents merges middleware by `.name` into the
   subagent's list too — behaviour we do not control, so `_require_shell_withheld` reads every
   subagent graph back via `capabilities.subagent_graphs` and asserts there as well (F20).
+  The permission rules reach it for a stronger reason than the merge: a subagent's filesystem tools
+  are *the same objects* as the parent's, closing over the same `_permissions` and backend, so they
+  cannot diverge. `compiled_tools` is public so that identity is assertable, and a test drives the
+  subagent's own `write_file` to a denied path and gets `permission denied` with no model involved.
 - **Nothing is inherited, including the safe option.** `least_privilege_filesystem` passes its
   `backend` and three context bounds explicitly even though they equal deepagents' defaults, and a
   load-time check pins them against the wheel (F21). "Inherited a library default" and "chose the
@@ -220,6 +224,14 @@ Bugs live in the states the code was never written to handle. Write those down a
   on `run.RunBounds` and `run_turn` always sends them. A postcondition must be relative for the
   same reason: `len(messages) > 1` passes on any non-empty history while the agent contributes
   nothing, so the check is `> len(sent)`.
+- **Some bounds cannot be set from code, and saying so is the deliverable.** `weave.init()` signs
+  this process up for an `atexit` flush that joins its sender thread with no timeout, retrying for
+  up to five minutes, so a weave outage hangs shutdown rather than losing telemetry. Bounding it
+  from `activate()` was tried, measured ineffective and reverted — twice over, because retries are
+  not even the mechanism. The real wait is `FLUSH_TIMEOUT_SECONDS`, hardcoded at 300s inside weave's
+  `CallBatchProcessor`, spent waiting for call starts that were dropped and can never pair (F23).
+  There is no setting for it. Knowing that, and saying so where the next reader will look, is the
+  whole deliverable.
 - Split compound checks: `require(a); require(b)` names the failure, `require(a and b)` does not.
 - mypy cannot narrow types through `require()`. Where a check also narrows (`x is not None`), use an
   explicit `if ... raise CheckFailed(...)` — same runtime behaviour, and mypy follows it.
@@ -244,6 +256,10 @@ Two different things; keep them apart.
   showing the behaviour is really ours: `test_build_agent_withholds_the_shell_tool_from_every_subagent`
   is worthless without `test_a_bare_deep_agent_does_grant_the_shell_tool_to_its_subagent`, because
   the first keeps passing if deepagents stops granting `execute` for its own reasons.
+- **`monkeypatch.delenv(name, raising=False)` on an absent name records no undo**, so a variable
+  the code under test writes afterwards leaks into the next test. `setenv` then `delenv` when the
+  test needs the name absent *and* the code under test will set it. Verified with a two-test probe,
+  not assumed.
 - **A pinned value that equals the library default cannot be tested by reading it back.** Deleting
   the argument leaves the same value in place, so the test passes over the mutant. Record the
   *call* instead (patch the constructor where it is used, delegate to the real one) — F21 is the
@@ -269,7 +285,7 @@ Two different things; keep them apart.
 Recorded from `inspect` against the installed wheels on 2026-09-17. Re-verify after any `uv sync`
 that moves these versions.
 
-**`docs/findings.md` is the full record** — twenty-two verified library and tooling behaviours (F1–F22), each with
+**`docs/findings.md` is the full record** — twenty-three verified library and tooling behaviours (F1–F23), each with
 how it was checked, what the code does about it, and what is still unverified. Read it before
 debugging anything that looks like a library bug, and add to it when you verify something new. The
 summary below covers only what is needed to write code day to day.

@@ -631,10 +631,28 @@ graph leaked, with `require_granted` as its positive twin (two more verbatim cop
 `main.check_shell_tool_withheld` also carried a dead branch: `build_agent` raises when the tool is
 present, so the `CheckResult(..., False, f"bound: ...")` return was unreachable.
 
-*Still unverified:* whether a deny **permission rule** is enforced inside a subagent run. The rules
-do reach it (`_permissions` is forwarded to the subagent middleware, and ours carries them), and
-the parent path is live-verified by the F5 check, but no check has asked a subagent to write to
-`/secrets/**`.
+*Closed, offline.* Whether a deny rule is enforced *inside* a subagent was the open half, and it
+turned out to be provable without a model. The subagent's filesystem tools are not equivalents of
+the parent's, they are **the same objects**: `compiled_tools(subagent) is compiled_tools(parent)`
+holds name by name, because the middleware deepagents replaced was ours and each tool closes over
+that one instance's `self._permissions` and `self.backend` (read off
+`FilesystemMiddleware._create_write_file_tool`). Identity is the mechanism; two tests are its
+observable consequence, exercised through the subagent's own `write_file` with a hand-built
+`ToolRuntime`:
+
+- `/secrets/keys.txt` comes back `status="error"`, `"Error: permission denied for write on
+  /secrets/keys.txt"`.
+- `/notes/ok.txt` gets *past* the permission gate and fails inside `StateBackend`, which refuses to
+  run outside a graph execution. That refusal is the discriminator: it is reachable only by a call
+  the rule allowed, so the deny is targeted rather than blanket.
+
+Both were checked against a rule that no longer covers the path and a rule flipped to `allow`; the
+enforcement test fails under each, so it is sensitive to the rule's content and not merely to
+"some write errored". A mutant that breaks the subagent *alone* does not exist in this code --
+which is the finding, not a gap in the tests.
+
+`compiled_tools` is public for this reason: names are enough for an absence check, identity is what
+explains why the rules reach a second graph at all.
 
 ---
 
@@ -708,6 +726,72 @@ error rather than a silently ignored key at run time.
 
 ---
 
+## F23 — weave's exit waits 300s for call starts that were dropped, and nothing configures it
+
+**Severity: important.** A trace server that drops a write does not degrade telemetry; it blocks
+process exit for five minutes. Two wrong theories preceded the right one, and both are recorded
+because each looked convincing.
+
+*Observed:* a `pytest -m live` run whose tests took **3.11s** while the process took **5m06s** to
+exit, and an earlier one killed by `timeout` at 480s. Logs fill with
+`httpx.HTTPStatusError: Client error '404 Not Found' for url '.../call/end'` and `Cannot end call
+<id>: no start found in project`.
+
+*Root cause, from a `faulthandler.dump_traceback_later` stack dump of every thread.* The main
+thread sits in `call_batch_processor.py:188`, inside
+`CallBatchProcessor.stop_accepting_new_work_and_flush_queue`, which weave registers with `atexit`:
+
+```python
+deadline = time.monotonic() + FLUSH_TIMEOUT_SECONDS      # = 5 * 60
+while time.monotonic() < deadline:
+    pending_count = len(self._pending_starts) + len(self._pending_ends)
+    if pending_count == 0:
+        break
+    time.sleep(FLUSH_POLL_INTERVAL_SECONDS)              # = 0.1
+```
+
+It waits for in-flight calls to *pair* start with end. When a `start` upload was dropped, its
+`end` can never pair, `pending_count` never reaches zero, and the handler burns the whole 300s —
+which is the 5m06s measured, to the second. The `404` is the symptom of the same drop, not the
+cause of the wait.
+
+**`FLUSH_TIMEOUT_SECONDS` is a module constant with no setting and no environment variable.**
+Grepping the installed wheel finds it only in `call_batch_processor.py`.
+
+*Two levers that look like fixes and are not:*
+
+- **`WEAVE_RETRY_MAX_INTERVAL` / `WEAVE_RETRY_MAX_ATTEMPTS`** — the wrong mechanism entirely;
+  retries are not what blocks. Setting them from `WeaveTracing.activate()` was implemented,
+  measured (the 5m06s run), found ineffective and reverted. Worth recording *why* it could never
+  have worked either: `weave.utils.retry` applies `@with_retry` as a bare decorator, so
+  `stop_after_attempt(retry_max_attempts())` and `wait_exponential_jitter(max=retry_max_interval())`
+  are evaluated at **decoration** time. `weave.trace_server_bindings.remote_http_trace_server` is
+  in `sys.modules` immediately after `import weave` (checked), and `tracing.py` imports weave at
+  module scope, so the numbers are frozen before `activate()` runs. Set before the import they do
+  change (`10.0` and `1`); set after, the decorators already hold `300`/`3`. Four tests went with
+  the revert: they passed by asserting the variable had been *set* rather than that the wait had
+  *shrunk* — a mechanism assertion standing in for an outcome, the same trap as F21.
+- **`WEAVE_USE_CALLS_COMPLETE=false`** — would select `AsyncBatchProcessor`, which has no pairing
+  flush, and unlike the retry settings it is read during `weave.init()` so `activate()` could set
+  it. But `remote_http_trace_server.py:260` logs "Project has been previously written to with
+  `use_calls_complete=True` and requires 'calls_complete' mode. Automatically upgrading SDK..." —
+  weave puts the project back. It is also a change to the write path, traded for shutdown latency,
+  which is not a trade to make silently.
+
+*What the code does:* nothing, deliberately. `WeaveTracing.activate()` carries a comment saying the
+wait exists and cannot be bounded from here, so the next reader does not spend the afternoon this
+took. `WeaveClient.finish()` remains reverted for hanging worse (F11).
+
+*Not reproducible on demand.* `weave.init()` plus one `@weave.op` call exits in **3.4s**; the long
+wait needs the server in the state that drops a start. Insurance to know about, not a permanent
+condition.
+
+*Also recorded, about testing this:* `monkeypatch.delenv(name, raising=False)` on a name that is
+**absent** records no undo, so a variable the code under test writes afterwards survives into the
+next test. Verified with a two-test probe.
+
+---
+
 ## Live verification
 
 `uv run my-agent` runs one check per finding against the real router and prints PASS/FAIL. As of
@@ -732,7 +816,8 @@ it go red.
 Observed 2026-09-18: the weave coexistence test printed `PASSED` (1.61s call, 2.04s total) and the
 process then hung in teardown while weave's async batch processor retried against a trace server
 answering `404` on `.../call/end`, until `timeout` killed it. This is F11's send-queue hazard, and
-it is *post-summary*, so everything after pytest's own output is background-thread noise.
+it is *post-summary*, so everything after pytest's own output is background-thread noise. The wait
+itself is now bounded — see F23 — but the piping lesson stands regardless.
 
 Piping the run through `tail -12` therefore discarded the summary line and kept only that noise —
 and `pytest ... | tail; echo $?` reports **`tail`'s** exit status, not pytest's, so the run looked
