@@ -26,9 +26,11 @@ concurrency:
 jobs:
   live:
     runs-on: ubuntu-latest
-    # Generous on purpose. The suite itself takes seconds, but weave's atexit
-    # handler waits up to 300s for call starts that were dropped and cannot be
-    # bounded from code -- see docs/findings.md F23.
+    # Generous on purpose, and measured rather than guessed: the suite itself
+    # takes about four seconds, but weave's atexit handler waits on a hardcoded
+    # 300s flush that cannot be bounded from code (docs/findings.md F23). The
+    # first real run of this workflow took 5m51s. A 10-minute ceiling would
+    # leave no headroom and a 5-minute one would have killed a passing run.
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7

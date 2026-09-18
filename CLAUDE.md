@@ -24,7 +24,8 @@ uv run pytest tests/test_x.py::test_y     # a single test
 uv run pytest -m live > live.log 2>&1     # real HF router / LangSmith / W&B. Redirect, do not
                                           # pipe: weave's teardown runs *after* pytest reports, so
                                           # `| tail; echo $?` yields tail's status and none of the
-                                          # summary. The wait is bounded now (F23), not gone.
+                                          # summary. Expect ~5 min to exit after a ~4s suite; that
+                                          # wait cannot be bounded from code (F23).
 uv run pytest -m eval                     # the eval suite
 uv run pytest --cov                       # coverage report
 uv run my-agent                           # live checks: one per finding in docs/findings.md
