@@ -268,8 +268,19 @@ Two different things; keep them apart.
   **In a worktree, do not install it.** `git rev-parse --git-common-dir` resolves to the main
   checkout's `.git` and hooks live there, so installing from a worktree makes every commit in the
   main checkout run a `scripts/check.sh` that may not exist on the branch checked out there.
-- **Two workflows, and only one of them gates anything.** `.github/workflows/ci.yml` runs
-  `scripts/check.sh` on every push and pull request — that is the gate.
+- **Three scans run on this repo, and only two of them live in `.github/workflows/`.**
+  `ci.yml` runs `scripts/check.sh` on every push and pull request — that is the gate. CodeQL is the
+  third and it is **not a file here**: it uses GitHub's default setup, so the workflow is generated
+  and managed by GitHub and appears under Security, not in the repo tree. Reading
+  `.github/workflows/` will not tell you it exists. It analyses two languages, `python` and
+  `actions` — the second is the one that earns its place, because `ci.yml` and `live.yml` are
+  hand-written and workflow-specific defects (script injection through untrusted interpolation, an
+  over-broad `GITHUB_TOKEN`, an unpinned action) are invisible to every other check here.
+- **The required checks are named `gate`, `Analyze (python)` and `Analyze (actions)`.** Those exact
+  strings are what the ruleset matches, and CodeQL's are *not* "CodeQL" — the check names come from
+  the job, not the workflow. Its `Adjust Configuration` check is deliberately not required: it
+  reports `skipped`, and a required check that never concludes can never be satisfied, which
+  silently makes every pull request unmergeable.
   `.github/workflows/live.yml` runs `-m live` weekly on a schedule (and on demand), because
   `docs/findings.md` is twenty-three entries of verified provider and library behaviour and
   nothing else re-checks any of it. It skips rather than fails when `HF_TOKEN` is absent, so an
