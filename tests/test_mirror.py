@@ -14,7 +14,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, LLMResult
 
 from my_agent.mirror import (
@@ -451,3 +451,41 @@ def test_chain_end_summarises_a_non_dict_payload(
     promises — that is what produced the repr blobs."""
     mirror.on_chain_end(["not-a-dict"], run_id=RUN_ID)  # type: ignore[arg-type]
     assert records(stream)[0]["outputs"]["items"] == 1
+
+
+def test_tool_end_records_a_tool_message_as_fields(
+    mirror: JsonlMirror, stream: io.StringIO
+) -> None:
+    """deepagents returns ToolMessage objects, which `default=str` turned into a
+    repr — burying `status`, the authoritative success/error signal."""
+    message = ToolMessage(
+        content="Error: permission denied for write on /secrets/keys.txt",
+        name="write_file",
+        tool_call_id="call_1",
+        status="error",
+    )
+    mirror.on_tool_end(message, run_id=RUN_ID)
+    output = records(stream)[0]["output"]
+    assert output["status"] == "error"
+    assert output["name"] == "write_file"
+    assert "permission denied" in output["content"]
+    assert "tool_call_id='call_1'" not in stream.getvalue()
+
+
+def test_tool_end_leaves_a_plain_value_alone(mirror: JsonlMirror, stream: io.StringIO) -> None:
+    """Not every tool returns a ToolMessage; a plain result must pass through."""
+    mirror.on_tool_end("wrote 5 bytes", run_id=RUN_ID)
+    assert records(stream)[0]["output"] == "wrote 5 bytes"
+
+
+def test_tool_end_flags_an_artifact_without_copying_it(
+    mirror: JsonlMirror, stream: io.StringIO
+) -> None:
+    """Tools may attach arbitrary payloads; the log records that one exists."""
+    message = ToolMessage(
+        content="done", tool_call_id="c", artifact={"rows": list(range(1000))}
+    )
+    mirror.on_tool_end(message, run_id=RUN_ID)
+    output = records(stream)[0]["output"]
+    assert output["has_artifact"] is True
+    assert "999" not in stream.getvalue()

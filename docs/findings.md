@@ -507,6 +507,30 @@ content is already recorded structurally by the model and tool records.
 Verified on a live run afterwards: no repr blobs remain, the largest field fell from 3745 to 563
 chars, and `chain_*` fell from 77% to 39% of a file less than a quarter the size per turn.
 
+**Two follow-ups from reading the next run's log.**
+
+*One repr blob survived the first pass.* `on_tool_end` receives `ToolMessage` objects, so
+`default=str` wrote `content='...' name='write_file' tool_call_id='...'` — and buried `status`,
+which is the authoritative success/error signal. A permission denial was findable only by
+substring-matching the repr. `_tool_output_summary` now records `content`, `status`, `name` and
+`tool_call_id` as fields; a live run shows the denial as `status: "error"` rather than prose inside
+a string. `artifact` is reduced to a boolean flag on purpose — tools may attach arbitrary payloads
+and a log is not the place to copy them. Plain (non-`ToolMessage`) tool returns pass through
+untouched.
+
+*`params` is the langchain-level request, not the HTTP body.* Callbacks only ever receive
+`invocation_params`, which is read before `_get_request_payload` renames anything. So a bound token
+cap appears in the log as `max_tokens: 24` while the wire carries `max_completion_tokens: 24`
+(F2) — confirmed by comparing the two directly. Every other parameter agrees; this is the only
+rename langchain performs, and there is no callback hook that sees the final payload. Recorded here
+rather than worked around, because reaching the real body would mean monkeypatching a private
+method.
+
+Second live run, with both fixes in: 52 records, 19,458 bytes for the same five checks that
+originally produced 36,214 — no repr blobs anywhere, `finish_reason` distinguishing `length` (the
+capped check) from `tool_calls` and `stop`, and the withheld-`execute` allowlist now visible in the
+request record rather than only asserted in tests.
+
 ---
 
 ## F19 — a hand-maintained mapping drifts; only a check that reads the dataclass stops it

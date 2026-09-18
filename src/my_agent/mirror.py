@@ -120,6 +120,13 @@ def _invocation_params(kwargs: dict[str, Any]) -> dict[str, Any]:
 
     Tool *definitions* are reduced to their names. The schemas are static, and
     repeating them on every model call would dominate the file.
+
+    **This is the langchain-level request, not the HTTP body.** Callbacks only
+    ever receive `invocation_params`, which is read before
+    `_get_request_payload` renames anything — so a bound token cap is recorded
+    as `max_tokens: 24` while the wire actually carries
+    `max_completion_tokens: 24` (F2). Verified 2026-09-17. For every other
+    parameter the two agree; this is the one rename langchain performs.
     """
     params = kwargs.get("invocation_params")
     if not isinstance(params, dict):
@@ -140,6 +147,32 @@ def _tool_definition_name(tool: Any) -> Any:
         if "name" in tool:
             return tool["name"]
     return tool
+
+
+def _tool_output_summary(output: Any) -> Any:
+    """A tool result as fields rather than a repr.
+
+    deepagents hands `ToolMessage` objects to `on_tool_end`, so `default=str`
+    wrote `content='...' name='write_file' tool_call_id='...'` — the same
+    unqueryable blob that chain records used to be, and it buried `status`, which
+    is the authoritative success/error signal. A permission denial was findable
+    only by substring-matching the repr.
+
+    `artifact` is reduced to a flag on purpose: tools may attach arbitrary
+    payloads there, and a log is not the place to copy them.
+    """
+    content = getattr(output, "content", None)
+    if content is None:
+        return output
+
+    summary: dict[str, Any] = {"content": content}
+    for key in ("status", "name", "tool_call_id"):
+        value = getattr(output, key, None)
+        if value is not None:
+            summary[key] = value
+    if getattr(output, "artifact", None) is not None:
+        summary["has_artifact"] = True
+    return summary
 
 
 def _state_summary(value: Any) -> Any:
@@ -308,7 +341,7 @@ class JsonlMirror(BaseCallbackHandler):
     def on_tool_end(
         self, output: Any, *, run_id: UUID, parent_run_id: UUID | None = None, **kwargs: Any
     ) -> None:
-        self._write("tool_end", run_id, parent_run_id, output=output)
+        self._write("tool_end", run_id, parent_run_id, output=_tool_output_summary(output))
 
     @override
     def on_tool_error(
