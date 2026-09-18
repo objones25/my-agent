@@ -35,6 +35,9 @@ from deepagents import (
     SubAgent,
     create_deep_agent,
 )
+from deepagents.backends import StateBackend
+from deepagents.backends.protocol import BackendProtocol
+from deepagents.middleware import SummarizationMiddleware
 from deepagents.middleware.subagents import GENERAL_PURPOSE_SUBAGENT
 from langchain.agents.middleware.types import (
     AgentMiddleware,
@@ -51,6 +54,7 @@ from my_agent.capabilities import (
     SHELL_TOOL_NAME,
     SUBAGENT_STEP_LIMIT,
     bound_step_limit,
+    bounded_compaction,
     call_limits,
     compiled_tool_names,
     least_privilege_filesystem,
@@ -267,13 +271,18 @@ def _supplies_general_purpose_subagent(config: AgentConfig) -> bool:
     )
 
 
-def _agent_kwargs(config: AgentConfig) -> dict[str, Any]:
+def _agent_kwargs(config: AgentConfig, model: BaseChatModel) -> dict[str, Any]:
     """`create_deep_agent` keywords, with the middleware list assembled.
 
     Everything splats straight from the config except `middleware`, which gains
-    the least-privilege `FilesystemMiddleware` in front of the caller's own.
-    Extracted from `build_agent` because this is where the subtle failure lives
-    and it is worth testing without building a model or compiling a graph.
+    the least-privilege `FilesystemMiddleware`, the bounded compaction
+    middleware and the two call limits in front of the caller's own. Extracted
+    from `build_agent` because this is where the subtle failures live and it is
+    worth testing without compiling a graph.
+
+    Takes the `model` only because compaction needs one: the summary that
+    replaces a conversation is written by the same model the agent runs on.
+    Nothing else here looks at it.
     """
     # `permissions` reaches the tool layer only through FilesystemMiddleware's
     # `_permissions`. Replacing that middleware without forwarding them drops
@@ -294,17 +303,26 @@ def _agent_kwargs(config: AgentConfig) -> dict[str, Any]:
     # to exist before it can bind a step limit onto it.
     kwargs["subagents"] = list(config.subagents) or None
 
-    # `backend` is read the same way, and for the same reason: deepagents wires
-    # it into skills and summarisation while our middleware owns the filesystem
-    # tools, so a backend that reached only one of them would put one agent on
-    # two filesystems (F21). `.get` rather than `[...]` because `AgentConfig`
-    # has no such field today — this is what makes adding it the one-line change
-    # the class docstring promises.
+    # One backend object for every consumer of one. deepagents wires its own
+    # into skills and compaction while our middleware owns the filesystem tools,
+    # so a backend that reached only some of them would put one agent on two
+    # filesystems (F21). `.get` rather than `[...]` because `AgentConfig` has no
+    # such field today — that is what makes adding it the one-line change the
+    # class docstring promises — and naming the fallback here rather than
+    # letting each consumer default separately is what makes the postcondition
+    # below mean something. It used to read `declared_backend is None or ...`,
+    # which on the default path compared `None` against `None` and passed while
+    # `least_privilege_filesystem` and `create_deep_agent` each quietly built a
+    # `StateBackend` of their own.
+    backend: BackendProtocol = kwargs.get("backend") or StateBackend()
+    kwargs["backend"] = backend
+
     # Order matters only in that ours go first: deepagents merges a caller's
     # middleware by `.name`, so a caller who wants different bounds supplies
     # middleware of the same name deliberately rather than by accident.
     kwargs["middleware"] = [
-        least_privilege_filesystem(permissions, kwargs.get("backend")),
+        least_privilege_filesystem(permissions, backend),
+        bounded_compaction(model, backend),
         *call_limits(),
         *config.middleware,
     ]
@@ -315,10 +333,22 @@ def _agent_kwargs(config: AgentConfig) -> dict[str, Any]:
         kwargs["middleware"][0]._permissions == list(permissions or []),
         "assembled middleware does not carry the permissions passed to create_deep_agent",
     )
-    declared_backend = kwargs.get("backend")
     require(
-        declared_backend is None or kwargs["middleware"][0].backend is declared_backend,
+        kwargs["middleware"][0].backend is backend,
         "assembled middleware is on a different backend than create_deep_agent will use",
+    )
+
+    # deepagents installs a compaction middleware of its own and merges by
+    # `.name`, so two here would mean ours joined the stack rather than
+    # replacing the one sized above the window (`bounded_compaction`). Counted
+    # rather than assumed: a caller may legitimately supply their own, and that
+    # is a decision to surface, not to silently take second place behind.
+    compaction = [m for m in kwargs["middleware"] if isinstance(m, SummarizationMiddleware)]
+    require(
+        len(compaction) == 1,
+        f"the assembled middleware carries {len(compaction)} compaction middlewares; "
+        f"deepagents merges by name, so more than one means the agent may still run at "
+        f"the library's own threshold",
     )
     return kwargs
 
@@ -437,7 +467,7 @@ def build_agent(
     # `least_privilege_filesystem` a second time and put the two graphs on two
     # different `StateBackend`s — the same split F21 was about, arrived at from
     # the other direction.
-    kwargs = _agent_kwargs(agent_config)
+    kwargs = _agent_kwargs(agent_config, model)
     agent = create_deep_agent(model=model, **kwargs)
     require(agent is not None, "create_deep_agent returned None")
 

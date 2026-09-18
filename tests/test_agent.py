@@ -22,6 +22,7 @@ import pytest
 from deepagents import FilesystemMiddleware, FilesystemPermission, create_deep_agent
 from deepagents.backends import FilesystemBackend, StateBackend
 from deepagents.backends.protocol import BackendProtocol
+from deepagents.middleware import SummarizationMiddleware
 from langchain.agents.middleware import TodoListMiddleware
 from langchain.tools import ToolRuntime
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -35,6 +36,7 @@ from pydantic import SecretStr
 
 from my_agent.agent import KNOWN_CREATE_DEEP_AGENT_PARAMS, AgentConfig, _agent_kwargs, build_agent
 from my_agent.capabilities import (
+    COMPACTION_TRIGGER_TOKENS,
     DEFAULT_FILESYSTEM_TOOLS,
     LIBRARY_SUBAGENT_STEP_LIMIT,
     SHELL_TOOL_NAME,
@@ -224,7 +226,7 @@ def test_agent_kwargs_sends_the_same_rules_to_both_places_they_are_needed(
     """`permissions` has to reach `create_deep_agent` AND the FilesystemMiddleware
     that replaces its default. Disagreement between the two is the silent failure
     this assembly exists to prevent."""
-    kwargs = _agent_kwargs(AgentConfig(permissions=[deny_secrets]))
+    kwargs = _agent_kwargs(AgentConfig(permissions=[deny_secrets]), ParrotFakeChatModel())
     installed = kwargs["middleware"][0]
 
     assert kwargs["permissions"] == [deny_secrets]
@@ -235,28 +237,30 @@ def test_agent_kwargs_sends_the_same_rules_to_both_places_they_are_needed(
 def test_agent_kwargs_puts_the_least_privilege_middleware_before_the_callers() -> None:
     """Ours has to be in the list at all, and the caller's additions follow it."""
     extra = TodoListMiddleware()
-    kwargs = _agent_kwargs(AgentConfig(middleware=[extra]))
+    kwargs = _agent_kwargs(AgentConfig(middleware=[extra]), ParrotFakeChatModel())
 
     assert isinstance(kwargs["middleware"][0], FilesystemMiddleware)
-    assert [m.name for m in kwargs["middleware"][1:-1]] == [m.name for m in call_limits()]
+    assert isinstance(kwargs["middleware"][1], SummarizationMiddleware)
+    assert [m.name for m in kwargs["middleware"][2:-1]] == [m.name for m in call_limits()]
     assert kwargs["middleware"][-1] is extra
 
 
 def test_agent_kwargs_passes_no_rules_as_none_rather_than_an_empty_list() -> None:
     """Empty permissions means "no rules", not "deny everything" — deepagents
     reads `None` as the former."""
-    kwargs = _agent_kwargs(AgentConfig())
+    kwargs = _agent_kwargs(AgentConfig(), ParrotFakeChatModel())
 
     assert kwargs["permissions"] is None
 
 
 def test_agent_kwargs_leaves_every_other_field_untouched() -> None:
-    """`middleware` and `permissions` are the only two fields build_agent
-    rewrites; the rest is why AgentConfig is a parameter object at all."""
+    """`middleware`, `permissions`, `subagents` and `backend` are the only
+    things build_agent rewrites; the rest is why AgentConfig is a parameter
+    object at all."""
     config = AgentConfig(name="assembled", system_prompt="Be brief.")
-    kwargs = _agent_kwargs(config)
+    kwargs = _agent_kwargs(config, ParrotFakeChatModel())
 
-    rewritten = {"middleware", "permissions", "subagents"}
+    rewritten = {"middleware", "permissions", "subagents", "backend"}
     passthrough = {k: v for k, v in kwargs.items() if k not in rewritten}
     assert passthrough == {k: v for k, v in config.as_kwargs().items() if k not in rewritten}
 
@@ -277,30 +281,56 @@ def test_agent_kwargs_threads_a_backend_into_the_middleware_it_installs(
 
     backend = FilesystemBackend(root_dir=tmp_path)
 
-    kwargs = _agent_kwargs(ConfigWithBackend(backend=backend))
+    kwargs = _agent_kwargs(ConfigWithBackend(backend=backend), ParrotFakeChatModel())
 
     assert kwargs["backend"] is backend
     assert kwargs["middleware"][0].backend is backend
+    assert kwargs["middleware"][1]._backend is backend
 
 
 def test_agent_kwargs_leaves_the_middleware_on_the_state_backend_by_default() -> None:
     """No backend configured means the safest one, chosen rather than inherited."""
-    kwargs = _agent_kwargs(AgentConfig())
+    kwargs = _agent_kwargs(AgentConfig(), ParrotFakeChatModel())
 
     assert isinstance(kwargs["middleware"][0].backend, StateBackend)
 
 
-def test_agent_kwargs_refuses_the_rule_dropping_combination_without_a_model(
+def test_agent_kwargs_installs_one_compaction_middleware_carrying_our_trigger() -> None:
+    """deepagents installs its own and merges by `.name`, so the count is the
+    claim: two entries would mean ours joined the stack instead of replacing
+    the one sized 33% above the window (`capabilities.bounded_compaction`)."""
+    kwargs = _agent_kwargs(AgentConfig(), ParrotFakeChatModel())
+
+    compaction = [m for m in kwargs["middleware"] if isinstance(m, SummarizationMiddleware)]
+    assert len(compaction) == 1
+    assert compaction[0]._lc_helper.trigger == ("tokens", COMPACTION_TRIGGER_TOKENS)
+
+
+def test_agent_kwargs_puts_every_middleware_on_one_backend() -> None:
+    """The F21 split arrived at from the default direction. Until this was
+    stated, `least_privilege_filesystem` built a `StateBackend` of its own and
+    `create_deep_agent` built another, and the postcondition that was supposed
+    to catch it compared `None` against `None` and passed."""
+    kwargs = _agent_kwargs(AgentConfig(), ParrotFakeChatModel())
+
+    backend = kwargs["backend"]
+    assert isinstance(backend, StateBackend)
+    assert kwargs["middleware"][0].backend is backend
+    assert kwargs["middleware"][1]._backend is backend
+
+
+def test_agent_kwargs_refuses_the_rule_dropping_combination_without_compiling(
     deny_secrets: FilesystemPermission,
 ) -> None:
-    """The same refusal build_agent surfaces, reachable without building a model
-    or compiling a graph."""
+    """The same refusal build_agent surfaces, reachable without compiling a
+    graph."""
     with pytest.raises(CheckFailed, match="silently drop"):
         _agent_kwargs(
             AgentConfig(
                 middleware=[FilesystemMiddleware(tools=list(DEFAULT_FILESYSTEM_TOOLS))],
                 permissions=[deny_secrets],
-            )
+            ),
+            ParrotFakeChatModel(),
         )
 
 

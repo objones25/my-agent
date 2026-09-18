@@ -20,17 +20,24 @@ from typing import Any, get_args
 from deepagents import FilesystemMiddleware, FilesystemPermission, FsToolName
 from deepagents.backends import StateBackend
 from deepagents.backends.protocol import BackendProtocol
+from deepagents.middleware import SummarizationMiddleware
 from langchain.agents.middleware import ToolCallLimitMiddleware
+from langchain_core.language_models.chat_models import BaseChatModel
 from langgraph.graph.state import CompiledStateGraph
 
 from my_agent.negative_space import CheckFailed, require
 
 __all__ = [
+    "COMPACTION_ARG_TRUNCATION_MESSAGES",
+    "COMPACTION_KEEP_MESSAGES",
+    "COMPACTION_TRIGGER_TOKENS",
+    "CONTEXT_WINDOW_TOKENS",
     "DEEPAGENTS_PLUGIN_GROUPS",
     "DEFAULT_FILESYSTEM_TOOLS",
     "GENERAL_PURPOSE_SUBAGENT_NAME",
     "GREP_MATCH_LIMIT",
     "HUMAN_MESSAGE_TOKEN_LIMIT",
+    "LIBRARY_COMPACTION_TRIGGER_TOKENS",
     "LIBRARY_SUBAGENT_STEP_LIMIT",
     "SHELL_TOOL_NAME",
     "SUBAGENT_STEP_LIMIT",
@@ -39,6 +46,7 @@ __all__ = [
     "TOOL_CALL_LIMIT",
     "TOOL_RESULT_TOKEN_LIMIT",
     "bound_step_limit",
+    "bounded_compaction",
     "call_limits",
     "compiled_tool_names",
     "compiled_tools",
@@ -165,6 +173,65 @@ A bound on a capability we *do* grant, which is why it is pinned while
 withheld, so pinning it would assert something about a tool nobody has.
 """
 
+CONTEXT_WINDOW_TOKENS = 128_000
+"""The context window this harness assumes a provider serves.
+
+gpt-oss natively supports 128k (OpenAI, *Introducing gpt-oss*). The router picks
+among providers and they do not all advertise the same number, so this is a
+*floor*, not the ceiling any one provider offers — `main` asserts every provider
+that states a window meets it (F25).
+
+It lives here rather than beside that check because it is no longer only a
+reporting number: `COMPACTION_TRIGGER_TOKENS` is sized against it, and a bound
+belongs to the thing it bounds.
+"""
+
+COMPACTION_TRIGGER_TOKENS = 96_000
+"""Conversation tokens after which deepagents compacts the history.
+
+**The bound nothing in this repo owned.** `create_deep_agent` installs a
+`SummarizationMiddleware` on the parent *and* on the general-purpose subagent
+with no opt-in, and sizes it from `model.profile`. A router model id
+(`org/model`) resolves to no profile, so deepagents takes its profile-less
+fallback: `LIBRARY_COMPACTION_TRIGGER_TOKENS`, which is 33% *above* the window
+we assume. Measured 2026-09-18 — compaction could therefore never fire before
+the provider rejected the request, and the only remaining path was the
+middleware's reactive `ContextOverflowError` retry, which langchain-openai
+raises only when the provider's error text matches one of four hardcoded
+substrings (`chat_models/base.py`). Across eleven router providers that is not a
+mechanism to rely on.
+
+75% of the floor. The remaining quarter is headroom for the reply, the tool
+schemas (~2,090 tokens every turn, F30) and the summary itself — compaction that
+triggers at the window is compaction that triggers too late to help.
+"""
+
+COMPACTION_KEEP_MESSAGES = 6
+"""Messages kept verbatim after a compaction; everything older becomes summary.
+
+Equal to deepagents' profile-less default, and stated for the reason
+`TOOL_RESULT_TOKEN_LIMIT` is: this decides how much of the real conversation
+survives, and a number that important must not be one nobody chose.
+"""
+
+COMPACTION_ARG_TRUNCATION_MESSAGES = 20
+"""Messages after which oversized tool *arguments* are clipped, and kept intact.
+
+Its default is `None`, which switches argument truncation off entirely. Stating
+it is what stops a hand-built replacement silently dropping a capability
+deepagents' own factory switches on — the cheap step that often reclaims enough
+context to skip a full compaction.
+"""
+
+LIBRARY_COMPACTION_TRIGGER_TOKENS = 170_000
+"""What deepagents compacts at when nobody sets a threshold and the model
+exposes no profile.
+
+The discriminator for the pin above, exactly as `LIBRARY_SUBAGENT_STEP_LIMIT` is
+for the step limit: without it, a test asserting our trigger clears the window
+keeps passing on the day the library picks a sane number for its own reasons.
+"""
+
 _PINNED_FS_BOUNDS = {
     "tool_token_limit_before_evict": TOOL_RESULT_TOKEN_LIMIT,
     "human_message_token_limit_before_evict": HUMAN_MESSAGE_TOKEN_LIMIT,
@@ -228,6 +295,29 @@ require(
     f"a package is registering deepagents profile plugins: {_INSTALLED_PLUGINS}. Each one runs "
     f"at import and may add middleware, drop tools or rewrite the system prompt without "
     f"passing through create_deep_agent. Review what it grants, then allow it here.",
+)
+
+# A trigger at or above the window can only fire once the request has already
+# been rejected, which is the state this constant exists to leave. Checked here
+# rather than trusted, because both numbers are edited by hand.
+require(
+    0 < COMPACTION_TRIGGER_TOKENS < CONTEXT_WINDOW_TOKENS,
+    f"the compaction trigger ({COMPACTION_TRIGGER_TOKENS}) must leave room below the "
+    f"context window we assume ({CONTEXT_WINDOW_TOKENS}); at or above it, compaction can "
+    f"only fire after a provider has already refused the request",
+)
+
+# Every threshold `bounded_compaction` sets has to still be a parameter. These
+# are not defaults we agree with — they are values we override — so unlike
+# `_PINNED_FS_BOUNDS` there is no upstream number to compare against, and a
+# rename is the whole failure mode.
+_SUMMARIZATION_PARAMS = frozenset(inspect.signature(SummarizationMiddleware.__init__).parameters)
+_NEEDED_SUMMARIZATION_PARAMS = frozenset({"backend", "trigger", "keep", "truncate_args_settings"})
+require(
+    _NEEDED_SUMMARIZATION_PARAMS <= _SUMMARIZATION_PARAMS,
+    f"SummarizationMiddleware no longer accepts "
+    f"{sorted(_NEEDED_SUMMARIZATION_PARAMS - _SUMMARIZATION_PARAMS)}; the compaction bounds "
+    f"cannot be set and the agent would run at deepagents' own threshold",
 )
 
 # `_permissions` is private API. Pin it: losing it silently would drop every
@@ -324,6 +414,62 @@ def least_privilege_filesystem(
     # middleware contributes — the allowlist is only a request until checked.
     granted = {getattr(t, "name", None) for t in middleware.tools}
     require_withheld(SHELL_TOOL_NAME, granted, "the least-privilege middleware")
+    return middleware
+
+
+def bounded_compaction(model: BaseChatModel, backend: BackendProtocol) -> SummarizationMiddleware:
+    """The compaction middleware `build_agent` installs in place of the default.
+
+    `create_deep_agent` always installs one of these and sizes it from
+    `model.profile`; a router model has none, so it lands on a threshold above
+    the window it is serving. This replaces it by `.name`, the same route
+    `least_privilege_filesystem` takes, and states all four thresholds rather
+    than inheriting any of them.
+
+    Takes the model because compaction *is* a model call — the summary is
+    written by the same model the agent runs on — which is the one place
+    `capabilities.py` has to know a model exists at all. It is still handed one,
+    never asked where to get one.
+    """
+    middleware = SummarizationMiddleware(
+        model,
+        backend=backend,
+        trigger=("tokens", COMPACTION_TRIGGER_TOKENS),
+        keep=("messages", COMPACTION_KEEP_MESSAGES),
+        truncate_args_settings={
+            "trigger": ("messages", COMPACTION_ARG_TRUNCATION_MESSAGES),
+            "keep": ("messages", COMPACTION_ARG_TRUNCATION_MESSAGES),
+        },
+    )
+
+    # Postcondition. deepagents wraps langchain's own middleware and normalises
+    # what it was handed, so the thresholds are read back off the helper that
+    # actually evaluates them rather than off the constructor call.
+    helper: Any = middleware._lc_helper
+    require(
+        helper.trigger == ("tokens", COMPACTION_TRIGGER_TOKENS),
+        f"compaction did not retain its trigger: wanted {COMPACTION_TRIGGER_TOKENS} tokens, "
+        f"middleware carries {helper.trigger}",
+    )
+    require(
+        helper.keep == ("messages", COMPACTION_KEEP_MESSAGES),
+        f"compaction did not retain how much conversation it keeps: wanted "
+        f"{COMPACTION_KEEP_MESSAGES} messages, middleware carries {helper.keep}",
+    )
+    require(
+        middleware._truncate_args_trigger == ("messages", COMPACTION_ARG_TRUNCATION_MESSAGES),
+        "compaction did not retain the tool-argument truncation trigger, so oversized "
+        "arguments would never be clipped",
+    )
+    require(
+        middleware._truncate_args_keep == ("messages", COMPACTION_ARG_TRUNCATION_MESSAGES),
+        "compaction did not retain how many messages keep their arguments intact",
+    )
+    require(
+        middleware._backend is backend,
+        "compaction is on a different backend than it was given; the messages it offloads "
+        "would land where the filesystem tools cannot read them",
+    )
     return middleware
 
 

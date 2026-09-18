@@ -1000,6 +1000,201 @@ a consumer yet.
 
 ---
 
+## F31 — compaction was configured to fire above the context window it was serving
+
+**Severity: critical.** The one bound on context nobody in this repo owned, and it was set 33%
+above the window.
+
+`create_deep_agent` installs a `SummarizationMiddleware` unconditionally — on the parent
+(`graph.py:888`) **and** on the general-purpose subagent (`graph.py:803`) — and sizes it from the
+model's profile:
+
+```python
+# deepagents/middleware/summarization.py, compute_summarization_defaults
+has_profile = model.profile is not None and "max_input_tokens" in model.profile
+# with a profile:  trigger=("fraction", 0.85)   keep=("fraction", 0.10)
+# without one:     trigger=("tokens", 170_000)  keep=("messages", 6)
+```
+
+A router model id has no profile at all. Measured 2026-09-18:
+
+```
+model: openai/gpt-oss-120b
+profile: None
+summarization defaults: {'trigger': ('tokens', 170000), 'keep': ('messages', 6),
+                         'truncate_args_settings': {'trigger': ('messages', 20), ...}}
+```
+
+170,000 against the 128,000-token floor F25 established (shortest stated provider: 128,072).
+**Proactive compaction could therefore never fire.** What was left was the middleware's reactive
+path: it catches `ContextOverflowError` and retries — but `langchain_openai` raises that only when
+the provider's error text matches one of four hardcoded substrings
+(`chat_models/base.py:614`: `context_length_exceeded`, `Input tokens exceed the configured limit`,
+`prompt is too long`, `ContextWindowExceededError`). Across eleven router providers, whether any of
+those strings comes back is unverified — and F25 is the finding that says providers differ. A
+substring match against a third party's error prose is not a context strategy.
+
+**The fix.** `capabilities.bounded_compaction` states all four thresholds and replaces deepagents'
+own by `.name`, the same route `least_privilege_filesystem` takes:
+
+| bound | ours | deepagents' fallback |
+|---|---|---|
+| `COMPACTION_TRIGGER_TOKENS` | 96,000 (75% of the floor) | 170,000 |
+| `COMPACTION_KEEP_MESSAGES` | 6 | 6 (stated anyway) |
+| `COMPACTION_ARG_TRUNCATION_MESSAGES` | 20 | 20, but `None` if you build one by hand |
+
+The remaining quarter of the window is headroom for the reply, the ~2,090 tokens of tool schemas
+sent every turn (F30) and the summary itself. Compaction that triggers *at* the window triggers too
+late to help.
+
+`truncate_args_settings` is the trap in building one by hand: its constructor default is `None`,
+which switches argument clipping off entirely. Passing the middleware yourself and omitting it
+silently removes a capability deepagents' own factory switches on.
+
+**What pins it.** `CONTEXT_WINDOW_TOKENS` moved from `main.py` into `capabilities.py` — it is no
+longer only a number a live check reports, it is the number the trigger is sized against, and a
+bound belongs to the thing it bounds. At import, `0 < COMPACTION_TRIGGER_TOKENS <
+CONTEXT_WINDOW_TOKENS` and the four parameter names still exist. At assembly, `_agent_kwargs`
+counts the compaction middlewares in the list it hands over: two would mean ours joined the stack
+instead of replacing the one sized above the window. `LIBRARY_COMPACTION_TRIGGER_TOKENS` is the
+discriminator, so the test cannot pass by agreeing with a library that changed its mind.
+
+Verified on the compiled graph 2026-09-18 — `build_agent` now leaves exactly **one** summarization
+middleware alive, carrying `('tokens', 96000)` and `('messages', 6)`, on one backend, reaching both
+the parent and the subagent.
+
+---
+
+## F32 — a turn cut short by our own tool-call ceiling looked exactly like a clean one
+
+**Severity: important.** The harness manufactured the false-success case it exists to prevent.
+
+Both call limits run `exit_behavior="continue"` (F30): the exceeded call is replaced by a
+`ToolMessage(status="error")` and the agent answers with what it already has. Reproduced
+2026-09-18 against a real compiled agent and a fake model fanning out six `write_file` calls a turn:
+
+```
+model calls: 6 | paused: False | messages: 37
+tool messages: 30 | status=error: 6
+blocked message: Tool call limit exceeded. Do not make additional tool calls.
+final reply   : All done! I wrote every file you asked for.
+TurnResult surface: ['action_requests', 'interrupts', 'messages', 'paused', 'thread_id']
+```
+
+Six writes never happened, the agent said they had, and nothing on the result said otherwise.
+`main._single_turn` printed the reply and returned 0. The only record was `logs/*.jsonl` — a file
+for a human, not a signal for code.
+
+**The fix.** `TurnResult.failed_tool_calls` returns every `ToolMessage` whose `status` is `error`,
+which covers all three ways a call comes back unfulfilled: the tool failed, a `FilesystemPermission`
+denied it, or a call limit blocked it. `main._single_turn` names them on stderr and exits non-zero —
+the reply is still printed, because it is what the agent said, but it is no longer the only thing a
+caller reads.
+
+Deliberately **not** a `require()`. A failed tool call is a fact about the run, not a violated
+contract of ours, and the caller decides what it means. It is also the one rung of the verification
+ladder reachable before the domain lands: "did a tool call error" is a fact about the run, not about
+the answer, which is why CLAUDE.md's "deliberately not verified" section does not cover it.
+
+---
+
+## F33 — every bound in `run.py` reset on a resume
+
+**Severity: important.** The human gate was the way around the limits the human gate was added to.
+
+`resume_turn` called `_run_config(bounds, ...)`, which built a fresh `RunDeadline` starting now and
+sent `recursion_limit: bounds.step_limit` again in full. A turn paused and approved ten times got
+ten complete 600-second budgets and ten complete step allowances. `_invoke`'s own comment said "a
+resume path that quietly dropped any of those would make 'pause, then approve' the way around every
+limit here" — nothing was dropped, and the property a reader took from it was false anyway.
+
+**What could be fixed exactly.** The wall clock. `TurnResult.elapsed_s` carries what the agent has
+spent, `resume_turn` runs on `deadline_s - elapsed_s`, and a remainder of zero or less is a
+`DeadlineExceeded` naming the spend rather than a `CheckFailed` from `RunDeadline`'s own
+positive-budget precondition. Time a human spends deciding is **not** charged: the clock is read
+when an invocation starts and when it returns, so the gap between them belongs to nobody. This
+bounds how long the agent may run, not how long a conversation may stay open.
+
+**What could not.** The step limit. `recursion_limit` counts supersteps within one invocation,
+langgraph restarts the count on a resume, and the count it reached is not reported back in any form
+this module can read — so no remainder can be computed. Saying so is the deliverable; the
+compensating bound is `RunBounds.resume_limit` (3), which counts the halves. Worst case is four step
+budgets rather than unboundedly many, and a turn needing a fourth round of human approval is a turn
+to restart rather than extend. `ResumeLimitExceeded` is an operating error like the other two: a
+human who keeps approving is the outside world being persistent, not a caller passing something
+impossible.
+
+---
+
+## F34 — the backend postcondition passed by comparing `None` to `None`
+
+**Severity: minor today, and only by luck.** Found while wiring F31.
+
+`_agent_kwargs` asserted:
+
+```python
+declared_backend = kwargs.get("backend")
+require(declared_backend is None or kwargs["middleware"][0].backend is declared_backend, ...)
+```
+
+`AgentConfig` has no `backend` field, so `declared_backend` was always `None` and the check passed
+without checking. Meanwhile the default path really did build two: `least_privilege_filesystem`
+made a `StateBackend` (`capabilities.py`) and `create_deep_agent` made another
+(`graph.py:637`). F21 is the finding about exactly that split; the guard written to catch it bit
+only when a backend was passed explicitly, which is the case where it is least needed.
+
+Harmless so far because `StateBackend` is stateless — verified 2026-09-18, its instance `__dict__`
+is empty and every operation reads graph state through the config. That is a fact about deepagents,
+not about this code, and it is the kind of fact this file exists to stop relying on silently.
+
+**The fix.** `_agent_kwargs` names the fallback once, sets `kwargs["backend"]` to it, and hands the
+same object to `create_deep_agent`, `least_privilege_filesystem` and `bounded_compaction`. The
+postcondition is now unconditional, and the mutant that reverts it is caught.
+
+---
+
+## F35 — nothing bounded what a turn costs
+
+**Severity: important.** Three bounds on a turn and none of them counted the thing it is billed for.
+
+`step_limit` counts graph steps, `deadline_s` counts seconds, `resume_limit` counts halves. A turn
+is charged in tokens, and the numbers are not small: F30 measured ~2,090 input tokens on a one-line
+prompt because the tool schemas are resent on every call, and F31 now lets a conversation reach
+96,000 tokens before compaction fires.
+
+The arithmetic the ceiling sits against, all of it inside the existing bounds:
+
+```
+25 steps                     -> 12 parent model/tool round trips
+TASK_DISPATCH_LIMIT = 3      -> 3 dispatches of a 25-step subagent
+                             -> ~37 model calls in one turn
+37 calls x 96,000 tokens     -> ~3.5M tokens
+```
+
+`RunBounds.token_limit` (500,000) is roughly 5% of that worst case and something like seventy times
+an ordinary tool-using turn: it never bites on real work and does bite on a runaway. **The number to
+revisit first when a domain lands** — it is the one bound here whose right value depends on what a
+turn is worth.
+
+**Shape.** `RunTokenBudget` is `RunDeadline` with a different unit: it accumulates on `on_llm_end`
+and refuses on `on_chat_model_start`, so the call that crossed the line is paid for and the one
+after it is not. That is the only granularity available, because a token count exists only once the
+call has returned. `run_inline` and `raise_error` are set for the F12 reason. It reads
+`message.usage_metadata`, the same field `mirror.py` records, so the number that bounds a run is the
+number the log shows. Subagent calls count: `ensure_config` seeds a subagent's run from the ambient
+parent config, which matters more here than for the wall clock because a `task` dispatch is where
+the tokens actually go.
+
+**A provider that omits usage makes the bound blind**, so `RunTokenBudget.unmeasured_calls` counts
+those separately rather than folding them into a silent zero. Crashing a turn over someone else's
+response shape would be worse; the router does report usage, and the live F2 check already refuses
+to grade itself without `output_tokens`, so a change would not go unnoticed for long.
+
+Carries across a pause exactly as `elapsed_s` does (F33): `TurnResult.tokens` accumulates and
+`resume_turn` runs on `token_limit - tokens`.
+
+---
+
 ## Observability API reference
 
 Not findings — API surfaces recorded so the next piece of work does not have to re-derive them.

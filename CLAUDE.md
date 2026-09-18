@@ -1,7 +1,7 @@
 # CLAUDE.md
 
 Guidance for Claude Code in this repository. `README.md` says what the project is; this is the
-contributor's contract, and **`docs/findings.md` (F1–F30) is the evidence behind it** — read it
+contributor's contract, and **`docs/findings.md` (F1–F35) is the evidence behind it** — read it
 before debugging anything that looks like a library bug, and add to it when you verify something
 new.
 
@@ -190,9 +190,24 @@ Bugs live in the states the code was never written to handle. Write those down a
   the value came from. Model output is *always* an operating error: it is untrusted input.
 - Every loop, retry and agent turn gets an explicit bound — an agent that loops forever is the worst
   failure mode here. What bounds a turn is `run.RunBounds`: `step_limit` (25), sent as
-  `recursion_limit` on every `run_turn` config, plus the wall-clock `deadline_s` (600) enforced by
-  `RunDeadline`. Neither goes through `bounded()`, which **has no call site in `src/` at all** — it
-  exists for iteration loops this codebase does not have yet.
+  `recursion_limit` on every `run_turn` config, the wall-clock `deadline_s` (600) enforced by
+  `RunDeadline`, `token_limit` (500,000) enforced by `RunTokenBudget`, and `resume_limit` (3). None
+  goes through `bounded()`, which **has no call site in `src/` at all** — it exists for iteration
+  loops this codebase does not have yet.
+- **A turn is billed in none of the units the first three bounds count.** Steps, seconds and halves
+  are all satisfiable by a turn that spends millions of tokens: 37 model calls at a 96,000-token
+  conversation is ~3.5M tokens inside every other bound. `RunTokenBudget` is `RunDeadline` with a
+  different unit — accumulate on `on_llm_end`, refuse on `on_chat_model_start` — reading the same
+  `usage_metadata` the mirror records, and it reaches subagent calls, which is where the tokens go.
+  `unmeasured_calls` is counted separately, because a provider that omits usage makes the bound
+  blind and a blind bound must not be silent (F35).
+- **A bound applied per invocation is not a bound on a turn, and a pause splits a turn into
+  invocations.** Both of the first two used to reset on every `resume_turn`, so a turn approved ten
+  times got ten full budgets. `deadline_s` now carries: `TurnResult.elapsed_s` accumulates the
+  agent's own wall clock and a resume runs on the remainder (a human's deliberation is never charged
+  — the clock is read at invocation boundaries). `step_limit` **cannot** carry: langgraph restarts
+  the superstep count and never reports what it reached, so `resume_limit` counts the halves
+  instead. Worst case is four step budgets, not unboundedly many (F33).
 - **A bound sent is not a bound applied, and the graph you configure is not the only graph that
   runs.** `step_limit` reaches the parent and stops there: langchain's `create_agent` binds
   `recursion_limit: 9999` onto every graph it compiles, and deepagents invokes a subagent with that
@@ -200,9 +215,10 @@ Bugs live in the states the code was never written to handle. Write those down a
   alone and **5002** once each step dispatched a `task` subagent. `capabilities.SUBAGENT_STEP_LIMIT`
   is the second bound, applied by compiling the agent, reading deepagents' own subagent back out and
   handing it back rebound — and asserted by reading it off the graph afterwards (F24).
-- Both bounds fail the same way at the edge. `run.StepLimitExceeded` translates langgraph's
-  `GraphRecursionError`; before it existed the wall clock was a handled ceiling and the step count
-  was a traceback.
+- All four bounds fail the same way at the edge, as operating errors `main` reports rather than
+  crashes: `DeadlineExceeded`, `StepLimitExceeded` (which translates langgraph's
+  `GraphRecursionError` — before it existed the wall clock was a handled ceiling and the step count
+  was a traceback), `TokenLimitExceeded` and `ResumeLimitExceeded`.
 - **A step is not a call.** langgraph's tool node runs every call in one `AIMessage`, so a fan-out
   does ten times the work per step and `step_limit` sees one step either way.
   `capabilities.call_limits()` installs the two bounds that can see it: `TOOL_CALL_LIMIT` (24,
@@ -234,7 +250,7 @@ Bugs live in the states the code was never written to handle. Write those down a
 
 ## Testing and evals
 
-Keep them apart. 300 offline tests and 2 live as of 2026-09-18.
+Keep them apart. 352 offline tests and 2 live as of 2026-09-18.
 
 - **Unit tests** (`tests/`, default selection) are deterministic and offline. One test file per
   source module; a new module gets a new file, not an extra section in an existing one. They test
@@ -371,9 +387,9 @@ Everything in this table lives in `src/my_agent/`.
 |---|---|
 | `model.py` | `ModelConfig`, `build_model`, router defaults, `USE_RESPONSES_API`. Reads `os.environ` via `from_env`; the only module that knows the router exists. |
 | `agent.py` | `AgentConfig`, `build_agent`. Takes a `BaseChatModel` and imports nothing from `model.py` — `main.py` is the only place the two meet. Compiles **twice**: the second build is what puts a step limit on the `task` subagent (F24). |
-| `capabilities.py` | The allowlist and the proof it held: `DEFAULT_FILESYSTEM_TOOLS`, `least_privilege_filesystem`, `compiled_tools`, `compiled_tool_names`, `subagent_graphs`, `bound_step_limit`, `require_withheld`/`require_granted`, plus the bounds on granted capabilities (`SUBAGENT_STEP_LIMIT`, `GREP_MATCH_LIMIT`, the eviction limits) and the `DEEPAGENTS_PLUGIN_GROUPS` pin. |
+| `capabilities.py` | The allowlist and the proof it held: `DEFAULT_FILESYSTEM_TOOLS`, `least_privilege_filesystem`, `compiled_tools`, `compiled_tool_names`, `subagent_graphs`, `bound_step_limit`, `require_withheld`/`require_granted`, plus the bounds on granted capabilities (`SUBAGENT_STEP_LIMIT`, `GREP_MATCH_LIMIT`, the eviction limits, `bounded_compaction` and `CONTEXT_WINDOW_TOKENS`) and the `DEEPAGENTS_PLUGIN_GROUPS` pin. |
 | `contracts.py` | `check_config_contract`, `pydantic_param_names` — the import-time check that makes `as_kwargs()` splatting safe. |
-| `run.py` | `Invokable`, `RunBounds`, `RunDeadline`, `TurnResult`, `run_turn`, `resume_turn` — one bounded turn, with three outcomes: finished, failed (`DeadlineExceeded`, `StepLimitExceeded`) or paused for approval. Owns the step limit, the wall clock, the thread and multi-turn history. Imports no deepagents and builds no model. |
+| `run.py` | `Invokable`, `RunBounds`, `RunDeadline`, `RunTokenBudget`, `TurnResult`, `run_turn`, `resume_turn` — one bounded turn, with three outcomes: finished, failed (`DeadlineExceeded`, `StepLimitExceeded`, `TokenLimitExceeded`, `ResumeLimitExceeded`) or paused for approval, and `failed_tool_calls` for a turn that finished without doing what it says. Owns the step limit, the wall clock and token budget across a pause, the resume count, the thread and multi-turn history. Imports no deepagents and builds no model. |
 | `main.py` | `uv run my-agent` — the composition root, and the live checks (one per finding). |
 | `negative_space.py` | `require`/`unreachable`/`bounded`, and the only doctests in `src/`. |
 | `tracing.py` | `TracingBackend`, `LangSmithTracing`, `WeaveTracing`, `available_backends`, `langchain_tracer_names`. |
@@ -382,7 +398,7 @@ Everything in this table lives in `src/my_agent/`.
 `tests/` mirrors that one file per module, offline by default, plus `conftest.py` for shared
 fixtures and the socket guard. The only `-m live` tests are one each at the end of `test_tracing.py`
 (calls the real `weave.init()` and hits the router) and `test_run.py` (proves multi-turn history
-against a real graph, which a fake cannot show). `evals/` is empty. `docs/findings.md` holds F1–F30
+against a real graph, which a fake cannot show). `evals/` is empty. `docs/findings.md` holds F1–F35
 plus the repo-gates, deepagents-surface, test-infrastructure and observability appendices;
 `scripts/audit_negative_space.py` is **vendored** from the negative-space-programming skill — do not
 hand-edit it, refresh by re-copying (it is excluded from ruff and mypy).

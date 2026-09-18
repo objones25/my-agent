@@ -12,6 +12,7 @@ import pytest
 from deepagents import FilesystemMiddleware, create_deep_agent
 from langchain.agents.middleware import TodoListMiddleware
 from langchain_core.callbacks import BaseCallbackHandler
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from pydantic import SecretStr
 
 from my_agent import main as main_module
@@ -24,7 +25,7 @@ from my_agent.capabilities import (
 from my_agent.main import EXIT_CHECK_FAILED, EXIT_MISCONFIGURED, main
 from my_agent.model import ModelConfig, build_model
 from my_agent.negative_space import CheckFailed
-from my_agent.run import DeadlineExceeded
+from my_agent.run import DeadlineExceeded, TurnResult
 
 VALID_SECRET = SecretStr("hf_token_value")
 
@@ -202,3 +203,66 @@ def test_main_reports_a_missed_deadline_instead_of_a_traceback(
     captured = capsys.readouterr()
     assert "600.0s deadline" in captured.err
     assert "Traceback" not in captured.err
+
+
+# --------------------------------------------------------------------------
+# What the CLI says about a turn whose tools did not all run
+# --------------------------------------------------------------------------
+
+
+def _turn_with_a_blocked_tool_call() -> TurnResult:
+    """A finished turn whose agent claims work a blocked tool call never did.
+
+    The exact shape `capabilities.call_limits` produces: `exit_behavior` is
+    `"continue"`, so the blocked call becomes an error `ToolMessage` and the
+    model answers over the top of it.
+    """
+    return TurnResult(
+        messages=[
+            HumanMessage("write me thirty files"),
+            AIMessage(content="", tool_calls=[{"name": "write_file", "args": {}, "id": "c1"}]),
+            ToolMessage(
+                content="Tool call limit exceeded.",
+                tool_call_id="c1",
+                name="write_file",
+                status="error",
+            ),
+            AIMessage("All done! I wrote every file."),
+        ]
+    )
+
+
+def _stub_turn(monkeypatch: pytest.MonkeyPatch, result: TurnResult) -> ModelConfig:
+    """Replace everything `_single_turn` needs a network for, and hand back a
+    config it can be called with. The turn is the subject; the model is not."""
+    monkeypatch.setattr(main_module, "build_model", lambda _config: object())
+    monkeypatch.setattr(main_module, "build_agent", lambda _model: object())
+    monkeypatch.setattr(main_module, "run_turn", lambda *_a, **_k: result)
+    return ModelConfig(api_key=SecretStr("hf_token_value"))
+
+
+def test_a_single_turn_names_the_tool_calls_that_did_not_run(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The gap this closes: the reply was printed and the exit code was 0 while
+    the work it described had been blocked, and the only record was the mirror."""
+    config = _stub_turn(monkeypatch, _turn_with_a_blocked_tool_call())
+
+    exit_code = main_module._single_turn(config, "write me thirty files", [])
+
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_CHECK_FAILED
+    assert "write_file" in captured.err
+    assert "All done!" in captured.out
+
+
+def test_a_single_turn_whose_tools_all_ran_says_nothing_about_failures(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The discriminator: an ordinary turn must not grow a warning."""
+    config = _stub_turn(monkeypatch, TurnResult(messages=[HumanMessage("ping"), AIMessage("pong")]))
+
+    exit_code = main_module._single_turn(config, "ping", [])
+
+    assert exit_code == 0
+    assert capsys.readouterr().err == ""
