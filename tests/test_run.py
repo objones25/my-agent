@@ -21,12 +21,18 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
+from deepagents import FilesystemPermission
 from dotenv import load_dotenv
 from langchain_core.callbacks import BaseCallbackHandler
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.runnables import RunnableConfig
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.errors import GraphRecursionError
+from langgraph.types import Command, Interrupt
 
-from my_agent.agent import build_agent
+from my_agent.agent import AgentConfig, build_agent
 from my_agent.mirror import JsonlMirror
 from my_agent.model import ModelConfig, build_model
 from my_agent.negative_space import CheckFailed
@@ -36,6 +42,8 @@ from my_agent.run import (
     DeadlineExceeded,
     RunBounds,
     RunDeadline,
+    StepLimitExceeded,
+    resume_turn,
     run_turn,
 )
 
@@ -110,6 +118,71 @@ class SteppingGraph:
 
 def _two_messages() -> dict[str, list[BaseMessage]]:
     return {"messages": [HumanMessage("ping"), AIMessage("pong")]}
+
+
+def _paused_result(sent: int = 1) -> dict[str, Any]:
+    """What a real graph returns when a HITL rule pauses it (verified 2026-09-18).
+
+    The shape is the finding: `__interrupt__` arrives *alongside* messages that
+    already grew — the assistant's tool call is there, its `ToolMessage` is not.
+    A turn that only asserted "the agent added something" would call this a
+    success and hand a conversation with an unanswered tool call to the next
+    turn.
+    """
+    messages: list[BaseMessage] = [HumanMessage("write it")]
+    messages.extend(HumanMessage(f"filler {i}") for i in range(sent - 1))
+    messages.append(
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "write_file", "args": {"file_path": "/secrets/k"}, "id": "t1"}],
+        )
+    )
+    return {
+        "messages": messages,
+        "__interrupt__": [
+            Interrupt(
+                value={
+                    "action_requests": [
+                        {"name": "write_file", "args": {"file_path": "/secrets/k"}}
+                    ],
+                    "review_configs": [
+                        {"action_name": "write_file", "allowed_decisions": ["approve", "reject"]}
+                    ],
+                },
+                id="i1",
+            )
+        ],
+    }
+
+
+class PausingGraph:
+    """Pauses on the first invoke, completes on a `Command(resume=...)`."""
+
+    def __init__(self, *, checkpointer: object = object()) -> None:
+        self.checkpointer = checkpointer
+        self.resumed_with: Any = None
+        self.config: RunnableConfig | None = None
+
+    def invoke(self, payload: Any, config: RunnableConfig | None = None) -> dict[str, Any]:
+        self.config = config
+        if isinstance(payload, Command):
+            self.resumed_with = payload.resume
+            return {
+                "messages": [
+                    HumanMessage("write it"),
+                    AIMessage(content="", tool_calls=[]),
+                    ToolMessage(content="Updated file", tool_call_id="t1", name="write_file"),
+                    AIMessage("done"),
+                ]
+            }
+        return _paused_result()
+
+
+class ExhaustingGraph:
+    """A graph that runs out of steps the way langgraph really does."""
+
+    def invoke(self, _payload: Any, _config: RunnableConfig | None = None) -> dict[str, Any]:
+        raise GraphRecursionError("Recursion limit of 25 reached without hitting a stop condition")
 
 
 # --------------------------------------------------------------------------
@@ -227,7 +300,7 @@ def test_run_turn_rejects_a_result_carrying_no_messages() -> None:
 def test_run_turn_rejects_a_graph_that_added_nothing_of_its_own() -> None:
     """One message back is our own prompt echoed. A turn that produced nothing
     is a failure, not an empty success."""
-    with pytest.raises(CheckFailed, match="added no messages"):
+    with pytest.raises(CheckFailed, match="neither added messages"):
         run_turn(FakeGraph({"messages": [HumanMessage("ping")]}), "ping")
 
 
@@ -396,7 +469,7 @@ def test_run_turn_requires_the_agent_to_add_to_the_history_it_was_given() -> Non
     unchanged = [HumanMessage("a"), AIMessage("b"), HumanMessage("c")]
     graph = FakeGraph({"messages": unchanged})
 
-    with pytest.raises(CheckFailed, match="added no messages"):
+    with pytest.raises(CheckFailed, match="neither added messages"):
         run_turn(graph, "c", history=unchanged[:2])
 
 
@@ -405,6 +478,93 @@ def test_run_turn_rejects_a_history_that_is_not_messages() -> None:
     coerced by langgraph or silently dropped, neither of which is visible."""
     with pytest.raises(CheckFailed, match="history"):
         run_turn(FakeGraph(), "ping", history=["a string"])  # type: ignore[list-item]
+
+
+# --------------------------------------------------------------------------
+# HITL against a real compiled graph, offline
+# --------------------------------------------------------------------------
+
+
+class WritesToSecrets(BaseChatModel):
+    """Calls `write_file` on a denied path once, then answers.
+
+    A fake graph can show that `run_turn` reads `__interrupt__`; only a real one
+    shows that an interrupt-mode `FilesystemPermission` produces it, that the
+    pause survives a checkpointer round trip, and that approving actually runs
+    the tool that was held.
+    """
+
+    calls: int = 0
+
+    @property
+    def _llm_type(self) -> str:
+        return "writes-to-secrets"
+
+    def bind_tools(self, tools: Any, **kwargs: Any) -> BaseChatModel:
+        return self
+
+    def _generate(self, messages: Any, stop: Any = None, run_manager: Any = None, **kw: Any) -> Any:
+        self.calls += 1
+        if self.calls == 1:
+            call = {
+                "name": "write_file",
+                "args": {"file_path": "/secrets/k.txt", "content": "x"},
+                "id": "t1",
+            }
+            message = AIMessage(content="", tool_calls=[call])
+        else:
+            message = AIMessage(content="written")
+        return ChatResult(generations=[ChatGeneration(message=message)])
+
+
+def _interrupting_agent() -> Any:
+    rule = FilesystemPermission(operations=["write"], paths=["/secrets/**"], mode="interrupt")
+    return build_agent(
+        WritesToSecrets(), AgentConfig(permissions=[rule], checkpointer=InMemorySaver())
+    )
+
+
+def test_an_interrupt_rule_pauses_a_real_turn_before_the_tool_runs() -> None:
+    """`FilesystemPermission(mode="interrupt")` is the whole HITL surface: no
+    new config field, and it reaches every subagent too."""
+    result = run_turn(_interrupting_agent(), "write it", thread_id="t")
+
+    assert result.paused
+    assert [r["name"] for r in result.action_requests] == ["write_file"]
+    assert not any(isinstance(m, ToolMessage) for m in result)
+
+
+def test_approving_a_paused_turn_runs_the_tool_that_was_held() -> None:
+    agent = _interrupting_agent()
+    paused = run_turn(agent, "write it", thread_id="t")
+
+    resumed = resume_turn(agent, paused, [{"type": "approve"}])
+
+    assert not resumed.paused
+    written = [m for m in resumed if isinstance(m, ToolMessage)]
+    assert [m.name for m in written] == ["write_file"]
+
+
+def test_rejecting_a_paused_turn_leaves_the_write_undone() -> None:
+    """The half that matters. An approval path that works while rejection
+    silently writes anyway is worse than no gate at all."""
+    agent = _interrupting_agent()
+    paused = run_turn(agent, "write it", thread_id="t")
+
+    resumed = resume_turn(agent, paused, [{"type": "reject"}])
+
+    written = [m for m in resumed if isinstance(m, ToolMessage)]
+    assert not any("updated file" in str(m.content).lower() for m in written)
+
+
+def test_a_turn_with_no_interrupt_rule_never_pauses() -> None:
+    """The discriminator: without it, every assertion above would still pass if
+    the graph paused on everything, or on nothing and the reader lied."""
+    agent = build_agent(WritesToSecrets(), AgentConfig(checkpointer=InMemorySaver()))
+
+    result = run_turn(agent, "write it", thread_id="t")
+
+    assert not result.paused
 
 
 # --------------------------------------------------------------------------
@@ -433,3 +593,245 @@ def test_a_real_agent_continues_a_conversation_across_two_turns() -> None:
     assert [m.text for m in second[: len(first)]] == [m.text for m in first]
     assert len(second) > len(first)
     assert "albatross" in second[-1].text.lower()
+
+
+# --------------------------------------------------------------------------
+# The step limit is an operating error, not a traceback
+# --------------------------------------------------------------------------
+
+
+def test_run_turn_reports_an_exhausted_step_limit_as_an_operating_error() -> None:
+    """`RunBounds` owns the step limit, so it owns what happens when it trips.
+
+    langgraph raises `GraphRecursionError`. Letting that escape means the only
+    bound in `RunBounds` whose failure the edge handles is the wall clock — the
+    same bound reported two different ways depending on which one ran out.
+    """
+    with pytest.raises(StepLimitExceeded, match="25 steps"):
+        run_turn(ExhaustingGraph(), "loop")
+
+
+def test_step_limit_failure_names_the_limit_that_was_in_force() -> None:
+    """The message has to say what to change. A bound that fails anonymously
+    sends the reader to the library's docs rather than to `RunBounds`."""
+    with pytest.raises(StepLimitExceeded, match="step_limit"):
+        run_turn(ExhaustingGraph(), "loop", bounds=RunBounds(step_limit=4))
+
+
+def test_step_limit_failure_keeps_the_library_error_as_its_cause() -> None:
+    """Translating an error must not lose where it came from."""
+    with pytest.raises(StepLimitExceeded) as caught:
+        run_turn(ExhaustingGraph(), "loop")
+
+    assert isinstance(caught.value.__cause__, GraphRecursionError)
+
+
+def test_step_limit_is_an_operating_error_not_a_broken_contract() -> None:
+    """The same split `DeadlineExceeded` makes: a run that hit a real ceiling is
+    the outside world being slow or the model looping, not a bug in this code."""
+    assert not issubclass(StepLimitExceeded, CheckFailed)
+    assert issubclass(StepLimitExceeded, RuntimeError)
+
+
+# --------------------------------------------------------------------------
+# A paused turn is an outcome, not a completed turn
+# --------------------------------------------------------------------------
+
+
+def test_run_turn_reports_a_turn_the_graph_paused() -> None:
+    """The defect this closes: an interrupted invoke returns `__interrupt__`
+    *and* more messages than were sent, so "the agent added something" is
+    satisfied by a turn whose tool never ran."""
+    result = run_turn(PausingGraph(), "write it")
+
+    assert result.paused
+
+
+def test_run_turn_carries_the_approval_requests_back_to_the_caller() -> None:
+    """A pause the caller cannot act on is the same as a hang."""
+    result = run_turn(PausingGraph(), "write it")
+
+    assert [r["name"] for r in result.interrupts[0].value["action_requests"]] == ["write_file"]
+
+
+def test_a_completed_turn_is_not_paused_and_carries_no_interrupts() -> None:
+    result = run_turn(FakeGraph(), "ping")
+
+    assert not result.paused
+    assert result.interrupts == ()
+
+
+def test_run_turn_still_reads_as_the_message_list_every_caller_already_uses() -> None:
+    """`TurnResult` is a new outcome, not a new calling convention: indexing,
+    slicing, iteration and `len` all still mean the messages."""
+    result = run_turn(FakeGraph(), "ping")
+
+    assert len(result) == 2
+    assert result[-1].text == "pong"
+    assert [m.text for m in result[:1]] == ["ping"]
+    assert result.messages == list(result)
+
+
+def test_run_turn_refuses_a_pause_on_a_graph_that_could_never_resume() -> None:
+    """Resuming needs a checkpointer (langgraph raises without one), so a graph
+    that pauses without one has produced a turn nobody can finish. That is a
+    misconfiguration by a caller we own, not the outside world misbehaving."""
+    with pytest.raises(CheckFailed, match="checkpointer"):
+        run_turn(PausingGraph(checkpointer=None), "write it")
+
+
+# --------------------------------------------------------------------------
+# resume_turn
+# --------------------------------------------------------------------------
+
+
+def test_resume_turn_sends_the_decisions_in_the_shape_the_middleware_reads() -> None:
+    """Verified against langchain's `HumanInTheLoopMiddleware` 2026-09-18: it
+    does `interrupt(request)["decisions"]`, so a bare list raises `TypeError:
+    list indices must be integers` from inside the library."""
+    graph = PausingGraph()
+    paused = run_turn(graph, "write it", thread_id="t")
+
+    resume_turn(graph, paused, [{"type": "approve"}])
+
+    assert graph.resumed_with == {"decisions": [{"type": "approve"}]}
+
+
+def test_resume_turn_completes_the_turn_the_pause_left_unfinished() -> None:
+    graph = PausingGraph()
+    paused = run_turn(graph, "write it", thread_id="t")
+
+    resumed = resume_turn(graph, paused, [{"type": "approve"}])
+
+    assert not resumed.paused
+    assert [m.type for m in resumed] == ["human", "ai", "tool", "ai"]
+
+
+def test_resume_turn_reaches_the_thread_the_pause_was_recorded_under() -> None:
+    """Read off the paused turn, never retyped. A `thread_id` the caller
+    supplies again can be supplied wrong, and a wrong one does not fail — it
+    starts a second run under a name that makes it look resumed."""
+    graph = PausingGraph()
+    paused = run_turn(graph, "write it", thread_id="thread-9")
+
+    resume_turn(graph, paused, [{"type": "approve"}])
+
+    assert graph.config is not None
+    assert graph.config.get("configurable", {}).get("thread_id") == "thread-9"
+
+
+def test_resume_turn_still_bounds_the_run_it_is_finishing() -> None:
+    """A resumed turn is a turn. Dropping the bounds here would make "pause,
+    approve" the way around every limit `run_turn` enforces."""
+    graph = PausingGraph()
+    paused = run_turn(graph, "write it", thread_id="t")
+
+    resume_turn(graph, paused, [{"type": "approve"}], bounds=RunBounds(step_limit=7))
+
+    assert graph.config is not None
+    assert graph.config.get("recursion_limit") == 7
+    assert any(isinstance(h, RunDeadline) for h in _handlers(graph.config))
+
+
+def test_resume_turn_refuses_a_turn_that_was_never_paused() -> None:
+    """Resuming a finished turn would replay it against a checkpoint that holds
+    no pending interrupt — a second run wearing the first one's thread id."""
+    with pytest.raises(CheckFailed, match="not paused"):
+        resume_turn(PausingGraph(), run_turn(FakeGraph(), "ping"), [{"type": "approve"}])
+
+
+def test_resume_turn_refuses_a_pause_that_ran_without_a_thread() -> None:
+    """The checkpoint holding the approval is addressed by thread. Without one
+    there is nothing to address, and resuming would start a fresh run."""
+    graph = PausingGraph()
+    paused = run_turn(graph, "write it")
+
+    with pytest.raises(CheckFailed, match="no thread_id"):
+        resume_turn(graph, paused, [{"type": "approve"}])
+
+
+def test_resume_turn_refuses_a_decision_count_that_does_not_match_the_requests() -> None:
+    """The middleware zips decisions onto action requests. A short list
+    misaligns them silently: approval meant for one tool lands on another."""
+    graph = PausingGraph()
+    paused = run_turn(graph, "write it", thread_id="t")
+
+    with pytest.raises(CheckFailed, match="1 approval request"):
+        resume_turn(graph, paused, [{"type": "approve"}, {"type": "reject"}])
+
+
+def test_resume_turn_refuses_a_decision_with_no_type() -> None:
+    graph = PausingGraph()
+    paused = run_turn(graph, "write it", thread_id="t")
+
+    with pytest.raises(CheckFailed, match="type"):
+        resume_turn(graph, paused, [{"approve": True}])
+
+
+def test_run_turn_keeps_a_conversation_on_the_thread_it_started_on() -> None:
+    """A thread lost between turns is a checkpointed conversation silently
+    forking into two."""
+    graph = AccumulatingGraph()
+
+    first = run_turn(graph, "one", thread_id="t-1")
+    second = run_turn(graph, "two", history=first)
+
+    assert second.thread_id == "t-1"
+
+
+def test_run_turn_rejects_a_blank_thread_id() -> None:
+    with pytest.raises(CheckFailed, match="thread_id"):
+        run_turn(FakeGraph(), "ping", thread_id="  ")
+
+
+# --------------------------------------------------------------------------
+# History hygiene: what a paused turn must not be allowed to become
+# --------------------------------------------------------------------------
+
+
+def test_run_turn_refuses_a_history_with_an_unanswered_tool_call() -> None:
+    """The corruption path a paused turn opens. `run_turn` returns the messages
+    of a paused turn, and the assistant's tool call in them has no
+    `ToolMessage`. Feeding that back as `history` sends the model a tool call it
+    can see it never got a result for — the one message-shape invariant a
+    conversation has."""
+    paused = run_turn(PausingGraph(), "write it")
+
+    with pytest.raises(CheckFailed, match="unanswered tool call"):
+        run_turn(FakeGraph(), "next", history=paused)
+
+
+def test_run_turn_accepts_a_history_whose_tool_calls_were_all_answered() -> None:
+    graph = FakeGraph(
+        {
+            "messages": [
+                HumanMessage("a"),
+                AIMessage(content="", tool_calls=[{"name": "ls", "args": {}, "id": "t1"}]),
+                ToolMessage(content="[]", tool_call_id="t1", name="ls"),
+                AIMessage("done"),
+                HumanMessage("b"),
+                AIMessage("ok"),
+            ]
+        }
+    )
+    answered: list[BaseMessage] = [
+        HumanMessage("a"),
+        AIMessage(content="", tool_calls=[{"name": "ls", "args": {}, "id": "t1"}]),
+        ToolMessage(content="[]", tool_call_id="t1", name="ls"),
+        AIMessage("done"),
+    ]
+
+    result = run_turn(graph, "b", history=answered)
+
+    assert result[-1].text == "ok"
+
+
+def test_run_turn_names_the_tool_call_that_was_left_unanswered() -> None:
+    """A rejection nobody can act on is a worse failure than the corruption."""
+    orphaned: list[BaseMessage] = [
+        HumanMessage("a"),
+        AIMessage(content="", tool_calls=[{"name": "write_file", "args": {}, "id": "t9"}]),
+    ]
+
+    with pytest.raises(CheckFailed, match="t9"):
+        run_turn(FakeGraph(), "b", history=orphaned)

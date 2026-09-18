@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Callable
+from importlib.metadata import entry_points
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast, get_args
@@ -22,10 +23,12 @@ from deepagents import (
 )
 from deepagents.backends import FilesystemBackend, StateBackend
 from deepagents.backends.protocol import SandboxBackendProtocol
+from deepagents.profiles import _builtin_profiles
 from langchain_core.language_models.fake_chat_models import ParrotFakeChatModel
 from langgraph.graph.state import CompiledStateGraph
 
 from my_agent.capabilities import (
+    DEEPAGENTS_PLUGIN_GROUPS,
     DEFAULT_FILESYSTEM_TOOLS,
     GREP_MATCH_LIMIT,
     HUMAN_MESSAGE_TOKEN_LIMIT,
@@ -313,3 +316,33 @@ def test_least_privilege_middleware_states_every_context_bound_it_runs_under() -
     assert middleware._tool_token_limit_before_evict == TOOL_RESULT_TOKEN_LIMIT
     assert middleware._human_message_token_limit_before_evict == HUMAN_MESSAGE_TOKEN_LIMIT
     assert middleware._grep_max_count == GREP_MATCH_LIMIT
+
+
+# --------------------------------------------------------------------------
+# The plugin door (F28)
+# --------------------------------------------------------------------------
+
+
+def test_no_package_is_registering_deepagents_profile_plugins() -> None:
+    """The escape the parameter pin cannot cover.
+
+    `KNOWN_CREATE_DEEP_AGENT_PARAMS` fails the import when deepagents grows a
+    parameter. A harness-profile plugin grows no parameter: it registers into a
+    process-global registry from an entry point, and can add middleware, drop
+    tools or rewrite the system prompt from there.
+    """
+    installed = {
+        group: sorted(ep.name for ep in entry_points(group=group))
+        for group in DEEPAGENTS_PLUGIN_GROUPS
+    }
+
+    assert installed == {group: [] for group in DEEPAGENTS_PLUGIN_GROUPS}
+
+
+def test_the_plugin_groups_are_the_names_deepagents_actually_reads() -> None:
+    """A pin on the wrong group name is a pin on nothing — it would pass
+    forever while the real groups filled up."""
+    source = inspect.getsource(_builtin_profiles)
+
+    for group in DEEPAGENTS_PLUGIN_GROUPS:
+        assert f'"{group}"' in source

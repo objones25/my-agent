@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Callable, Collection
+from importlib.metadata import entry_points
 from typing import Any, get_args
 
 from deepagents import FilesystemMiddleware, FilesystemPermission, FsToolName
@@ -24,12 +25,17 @@ from langgraph.graph.state import CompiledStateGraph
 from my_agent.negative_space import CheckFailed, require
 
 __all__ = [
+    "DEEPAGENTS_PLUGIN_GROUPS",
     "DEFAULT_FILESYSTEM_TOOLS",
+    "GENERAL_PURPOSE_SUBAGENT_NAME",
     "GREP_MATCH_LIMIT",
     "HUMAN_MESSAGE_TOKEN_LIMIT",
+    "LIBRARY_SUBAGENT_STEP_LIMIT",
     "SHELL_TOOL_NAME",
+    "SUBAGENT_STEP_LIMIT",
     "SUBAGENT_TASK_TOOL_NAME",
     "TOOL_RESULT_TOKEN_LIMIT",
+    "bound_step_limit",
     "compiled_tool_names",
     "compiled_tools",
     "least_privilege_filesystem",
@@ -87,6 +93,40 @@ of silently resizing how much of a tool result the model ever sees.
 HUMAN_MESSAGE_TOKEN_LIMIT = 50000
 """The same, for a user turn large enough that deepagents would evict it."""
 
+GENERAL_PURPOSE_SUBAGENT_NAME = "general-purpose"
+"""The subagent deepagents adds to every deep agent unless a caller supplies one.
+
+An explicit spec of this name is the supported way to replace it (`graph.py`
+0.7.15), which is how `build_agent` gets a step limit onto it.
+"""
+
+SUBAGENT_STEP_LIMIT = 25
+"""Graph steps one `task` dispatch may run.
+
+**The bound `RunBounds.step_limit` cannot reach.** langchain's `create_agent`
+binds `recursion_limit: 9999` on every graph it compiles, and deepagents invokes
+a subagent with that graph's own bound config — which wins the per-key merge
+against the ambient parent config by design (`middleware/subagents.py`, 0.7.15).
+So a caller's step limit stops at the parent: measured 2026-09-18, a
+`step_limit` of 25 allowed 12 parent model calls on its own and **5002** once
+each step dispatched a subagent (F24).
+
+Equal to `run.RECURSION_LIMIT` today and deliberately not defined as it: the two
+bound different graphs, and a subagent asked to do real research is the first
+thing that would need a different number. Two graph steps buy one model/tool
+round trip, so this is twelve of them — below the depth a tool-using model
+reaches on its own (OpenAI's own gpt-oss write-up shows it chaining 28 browsing
+calls in one turn), which is the trade being made until a domain says otherwise.
+"""
+
+LIBRARY_SUBAGENT_STEP_LIMIT = 9999
+"""What a subagent runs to when nobody sets a limit.
+
+Stated so the test that asserts ours is applied has a discriminator: without
+this, that test keeps passing if the library starts choosing a small number for
+its own reasons, and a bound we merely agree with reads as a bound we set.
+"""
+
 GREP_MATCH_LIMIT = 1000
 """Total matches `grep` may return across all files.
 
@@ -126,6 +166,39 @@ for _name, _pinned in _PINNED_FS_BOUNDS.items():
         f"deepagents changed its default for {_name}: ours is {_pinned}, theirs is now "
         f"{_FS_SIGNATURE[_name].default}. Review the bound deliberately before updating.",
     )
+
+DEEPAGENTS_PLUGIN_GROUPS = (
+    "deepagents.harness_profiles",
+    "deepagents.provider_profiles",
+)
+"""Entry-point groups through which an installed package reconfigures the agent.
+
+**The door `KNOWN_CREATE_DEEP_AGENT_PARAMS` cannot see.** That pin catches a new
+*parameter*; this is not a parameter. `create_deep_agent` resolves a
+`HarnessProfile` keyed by the model's provider and id from a process-global
+registry, and `deepagents.profiles` populates that registry by executing a
+zero-arg callable from every installed distribution advertising one of these
+groups (`profiles/_builtin_profiles.py`, 0.7.15). A profile can add
+`extra_middleware`, exclude tools, override tool descriptions and rewrite the
+system prompt — every one of them a capability decision, none of them visible at
+a call site.
+
+Verified 2026-09-18: both groups are empty in this environment, and the builtin
+harness profiles are keyed per-model (Anthropic models, Nemotron, Codex) so none
+matches the router model. A pin, not a claim of safety: adding the plugin is how
+it would stop being true, and this is what makes that an import failure rather
+than a quiet change of behaviour (F28).
+"""
+
+_INSTALLED_PLUGINS = {
+    group: sorted(ep.name for ep in entry_points(group=group)) for group in DEEPAGENTS_PLUGIN_GROUPS
+}
+require(
+    not any(_INSTALLED_PLUGINS.values()),
+    f"a package is registering deepagents profile plugins: {_INSTALLED_PLUGINS}. Each one runs "
+    f"at import and may add middleware, drop tools or rewrite the system prompt without "
+    f"passing through create_deep_agent. Review what it grants, then allow it here.",
+)
 
 # `_permissions` is private API. Pin it: losing it silently would drop every
 # permission rule (see docs/findings.md).
@@ -224,7 +297,6 @@ def least_privilege_filesystem(
     return middleware
 
 
-
 def compiled_tools(agent: CompiledStateGraph[Any, Any, Any, Any]) -> dict[str, Any]:
     """The tool objects actually bound in a compiled agent, by name.
 
@@ -251,6 +323,25 @@ def compiled_tools(agent: CompiledStateGraph[Any, Any, Any, Any]) -> dict[str, A
 def compiled_tool_names(agent: CompiledStateGraph[Any, Any, Any, Any]) -> frozenset[str]:
     """Tool names actually bound in a compiled agent."""
     return frozenset(compiled_tools(agent))
+
+
+def bound_step_limit(graph: CompiledStateGraph[Any, Any, Any, Any]) -> int | None:
+    """The `recursion_limit` bound onto `graph` itself, if any.
+
+    `with_config` is the only lever over a subagent's step limit, because the
+    subagent's own bound config beats the ambient parent one. Reading it back is
+    what turns "we passed a limit" into "the limit is on the graph that runs".
+    """
+    config: Any = graph.config or {}
+    limit: object = config.get("recursion_limit")
+    if limit is None:
+        return None
+    # An explicit narrowing rather than `require()`: mypy cannot narrow through
+    # a helper call (F10), and a limit read back as the wrong type would make
+    # every comparison against it quietly false.
+    if not isinstance(limit, int):
+        raise CheckFailed(f"recursion_limit on the graph is a {type(limit).__name__}, not an int")
+    return limit
 
 
 def _closure_values(fn: Callable[..., Any] | None) -> dict[str, Any]:

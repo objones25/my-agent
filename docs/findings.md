@@ -359,8 +359,10 @@ visible answer got 3, which is why that record's text is empty. **A token cap on
 is mostly a reasoning cap.** The check still verifies what it claims — the cap is honoured — but it
 is not evidence that 24 tokens buys 24 tokens of answer.
 
-`reasoning_effort` is a Chat Completions body parameter the router honours (`none, minimal, low,
-medium, high, xhigh`). Verified on the wire 2026-09-17, one prompt, three settings:
+`reasoning_effort` is a Chat Completions body parameter. The router *documents* `none, minimal,
+low, medium, high, xhigh` — **three of those are rejected on the wire, and `REASONING_EFFORTS` has
+since been narrowed to `low, medium, high`; see F26.** Verified on the wire 2026-09-17, one prompt,
+three settings:
 
 ```
 effort=None   reasoning=50   output=61    text='9'
@@ -384,8 +386,10 @@ belong.
 `REASONING_EFFORT=low uv run my-agent ...` produced 8/4/0 reasoning tokens where the same three-call
 shape had produced 16/11/11 at default.
 
-*Still unverified:* whether every provider the router may select honours it, and whether
-`none`/`minimal` differ from `low` on this model.
+*Answered since, in F26:* `none`, `minimal` and `xhigh` do not differ from `low` — they are
+refused with a 400. And unset is not "between low and high": it is `medium`, token for token.
+
+*Still unverified:* whether every provider the router may select honours it.
 
 ## F18 — callbacks see the langchain request, not the HTTP body; and `ToolMessage` hides `status` in its repr
 
@@ -667,6 +671,239 @@ would have killed a passing run. Any future timeout wrapping a Weave-traced proc
 
 ---
 
+## F24 — a step limit does not bound an agent that can dispatch a subagent
+
+**Severity: critical.** The bound that exists to stop a runaway did not reach the graph most likely
+to run away.
+
+`run.RunBounds.step_limit` is sent as `recursion_limit` on every `invoke`, and it works — on the
+parent. It does not reach a `task` subagent. **langchain's `create_agent` binds
+`recursion_limit: 9_999` onto every graph it compiles** (`{'recursion_limit': 9999, 'metadata':
+{'ls_integration': 'langchain_create_agent', ...}}`), `create_deep_agent` re-binds the same value,
+and deepagents invokes a subagent with only `{"configurable": {"ls_agent_type": "subagent"}}` — its
+own bound config wins the per-key merge, which deepagents states outright
+(`middleware/subagents.py`: *"the subagent's bound config still wins collisions (e.g.
+`lc_agent_name`, `recursion_limit`)"*).
+
+Measured 2026-09-18 with a fake model that always calls one tool, under `step_limit=25`:
+
+| what the model does | model calls before the limit tripped |
+|---|---|
+| always calls `ls` (parent only) | **12** |
+| always calls `task` | **5002** — `GraphRecursionError: Recursion limit of 9999 reached` |
+| always calls `task`, after the fix | **13** — `StepLimitExceeded` |
+
+So 25 steps buys 12 model/tool round trips, and before the fix a single dispatch bought 5000. Only
+`RUN_DEADLINE_S` was bounding a real run.
+
+Two things made this hard to see. The parent's limit *is* honoured, so the bound looked like it
+worked. And `create_deep_agent`'s own return carries the same 9999, which a caller's explicit
+`invoke` config overrides — so the same number behaves like a decision in one place and an
+inheritance in another.
+
+*What we do:* `capabilities.SUBAGENT_STEP_LIMIT` (25), applied by building twice. `build_agent`
+compiles the agent, reads deepagents' own general-purpose subagent back out with
+`capabilities.subagent_graphs`, rebinds it with `.with_config({"recursion_limit": ...})`, and passes
+it back as a `CompiledSubAgent` named `general-purpose` — which is the supported way to replace the
+default. Taking deepagents' own graph rather than assembling a replacement means summarisation,
+tool-call patching and anything else it adds next keep working; only the number changes. Verified
+that deepagents' subsequent `.with_config({"metadata", "run_name"})` does not clear ours.
+
+**The two builds share one `_agent_kwargs` result**, because rebuilding them would call
+`least_privilege_filesystem` twice and put the parent and the subagent on two different
+`StateBackend`s — F21 arrived at from the other direction.
+`test_the_bounded_subagent_is_still_on_the_parents_filesystem` asserts the tool objects are
+identical, which is what proves the second build reused the first's middleware.
+
+**A subagent that runs out aborts the whole turn** rather than reporting back, which is why the
+measured total is 13 and not 156: the subagent raises through the `task` call. Strict, and loud,
+which is the right side to fail on — but it means `StepLimitExceeded` has to name both limits,
+since either graph can be the one that ran out.
+
+*Also fixed here:* the step limit had no edge. `main()` caught `DeadlineExceeded` and nothing else,
+so a run that exhausted its wall clock printed `error: ...` and a run that exhausted its steps
+printed a `GraphRecursionError` traceback — the same `RunBounds`, two vocabularies.
+`run.StepLimitExceeded` is the translation, an operating error for the same reason
+`DeadlineExceeded` is one.
+
+*Also found here:* `AgentConfig.subagents` is a second door onto the allowlist. A spec that does not
+carry our `FilesystemMiddleware` gets one of deepagents' own, with every tool including `execute`.
+`_require_shell_withheld` already reads every subagent graph back, so this fails the build rather
+than granting a shell — pinned by
+`test_a_caller_supplied_subagent_cannot_re_grant_the_shell_tool`.
+
+*Still unverified:* whether a nested subagent (a subagent that itself dispatches) is bounded. Today
+none can — the general-purpose subagent has no `task` tool.
+
+## F25 — the router's providers do not all serve the same context window
+
+**Severity: important.** "128k context" is a property of the model; what you get is a property of
+whichever provider the router picked.
+
+gpt-oss-120b natively supports 128k (OpenAI, *Introducing gpt-oss*, 5 Aug 2025). Read off
+`https://router.huggingface.co/v1/models` 2026-09-18, the live providers for that model do not agree:
+
+| context_length | providers |
+|---|---|
+| 131072 | groq, novita, cerebras, nscale, together, fireworks-ai, ovhcloud, deepinfra |
+| **128072** | baseten |
+| *not advertised* | featherless-ai, scaleway |
+
+Nine of eleven state a number, one of those is 3000 tokens shorter than the rest, and two state
+nothing. With routing unpinned, the usable window is whichever provider answers — so a prompt sized
+against 131072 is a prompt that fails intermittently.
+
+*What we do:* `main.check_every_provider_serves_the_context_we_assume` reads the catalogue (one
+HTTP GET, no inference) and fails if any provider that *states* a length is below
+`ASSUMED_CONTEXT_TOKENS` (128000), reporting the ones that state nothing. Asserting on the unstated
+ones would be a check that can never go green; the mitigation for those is pinning `:provider`,
+which is a decision, not an assertion. A `require()` guards against the catalogue publishing no
+lengths at all, which would otherwise make the check pass by measuring nothing.
+
+**This makes `:provider` a correctness lever, not only a reproducibility one.** CLAUDE.md framed
+pinning as something an eval needs; it is also what turns the context window from a range into a
+number.
+
+## F26 — `reasoning_effort` has three levels, not the six the router documents
+
+**Severity: important.** A precondition that accepts values the request is guaranteed to fail on.
+
+`REASONING_EFFORTS` listed `none, minimal, low, medium, high, xhigh` — the values the router
+documents, recorded in F17. gpt-oss was post-trained on **three**: "the two open-weight models
+support three reasoning efforts—low, medium, and high" (OpenAI, *Introducing gpt-oss*), carried in
+the system message by the harmony format. Measured on the wire 2026-09-18, one prompt, every value:
+
+```
+effort=low       reasoning=10  output=21   text='391'
+effort=medium    reasoning=63  output=74   text='391'
+effort=high      reasoning=80  output=91   text='391'
+effort=None      reasoning=63  output=74   text='391'     <- identical to medium
+effort=minimal   400  "reasoning_effort: Input should be 'none', 'low', 'medium' or 'high'"
+effort=xhigh     400  same
+effort=none      400  "Failed to apply chat template ... Unsupported reasoning effort"
+```
+
+Two of those 400s come from the provider's schema and one from the model's own chat template, which
+is what "a provider-side mapping onto a three-level model" looks like from outside: `none` passes
+validation and the model then refuses it.
+
+This also closes F17's open question. **Unset is `medium`** — token-for-token identical, not merely
+"between low and high".
+
+*What we do:* `REASONING_EFFORTS` is `{"low", "medium", "high"}`. It is a property of the *model*,
+so a different model means widening it deliberately, the way `DEFAULT_FILESYSTEM_TOOLS` is widened
+deliberately — and failing locally is still better than a 400 from inside the provider.
+`main.check_reasoning_efforts_are_the_ones_the_router_takes` probes every allowed value live **and**
+one forbidden value, because "everything we allow was accepted" also passes on a router that
+accepts everything.
+
+## F27 — reasoning comes back as a token count, never as text
+
+**Severity: informational, and worth re-checking.** Three sinks would store it if it ever arrived.
+
+gpt-oss ships a deliberately unsupervised chain of thought: OpenAI "did not put any direct
+supervision on the CoT", the model "will often explicitly disobey instructions in its CoT", and
+their guidance is that "developers should not directly show CoTs to users… They may contain
+hallucinated or harmful content, including language that does not reflect OpenAI's standard safety
+policies, and may include information which the model is being explicitly asked to not include in
+the final output."
+
+Everything this harness records is a sink for that text if it ever arrives: `logs/*.jsonl` (local
+and gitignored), LangSmith, and W&B — the last two not local. Measured 2026-09-18 at
+`reasoning_effort="high"`: the reply carried 44 reasoning tokens, `additional_kwargs` held only
+`refusal`, and neither `reasoning` nor `reasoning_content` was present. `mirror.py` already noted
+this; it is now checked rather than assumed.
+
+*What we do:* `main.check_no_reasoning_content_comes_back` asserts the absence, with a `require()`
+that the run actually reasoned — otherwise "no content" would pass for the wrong reason. It also
+justifies something already true: the live checks assert on **tool messages and token counts, never
+on model prose**, which is now the vendor's own guidance rather than only good practice.
+
+## F28 — an installed package can reconfigure the agent without touching a parameter
+
+**Severity: important.** The door `KNOWN_CREATE_DEEP_AGENT_PARAMS` cannot see.
+
+That pin fails the import when `create_deep_agent` grows a parameter — which is how `execute`
+arrived (F4). A profile plugin grows no parameter. `create_deep_agent` resolves a `HarnessProfile`
+keyed by the model's provider and id (`graph.py`: `_harness_profile_for_model(model, _model_spec)`)
+from a process-global registry, and `deepagents.profiles` populates that registry by executing a
+zero-arg callable from **every installed distribution** advertising an entry point in
+`deepagents.harness_profiles` or `deepagents.provider_profiles`. A `HarnessProfile` carries
+`extra_middleware`, `excluded_tools`, `excluded_middleware`, `tool_description_overrides`,
+`base_system_prompt` and `general_purpose_subagent` — every one a capability decision, none of them
+visible at a call site.
+
+Verified 2026-09-18: both groups are empty in this environment, and the builtin harness profiles are
+keyed per-model (Anthropic models, Nemotron, Codex), so none matches the router model.
+
+**The near miss is the provider side.** deepagents ships
+`ProviderProfile("openai", init_kwargs={"use_responses_api": True})`. That is F1's pin, reversed, for
+every `openai:*` model. It does not reach us — `init_kwargs` feed `init_chat_model`, so they apply
+only when `create_deep_agent` is handed a model **string**, and `build_agent` refuses strings. The
+refusal of model strings is therefore load-bearing for correctness, not only for routing hygiene,
+and anyone "simplifying" `build_agent` to accept one would silently reroute every request to
+`/v1/responses`, which the router does not serve.
+
+*What we do:* `capabilities.DEEPAGENTS_PLUGIN_GROUPS` plus a load-time `require()` that both groups
+are empty. Installing such a plugin is then a failed import with the distribution named, rather than
+a quiet change of behaviour. Allowing one is a deliberate edit.
+
+## F29 — a paused turn looks exactly like a finished one
+
+**Severity: important.** The failure mode that arrives with human-in-the-loop, found before it
+shipped.
+
+`FilesystemPermission.mode` accepts `"interrupt"`, and deepagents turns interrupt-mode rules into
+`interrupt_on` entries for the parent *and* every subagent (`_build_interrupt_on_from_permissions`).
+So HITL needs no new config field. What it needs is a `run_turn` that can say a turn paused.
+
+Measured 2026-09-18 against a real compiled graph. An interrupted `invoke` returns:
+
+```
+keys: ['__interrupt__', 'files', 'messages']
+messages: 2      (human, then an AI message carrying the tool call)
+```
+
+The messages **already grew**, so the old postcondition (`len(messages) > len(sent)`) passed. A
+caller got a partial conversation, the tool never ran, and nothing said so. That is worse than a
+tripped assertion.
+
+Worse still, those messages contain a tool call with no `ToolMessage`. Handing them back as
+`history` shows the model a call it can see went unanswered — the one shape invariant a conversation
+has.
+
+The protocol, all verified rather than read from docs:
+
+- `result["__interrupt__"]` is a `list[Interrupt]`; each has `.id` and `.value`.
+- `.value` is `{"action_requests": [{"name", "args", "description"}], "review_configs":
+  [{"action_name", "allowed_decisions"}]}`. One interrupt batches a model turn's tool calls, so the
+  count a decision list must match is the number of *action requests*, not of interrupts.
+- Resuming needs a checkpointer: `RuntimeError: Cannot use Command(resume=...) without checkpointer`.
+  Interrupts still *fire* without one — the pause is simply unresumable.
+- The resume payload is `Command(resume={"decisions": [...]})`. A bare list raises `TypeError: list
+  indices must be integers, not str` from inside `HumanInTheLoopMiddleware.after_model`, which does
+  `interrupt(hitl_request)["decisions"]`.
+- The middleware zips decisions onto requests in order, so a short list misaligns them silently.
+
+*What we do:* `run.TurnResult` — `messages`, `interrupts`, `thread_id`, and a `paused` property. It
+keeps `__iter__`, `__len__` and `__getitem__` so every existing `messages = run_turn(...)` call site
+still indexes, slices and measures the way it did; a third outcome is not a reason to break the
+first two. The postcondition became "added messages **or** paused". `run.resume_turn` answers the
+requests, with preconditions on the decision count, on each decision having a `type`, and on the
+turn actually being paused. `run_turn` refuses a `history` carrying an unanswered tool call, which
+catches the corruption whether or not the caller kept the `TurnResult`. A pause on a graph with no
+checkpointer is a `CheckFailed`: it is a turn nobody can finish, and it is our own misconfiguration.
+
+`AgentConfig` gained `checkpointer` and `subagents`, both one-line fields of the kind its docstring
+promised. `thread_id` is carried on the `TurnResult` rather than retyped at the resume call site —
+a retyped id does not fail, it starts a second run wearing the first one's name.
+
+Proven end to end offline in `tests/test_run.py`: an interrupt rule pauses a real graph before the
+tool runs, approving runs the held tool, **rejecting leaves the write undone**, and an agent with no
+interrupt rule never pauses.
+
+---
+
 ## Observability API reference
 
 Not findings — API surfaces recorded so the next piece of work does not have to re-derive them.
@@ -805,9 +1042,8 @@ prompt to re-verify CLAUDE.md's version block — not a reason to skip that step
 
 ## Live verification
 
-`uv run my-agent` runs one check per finding against the real router and prints PASS/FAIL. 5/5 pass
-as of 2026-09-18 (re-run after the F20/F21 work and the move to `run.run_turn`), exit 0, both
-tracers active:
+`uv run my-agent` runs one check per finding against the real router and prints PASS/FAIL. 8/8
+pass as of 2026-09-18, exit 0, both tracers active:
 
 | Finding | Check | Evidence |
 |---|---|---|
@@ -816,10 +1052,17 @@ tracers active:
 | F4 | shell tool withheld | unbound; no `execute` call in a run that asked for one |
 | F4 | remaining filesystem tools usable | `write_file`, `read_file` both succeeded |
 | F5 | permission rules survive replacement | `write_file` denied on `/secrets/**` |
+| F26 | `reasoning_effort` set matches the router | accepted low/medium/high; `xhigh` rejected |
+| F27 | reasoning is a count, never text | 44 reasoning tokens, no content keys |
+| F25 | every provider that states a context window meets our floor | shortest 128072 across 9; featherless-ai and scaleway state nothing |
+
+The F25 check found a real divergence on its first run and is the reason that finding exists. It
+asserts only on providers that publish a length — the two that publish nothing are an unknown a
+check cannot close, and the note in its output says what does (pin `:provider`).
 
 The checks assert on tool messages and token counts rather than model prose, so they do not depend
-on how the model phrases things. The F5 check was itself verified by breaking the fix and watching
-it go red.
+on how the model phrases things — which F27 turned from good practice into the vendor's own
+guidance. The F5 check was itself verified by breaking the fix and watching it go red.
 
 **`uv run pytest -m live` can hang *after* reporting its result — do not pipe it to `tail`.** The
 wait is now explained and bounded at 300s (F23), but the piping lesson stands: `pytest ... | tail;
@@ -835,18 +1078,26 @@ The tests themselves pass; only process exit is affected. Run a single live test
 is all you need — it reports in ~2s and the wait costs nothing but the wait.
 
 Every finding added since F11 is pinned offline instead, and each was verified by mutation — the
-change reverted in place and the test watched go red. Nine mutants, all killed: a silent `{}` from
-`subagent_graphs`, a dropped subagent loop, a removed vacuity guard, `execute` back in the
+change reverted in place and the test watched go red. Fourteen mutants, all killed: a silent `{}`
+from `subagent_graphs`, a dropped subagent loop, a removed vacuity guard, `execute` back in the
 allowlist, an unsent step limit, an unattached deadline, a no-op deadline check, `raise_error =
-False`, and a fixed rather than relative message postcondition. A tenth survived and is written up
-in F21.
+False`, a fixed rather than relative message postcondition, and — added with F24 and F29 — a dropped
+subagent step-limit rebind, an untranslated `GraphRecursionError`, an unchecked unanswered tool
+call, a `paused` property hardwired to `False`, and a dropped checkpointer dead-end check. One
+survived and is written up in F21.
 
 ## Open / unverified
 
 Each of these is also noted at the finding it belongs to.
 
-- A **provider-pinned** model id (`org/model:groq`) on the token cap (F2) and on `reasoning_effort`
-  (F17). Only the router's own selection is covered.
-- Whether `none`/`minimal` differ from `low` on this model (F17).
+- A **provider-pinned** model id (`org/model:groq`) on the token cap (F2), on `reasoning_effort`
+  (F17, F26) and on the context window (F25). Only the router's own selection is covered, and F25 is
+  the finding that makes pinning worth doing rather than merely tidy.
+- What `featherless-ai` and `scaleway` actually serve as a context window (F25). They publish
+  nothing; measuring it means sending a prompt and watching it truncate.
 - Whether any new protocol with a non-method member diverges between mypy and pyright (F16).
 - Which `create_deep_agent` omissions `AgentConfig` considered and rejected (F19).
+- Whether a nested subagent would inherit `SUBAGENT_STEP_LIMIT` (F24). None can dispatch one today.
+- Whether HITL behaves the same against the live router as against the fake model it is proven with
+  (F29). The pause is a middleware decision taken before the model is called again, so it should —
+  but "should" is what this file exists to replace.

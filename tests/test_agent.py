@@ -26,6 +26,8 @@ from langchain.agents.middleware import TodoListMiddleware
 from langchain.tools import ToolRuntime
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.language_models.fake_chat_models import ParrotFakeChatModel
+from langchain_core.messages import AIMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from langgraph.graph.state import CompiledStateGraph
@@ -34,14 +36,47 @@ from pydantic import SecretStr
 from my_agent.agent import KNOWN_CREATE_DEEP_AGENT_PARAMS, AgentConfig, _agent_kwargs, build_agent
 from my_agent.capabilities import (
     DEFAULT_FILESYSTEM_TOOLS,
+    LIBRARY_SUBAGENT_STEP_LIMIT,
     SHELL_TOOL_NAME,
+    SUBAGENT_STEP_LIMIT,
     SUBAGENT_TASK_TOOL_NAME,
     compiled_tool_names,
     compiled_tools,
+    least_privilege_filesystem,
     subagent_graphs,
 )
 from my_agent.model import ModelConfig, build_model
 from my_agent.negative_space import CheckFailed
+from my_agent.run import RunBounds, StepLimitExceeded, run_turn
+
+
+class AlwaysDispatchesSubagents(BaseChatModel):
+    """A model that never stops delegating.
+
+    The cheapest stand-in for one that has lost the thread, and the only way to
+    exercise a subagent's step limit offline: it takes a real dispatch to reach
+    the subagent graph, and a real graph to show whose limit stopped it.
+    """
+
+    calls: int = 0
+
+    @property
+    def _llm_type(self) -> str:
+        return "always-dispatches"
+
+    def bind_tools(self, tools: Any, **kwargs: Any) -> BaseChatModel:
+        return self
+
+    def _generate(self, messages: Any, stop: Any = None, run_manager: Any = None, **kw: Any) -> Any:
+        self.calls += 1
+        call = {
+            "name": SUBAGENT_TASK_TOOL_NAME,
+            "args": {"description": "keep going", "subagent_type": "general-purpose"},
+            "id": f"c{self.calls}",
+        }
+        message = AIMessage(content="", tool_calls=[call])
+        return ChatResult(generations=[ChatGeneration(message=message)])
+
 
 # --------------------------------------------------------------------------
 # AgentConfig
@@ -180,10 +215,9 @@ def test_agent_kwargs_leaves_every_other_field_untouched() -> None:
     config = AgentConfig(name="assembled", system_prompt="Be brief.")
     kwargs = _agent_kwargs(config)
 
-    passthrough = {k: v for k, v in kwargs.items() if k not in {"middleware", "permissions"}}
-    assert passthrough == {
-        k: v for k, v in config.as_kwargs().items() if k not in {"middleware", "permissions"}
-    }
+    rewritten = {"middleware", "permissions", "subagents"}
+    passthrough = {k: v for k, v in kwargs.items() if k not in rewritten}
+    assert passthrough == {k: v for k, v in config.as_kwargs().items() if k not in rewritten}
 
 
 def test_agent_kwargs_threads_a_backend_into_the_middleware_it_installs(
@@ -293,9 +327,7 @@ def test_a_bare_deep_agent_does_grant_the_shell_tool_to_its_subagent() -> None:
     and we would never learn that our narrowing had become a no-op."""
     bare = create_deep_agent(model=ParrotFakeChatModel())
 
-    granted = {
-        name: compiled_tool_names(graph) for name, graph in subagent_graphs(bare).items()
-    }
+    granted = {name: compiled_tool_names(graph) for name, graph in subagent_graphs(bare).items()}
 
     assert granted != {}
     assert all(SHELL_TOOL_NAME in bound for bound in granted.values()), granted
@@ -336,9 +368,18 @@ def test_build_agent_fails_when_a_subagent_re_grants_the_shell_tool(
         ),
     )
     monkeypatch.setattr("my_agent.agent.subagent_graphs", lambda _agent: {"leaky": leaky})
+    # A caller-supplied general-purpose spec, so the step-limit rebuild (which
+    # reads the same patched mapping) is skipped and this test stays about the
+    # one postcondition it names.
+    owned: Any = {
+        "name": "general-purpose",
+        "description": "mine",
+        "tools": [],
+        "middleware": [least_privilege_filesystem(None)],
+    }
 
     with pytest.raises(CheckFailed, match=SHELL_TOOL_NAME):
-        build_agent(build_model(ModelConfig(api_key=valid_secret)))
+        build_agent(build_model(ModelConfig(api_key=valid_secret)), AgentConfig(subagents=[owned]))
 
 
 def test_build_agent_fails_when_the_subagent_reader_finds_nothing(
@@ -506,14 +547,156 @@ def test_create_deep_agent_parameters_are_pinned() -> None:
     `check_config_contract` only asserts our fields are real parameters; it
     cannot see a new one appear. That is the door the shell `execute` tool came
     through (F4), so the parameter set is pinned the way the tool list is."""
-    assert frozenset(
-        inspect.signature(create_deep_agent).parameters
-    ) == KNOWN_CREATE_DEEP_AGENT_PARAMS
+    assert (
+        frozenset(inspect.signature(create_deep_agent).parameters) == KNOWN_CREATE_DEEP_AGENT_PARAMS
+    )
 
 
 def test_agent_config_covers_only_what_is_needed() -> None:
     """Deliberate YAGNI, pinned so the gap is a decision rather than an accident:
     the rest are reachable by adding a field, and `build_agent` does not change."""
     configured = {f.name for f in dataclasses.fields(AgentConfig)}
-    assert configured == {"name", "system_prompt", "tools", "middleware", "permissions"}
+    assert configured == {
+        "name",
+        "system_prompt",
+        "tools",
+        "middleware",
+        "permissions",
+        "subagents",
+        "checkpointer",
+    }
     assert configured < KNOWN_CREATE_DEEP_AGENT_PARAMS
+
+
+# --------------------------------------------------------------------------
+# The subagent's step limit (F24)
+# --------------------------------------------------------------------------
+
+
+def test_the_general_purpose_subagent_runs_under_our_step_limit() -> None:
+    """The bound `RunBounds.step_limit` could not reach.
+
+    `create_agent` binds `recursion_limit: 9999` on every graph it compiles, and
+    a subagent is invoked with its own bound config rather than the parent's —
+    so a step limit sent to `run_turn` stopped at the parent and one `task`
+    dispatch ran to 9999. Measured before the fix: 5002 model calls under a
+    `step_limit` of 25.
+    """
+    agent = build_agent(ParrotFakeChatModel())
+
+    graph = subagent_graphs(agent)["general-purpose"]
+
+    assert (graph.config or {}).get("recursion_limit") == SUBAGENT_STEP_LIMIT
+
+
+def test_a_bare_deep_agent_leaves_its_subagent_at_the_library_default() -> None:
+    """The discriminator. Without it the test above keeps passing if deepagents
+    starts choosing a small limit for its own reasons, and the bound we think we
+    are setting would be one we merely happen to agree with."""
+    bare = create_deep_agent(model=ParrotFakeChatModel())
+
+    graph = subagent_graphs(bare)["general-purpose"]
+
+    assert (graph.config or {}).get("recursion_limit") == LIBRARY_SUBAGENT_STEP_LIMIT
+    assert LIBRARY_SUBAGENT_STEP_LIMIT > SUBAGENT_STEP_LIMIT
+
+
+def test_the_bounded_subagent_is_still_on_the_parents_filesystem() -> None:
+    """Building twice is how the bound gets applied, and building twice is
+    exactly how an agent ends up on two filesystems (F21). The tool objects
+    being identical is what proves the second build reused the first's
+    middleware rather than making a new one."""
+    agent = build_agent(ParrotFakeChatModel())
+
+    graph = subagent_graphs(agent)["general-purpose"]
+
+    assert compiled_tools(graph)["write_file"] is compiled_tools(agent)["write_file"]
+
+
+def test_the_bounded_subagent_still_withholds_the_shell_tool() -> None:
+    """Replacing deepagents' subagent means owning what it can do. The whole
+    point of the allowlist would be lost if the replacement re-granted it."""
+    agent = build_agent(ParrotFakeChatModel())
+
+    graph = subagent_graphs(agent)["general-purpose"]
+
+    assert SHELL_TOOL_NAME not in compiled_tool_names(graph)
+    assert "write_file" in compiled_tool_names(graph)
+
+
+def test_the_parent_can_still_dispatch_to_the_bounded_subagent() -> None:
+    """A bound applied by replacing the subagent is worthless if the
+    replacement is not the thing `task` actually dispatches to."""
+    agent = build_agent(ParrotFakeChatModel())
+
+    assert SUBAGENT_TASK_TOOL_NAME in compiled_tool_names(agent)
+    assert set(subagent_graphs(agent)) == {"general-purpose"}
+
+
+def test_a_caller_supplied_subagent_keeps_its_own_step_limit() -> None:
+    """`AgentConfig.subagents` is the caller's; ours is only the default nobody
+    chose. Silently rebinding a limit onto a spec someone wrote would be the
+    same inheritance bug in the other direction — so a caller who wants a bound
+    subagent supplies a `CompiledSubAgent` and binds it themselves."""
+    spec: Any = {
+        "name": "general-purpose",
+        "description": "mine",
+        "tools": [],
+        "middleware": [least_privilege_filesystem(None)],
+    }
+    agent = build_agent(ParrotFakeChatModel(), AgentConfig(subagents=[spec]))
+
+    graph = subagent_graphs(agent)["general-purpose"]
+
+    assert (graph.config or {}).get("recursion_limit") == LIBRARY_SUBAGENT_STEP_LIMIT
+
+
+def test_a_caller_supplied_subagent_cannot_re_grant_the_shell_tool() -> None:
+    """A subagent spec is a second door onto the allowlist: deepagents builds
+    it a `FilesystemMiddleware` of its own, with every tool, unless the spec
+    carries ours. `build_agent` reads every subagent graph back, so the escape
+    is a failed build rather than a shell the parent never had."""
+    spec: Any = {
+        "name": "general-purpose",
+        "description": "mine",
+        "tools": [],
+        "middleware": [],
+    }
+
+    with pytest.raises(CheckFailed, match=f"{SHELL_TOOL_NAME} leaked into subagent"):
+        build_agent(ParrotFakeChatModel(), AgentConfig(subagents=[spec]))
+
+
+def test_agent_config_freezes_the_subagents_it_was_given() -> None:
+    spec: Any = {"name": "helper", "description": "d", "tools": [], "middleware": []}
+    given = [spec]
+    config = AgentConfig(subagents=given)
+
+    given.append(spec)
+
+    assert len(config.subagents) == 1
+
+
+def test_subagent_step_limit_permits_at_least_one_round_trip() -> None:
+    """Two graph steps per model/tool round trip, so a limit below 2 buys a
+    subagent that cannot call a tool at all."""
+    assert SUBAGENT_STEP_LIMIT >= 2
+
+
+def test_a_runaway_subagent_cannot_outlive_the_turn_that_dispatched_it() -> None:
+    """The whole point of the bound, end to end.
+
+    A model that only ever calls `task` is the cheapest stand-in for one that
+    loses the thread. Before the limit was applied this ran 5002 model calls
+    under a `step_limit` of 25 and ended in a raw `GraphRecursionError`
+    (measured 2026-09-18). A subagent out of steps raises through the `task`
+    call rather than reporting back, so the whole turn stops — strict, and the
+    reason the failure is loud rather than a silently truncated answer.
+    """
+    model = AlwaysDispatchesSubagents()
+    agent = build_agent(model)
+
+    with pytest.raises(StepLimitExceeded, match="step_limit"):
+        run_turn(agent, "go", bounds=RunBounds(step_limit=25, deadline_s=30))
+
+    assert model.calls < 2 * SUBAGENT_STEP_LIMIT
