@@ -225,6 +225,12 @@ Bugs live in the states the code was never written to handle. Write those down a
   explicit `if ... raise CheckFailed(...)` — same runtime behaviour, and mypy follows it.
   `check_shape` in `negative_space.py` is the worked example.
 - Plain `assert` stays correct in test bodies (pytest rewrites it for readable failures).
+- **A test expecting a tripped `require()` names `CheckFailed`, never `AssertionError`.** The
+  latter is its base class, so it is also satisfied by a bare `assert` — which means an
+  `AssertionError` expectation silently accepts a `require()` being downgraded to the one construct
+  this project bans, and `python -O` then deletes the check entirely. Measured, not assumed:
+  downgrading `run_log_path`'s timezone guard to a bare `assert` passed the old expectation and
+  fails the new one.
 
 ## Testing and evals
 

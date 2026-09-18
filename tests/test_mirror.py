@@ -24,6 +24,7 @@ from my_agent.mirror import (
     mirror_to_file,
     run_log_path,
 )
+from my_agent.negative_space import CheckFailed
 
 RUN_ID = UUID("00000000-0000-4000-8000-000000000001")
 PARENT_ID = UUID("00000000-0000-4000-8000-000000000002")
@@ -228,7 +229,7 @@ def test_run_log_path_defaults_to_the_log_directory() -> None:
 
 def test_run_log_path_rejects_a_naive_timestamp() -> None:
     """A naive stamp is ambiguous, and these filenames sort by time."""
-    with pytest.raises(AssertionError, match="timezone"):
+    with pytest.raises(CheckFailed, match="timezone"):
         run_log_path(now=datetime(2026, 9, 17, 14, 30, 5), run_id="abc123")
 
 
@@ -245,22 +246,22 @@ def test_run_log_paths_differ_between_runs() -> None:
 def test_run_log_path_rejects_a_traversal_run_id() -> None:
     """The path is built by string interpolation: an unvalidated run_id can escape
     the log directory entirely (`../../etc/passwd`)."""
-    with pytest.raises(AssertionError, match="separator"):
+    with pytest.raises(CheckFailed, match="separator"):
         run_log_path(now=FIXED_NOW, run_id="../../etc/passwd")
 
 
 def test_run_log_path_rejects_a_run_id_with_a_path_separator() -> None:
-    with pytest.raises(AssertionError, match="separator"):
+    with pytest.raises(CheckFailed, match="separator"):
         run_log_path(now=FIXED_NOW, run_id="a/b")
 
 
 def test_run_log_path_rejects_a_run_id_with_a_backslash() -> None:
-    with pytest.raises(AssertionError, match="separator"):
+    with pytest.raises(CheckFailed, match="separator"):
         run_log_path(now=FIXED_NOW, run_id="a\\b")
 
 
 def test_run_log_path_rejects_a_bare_traversal_token() -> None:
-    with pytest.raises(AssertionError, match="traversal"):
+    with pytest.raises(CheckFailed, match="traversal"):
         run_log_path(now=FIXED_NOW, run_id="..")
 
 
@@ -285,11 +286,24 @@ def test_mirror_to_file_creates_the_directory(tmp_path: Path) -> None:
 
 
 def test_mirror_to_file_closes_the_file_even_when_the_run_raises(tmp_path: Path) -> None:
-    """The crashed run is the one whose log has to survive."""
+    """The crashed run is the one whose log has to survive.
+
+    The failing run is a nested function so the `pytest.raises` block holds one
+    statement: with two, the block passes if *either* raises, and an
+    `on_chain_start` that blew up would look like the deliberate explosion. The
+    `match` pins it to the one this test threw for the same reason — `RuntimeError`
+    alone would be satisfied by an unrelated failure inside `mirror_to_file`.
+    """
     path = tmp_path / "run.jsonl"
-    with pytest.raises(RuntimeError), mirror_to_file(path) as mirror:
-        mirror.on_chain_start({"name": "agent"}, {}, run_id=RUN_ID)
-        raise RuntimeError("the agent exploded")
+
+    def exploding_run() -> None:
+        with mirror_to_file(path) as mirror:
+            mirror.on_chain_start({"name": "agent"}, {}, run_id=RUN_ID)
+            raise RuntimeError("the agent exploded")
+
+    with pytest.raises(RuntimeError, match="the agent exploded"):
+        exploding_run()
+
     assert json.loads(path.read_text().strip())["name"] == "agent"
 
 

@@ -14,7 +14,7 @@ a real cost.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 import pytest
 import weave
@@ -24,8 +24,10 @@ from langsmith.utils import get_env_var
 import my_agent.tracing as tracing_module
 from my_agent.agent import build_agent
 from my_agent.model import ModelConfig, build_model
+from my_agent.negative_space import CheckFailed
 from my_agent.run import run_turn
 from my_agent.tracing import (
+    _TRUTHY,
     DEFAULT_WEAVE_PROJECT,
     LANGSMITH_API_KEY_ENV_VAR,
     LANGSMITH_PROJECT_ENV_VAR,
@@ -89,39 +91,78 @@ def test_langsmith_project_is_none_when_unset() -> None:
     assert backend.project is None
 
 
-@pytest.mark.parametrize("flag", ["true", "True", "  TRUE  ", "1", "yes", "on"])
+LANGSMITH_HONOURS = "true"
+"""The one spelling `langsmith.utils.tracing_is_enabled()` accepts (F13)."""
+
+TRUTHY_SPELLINGS = ("true", "True", "  TRUE  ", "1", "yes", "on")
+"""Every spelling `from_env` accepts, shared by the tests below.
+
+`from_env` is permissive on purpose: narrowing `_TRUTHY` to langsmith's exact
+`"true"` would make `LANGSMITH_TRACING=True` silently not trace. So configuring a
+backend does not mean it will actually trace, and the pipeline
+(`from_env()` then `.activate()`) has to be exercised for every accepted
+spelling — one of which activates and the rest of which must fail loudly.
+"""
+
+SPELLINGS_LANGSMITH_REFUSES = tuple(f for f in TRUTHY_SPELLINGS if f != LANGSMITH_HONOURS)
+"""The other half of the partition, derived rather than restated."""
+
+
+@pytest.mark.parametrize("flag", TRUTHY_SPELLINGS)
 def test_langsmith_accepts_the_usual_truthy_spellings(flag: str) -> None:
     assert LangSmithTracing.from_env(LANGSMITH_ENV | {LANGSMITH_TRACING_ENV_VAR: flag}) is not None
 
 
-@pytest.mark.parametrize("flag", ["true", "True", "  TRUE  ", "1", "yes", "on"])
-def test_langsmith_pipeline_only_the_exact_string_true_actually_traces(
+def test_the_spellings_under_test_are_exactly_the_ones_from_env_accepts() -> None:
+    """The pipeline tests below split `TRUTHY_SPELLINGS` in two. Neither half can
+    notice a spelling added to `_TRUTHY` and not here, so this compares the test
+    data to the production set directly.
+    """
+    assert {f.strip().lower() for f in TRUTHY_SPELLINGS} == set(_TRUTHY)
+    assert {*SPELLINGS_LANGSMITH_REFUSES, LANGSMITH_HONOURS} == set(TRUTHY_SPELLINGS)
+
+
+def test_langsmith_pipeline_traces_for_the_one_spelling_langsmith_honours(
+    monkeypatch: pytest.MonkeyPatch,
+    assert_does_not_raise: Callable[[Callable[[], object]], None],
+) -> None:
+    """Half the partition: the spelling that must get all the way through."""
+    monkeypatch.setenv(LANGSMITH_API_KEY_ENV_VAR, "ls-key-value")
+    monkeypatch.setenv(LANGSMITH_TRACING_ENV_VAR, LANGSMITH_HONOURS)
+
+    backend = LangSmithTracing.from_env()
+
+    assert backend is not None
+    assert_does_not_raise(backend.activate)
+
+
+@pytest.mark.parametrize("flag", SPELLINGS_LANGSMITH_REFUSES)
+def test_langsmith_pipeline_refuses_every_other_accepted_spelling(
     monkeypatch: pytest.MonkeyPatch, flag: str
 ) -> None:
-    """`from_env` is permissive on purpose (`_TRUTHY` accepts more spellings than
-    langsmith's own literal `"true"` comparison), so `from_env` alone configuring a
-    backend does not mean the backend will actually trace. This exercises the full
-    pipeline, `from_env()` then `.activate()`, for every accepted spelling: only the
-    exact string "true" may activate cleanly, and every other spelling must raise
-    `TracingMisconfigured` naming the offending value.
-    """
+    """The other half, one parametrize entry per spelling so a single spelling
+    regressing is reported on its own rather than inside one shared case."""
     monkeypatch.setenv(LANGSMITH_API_KEY_ENV_VAR, "ls-key-value")
     monkeypatch.setenv(LANGSMITH_TRACING_ENV_VAR, flag)
 
     backend = LangSmithTracing.from_env()
     assert backend is not None
 
-    if flag == "true":
-        backend.activate()  # must not raise
-    else:
-        with pytest.raises(TracingMisconfigured, match=re.escape(flag)):
-            backend.activate()
+    with pytest.raises(TracingMisconfigured, match=re.escape(flag)):
+        backend.activate()
 
 
-def test_langsmith_activate_passes_when_langsmith_agrees(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_langsmith_activate_passes_when_langsmith_agrees(
+    monkeypatch: pytest.MonkeyPatch,
+    assert_does_not_raise: Callable[[Callable[[], object]], None],
+) -> None:
+    """Stated as an explicit non-raise: a bare call asserts nothing, so the test
+    would pass even if `activate` were deleted, and a wrong rejection would be
+    reported as an error rather than a failure."""
     monkeypatch.setenv("LANGSMITH_TRACING", "true")
     monkeypatch.setenv("LANGSMITH_API_KEY", "ls-key-value")
-    LangSmithTracing(project="my-project").activate()  # must not raise
+
+    assert_does_not_raise(LangSmithTracing(project="my-project").activate)
 
 
 def test_langsmith_activate_fails_loudly_when_langsmith_disagrees(
@@ -161,6 +202,7 @@ def test_langsmith_activate_names_the_real_value_from_the_langchain_namespace(
 
 def test_langsmith_activate_survives_a_poisoned_env_var_cache(
     monkeypatch: pytest.MonkeyPatch,
+    assert_does_not_raise: Callable[[Callable[[], object]], None],
 ) -> None:
     """Reading the flag before load_dotenv() caches a False that would otherwise
     disable tracing for the life of the process.
@@ -173,7 +215,12 @@ def test_langsmith_activate_survives_a_poisoned_env_var_cache(
     monkeypatch.delenv("LANGSMITH_TRACING", raising=False)
     get_env_var("TRACING", default="")  # poison the cache with "absent"
     monkeypatch.setenv("LANGSMITH_TRACING", "true")
-    LangSmithTracing(project=None).activate()  # must not raise
+
+    assert_does_not_raise(LangSmithTracing(project=None).activate)
+
+    # The mechanism, not just the absence of a crash: `activate` clears the
+    # cache, so the poisoned "" must be gone and the real value readable.
+    assert get_env_var("TRACING", default="") == "true"
 
 
 def test_langsmith_satisfies_the_protocol() -> None:
@@ -257,7 +304,7 @@ def test_weave_activate_fails_when_the_langchain_tracer_is_missing(
 
 
 def test_weave_rejects_an_empty_project() -> None:
-    with pytest.raises(AssertionError, match="project"):
+    with pytest.raises(CheckFailed, match="project"):
         WeaveTracing(project="")
 
 
