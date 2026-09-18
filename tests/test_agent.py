@@ -14,19 +14,30 @@ from __future__ import annotations
 
 import dataclasses
 import inspect
-from typing import Any
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 from deepagents import FilesystemMiddleware, FilesystemPermission, create_deep_agent
+from deepagents.backends import FilesystemBackend, StateBackend
+from deepagents.backends.protocol import BackendProtocol
 from langchain.agents.middleware import TodoListMiddleware
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.language_models.fake_chat_models import ParrotFakeChatModel
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
+from langgraph.graph.state import CompiledStateGraph
 from pydantic import SecretStr
 
 from my_agent.agent import KNOWN_CREATE_DEEP_AGENT_PARAMS, AgentConfig, _agent_kwargs, build_agent
-from my_agent.capabilities import DEFAULT_FILESYSTEM_TOOLS, SHELL_TOOL_NAME, compiled_tool_names
+from my_agent.capabilities import (
+    DEFAULT_FILESYSTEM_TOOLS,
+    SHELL_TOOL_NAME,
+    SUBAGENT_TASK_TOOL_NAME,
+    compiled_tool_names,
+    subagent_graphs,
+)
 from my_agent.model import ModelConfig, build_model
 from my_agent.negative_space import CheckFailed
 
@@ -136,6 +147,35 @@ def test_agent_kwargs_leaves_every_other_field_untouched() -> None:
     }
 
 
+def test_agent_kwargs_threads_a_backend_into_the_middleware_it_installs(
+    tmp_path: Path,
+) -> None:
+    """`AgentConfig` gaining a field is supposed to be a one-line change, and for
+    `backend` it was not: `create_deep_agent` wires a backend into skills and
+    summarisation, while the FilesystemMiddleware we install *replaces* its
+    filesystem tools and kept a `StateBackend` of its own — two filesystems, one
+    agent (F21). This is F5's failure mode wearing a different hat.
+    """
+
+    @dataclasses.dataclass(frozen=True, slots=True)
+    class ConfigWithBackend(AgentConfig):
+        backend: BackendProtocol | None = None
+
+    backend = FilesystemBackend(root_dir=tmp_path)
+
+    kwargs = _agent_kwargs(ConfigWithBackend(backend=backend))
+
+    assert kwargs["backend"] is backend
+    assert kwargs["middleware"][0].backend is backend
+
+
+def test_agent_kwargs_leaves_the_middleware_on_the_state_backend_by_default() -> None:
+    """No backend configured means the safest one, chosen rather than inherited."""
+    kwargs = _agent_kwargs(AgentConfig())
+
+    assert isinstance(kwargs["middleware"][0].backend, StateBackend)
+
+
 def test_agent_kwargs_refuses_the_rule_dropping_combination_without_a_model(
     deny_secrets: FilesystemPermission,
 ) -> None:
@@ -190,6 +230,87 @@ def test_build_agent_withholds_the_shell_tool_from_the_compiled_graph(
 
     assert bound >= set(DEFAULT_FILESYSTEM_TOOLS)
     assert SHELL_TOOL_NAME not in bound
+
+
+def test_build_agent_withholds_the_shell_tool_from_every_subagent(
+    valid_secret: SecretStr,
+) -> None:
+    """The parent allowlist is not the whole claim. deepagents builds its
+    general-purpose subagent its own FilesystemMiddleware with no allowlist at
+    all, so `execute` reaching the parent's tool list is not the only way it can
+    come back (F20)."""
+    agent = build_agent(build_model(ModelConfig(api_key=valid_secret)))
+
+    granted = {name: compiled_tool_names(g) for name, g in subagent_graphs(agent).items()}
+
+    assert granted != {}
+    assert {n for n, b in granted.items() if b == frozenset()} == set()
+    assert {n for n, b in granted.items() if SHELL_TOOL_NAME in b} == set()
+
+
+def test_a_bare_deep_agent_does_grant_the_shell_tool_to_its_subagent() -> None:
+    """The discriminating half. Without this, the test above would keep passing
+    if deepagents stopped granting `execute` to subagents for its own reasons,
+    and we would never learn that our narrowing had become a no-op."""
+    bare = create_deep_agent(model=ParrotFakeChatModel())
+
+    granted = {
+        name: compiled_tool_names(graph) for name, graph in subagent_graphs(bare).items()
+    }
+
+    assert granted != {}
+    assert all(SHELL_TOOL_NAME in bound for bound in granted.values()), granted
+
+
+def test_every_subagent_gets_the_same_tool_allowlist_as_the_parent(
+    valid_secret: SecretStr,
+) -> None:
+    """Whatever the parent may do, a subagent may do — and no more. Stated as
+    equality rather than as an `execute` check so a *different* capability
+    appearing on one side only also fails."""
+    agent = build_agent(build_model(ModelConfig(api_key=valid_secret)))
+
+    parent = compiled_tool_names(agent) - {SUBAGENT_TASK_TOOL_NAME}
+
+    differing = {
+        name: sorted(compiled_tool_names(g))
+        for name, g in subagent_graphs(agent).items()
+        if compiled_tool_names(g) != parent
+    }
+
+    assert differing == {}
+
+
+def test_build_agent_fails_when_a_subagent_re_grants_the_shell_tool(
+    valid_secret: SecretStr, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Proof the postcondition can fire. The graph deepagents hands back is not
+    something a unit test can corrupt, so the reader is replaced instead."""
+    leaky = cast(
+        "CompiledStateGraph[Any, Any, Any, Any]",
+        SimpleNamespace(
+            nodes={
+                "tools": SimpleNamespace(
+                    bound=SimpleNamespace(tools_by_name={"ls": object(), SHELL_TOOL_NAME: object()})
+                )
+            }
+        ),
+    )
+    monkeypatch.setattr("my_agent.agent.subagent_graphs", lambda _agent: {"leaky": leaky})
+
+    with pytest.raises(CheckFailed, match=SHELL_TOOL_NAME):
+        build_agent(build_model(ModelConfig(api_key=valid_secret)))
+
+
+def test_build_agent_fails_when_the_subagent_reader_finds_nothing(
+    valid_secret: SecretStr, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An empty mapping from the reader means the `task` tool vanished. That is
+    a structural change worth failing on, not a licence to skip the check."""
+    monkeypatch.setattr("my_agent.agent.subagent_graphs", lambda _agent: {})
+
+    with pytest.raises(CheckFailed, match="subagent"):
+        build_agent(build_model(ModelConfig(api_key=valid_secret)))
 
 
 def test_build_agent_accepts_tools(valid_secret: SecretStr) -> None:

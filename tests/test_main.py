@@ -5,12 +5,13 @@ The live round trip is not tested here — that is what `uv run my-agent` is for
 
 from __future__ import annotations
 
-import io
+from pathlib import Path
+from uuid import uuid4
 
 import pytest
 from deepagents import FilesystemMiddleware, create_deep_agent
 from langchain.agents.middleware import TodoListMiddleware
-from langchain_core.messages import AIMessage
+from langchain_core.callbacks import BaseCallbackHandler
 from pydantic import SecretStr
 
 from my_agent import main as main_module
@@ -20,10 +21,10 @@ from my_agent.capabilities import (
     SHELL_TOOL_NAME,
     compiled_tool_names,
 )
-from my_agent.main import EXIT_MISCONFIGURED, main
-from my_agent.mirror import JsonlMirror
+from my_agent.main import EXIT_CHECK_FAILED, EXIT_MISCONFIGURED, main
 from my_agent.model import ModelConfig, build_model
 from my_agent.negative_space import CheckFailed
+from my_agent.run import DeadlineExceeded
 
 VALID_SECRET = SecretStr("hf_token_value")
 
@@ -172,16 +173,32 @@ def test_activate_tracing_is_quiet_when_nothing_is_configured(
     assert main_module._activate_tracing() == ()
 
 
-def test_run_passes_callbacks_to_the_graph() -> None:
-    """The mirror is only worth having if it is actually attached."""
-    seen: dict[str, object] = {}
+def test_main_reports_a_missed_deadline_instead_of_a_traceback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A run that outlives its wall clock is the outside world being slow, not a
+    broken contract — so the CLI reports it the way it reports a missing token.
 
-    class FakeAgent:
-        def invoke(self, payload: object, config: dict[str, object]) -> dict[str, object]:
-            seen.update(config)
-            return {"messages": [{"role": "user", "content": "hi"}, AIMessage("pong")]}
+    The fake records one event before raising, because that is what a real
+    timeout looks like: steps happened, then the budget ran out. It also keeps
+    the mirror postcondition honest rather than sidestepping it.
+    """
+    monkeypatch.setattr(main_module, "load_dotenv", lambda *_a, **_k: False)
+    monkeypatch.setenv("HF_TOKEN", "hf_token_value")
+    monkeypatch.setattr(main_module, "available_backends", tuple)
+    monkeypatch.setattr(main_module, "run_log_path", lambda: tmp_path / "run.jsonl")
+    monkeypatch.setattr("sys.argv", ["my-agent", "ping"])
 
-    mirror = JsonlMirror(io.StringIO())
-    main_module._run(FakeAgent(), "ping", [mirror])
-    assert seen["callbacks"] == [mirror]
-    assert seen["recursion_limit"] == main_module.RECURSION_LIMIT
+    def timed_out(
+        config: object, prompt: str, callbacks: list[BaseCallbackHandler]
+    ) -> int:
+        callbacks[0].on_chain_end({}, run_id=uuid4())
+        raise DeadlineExceeded("run exceeded its 600.0s deadline after 601.0s")
+
+    monkeypatch.setattr(main_module, "_single_turn", timed_out)
+
+    assert main() == EXIT_CHECK_FAILED
+
+    captured = capsys.readouterr()
+    assert "600.0s deadline" in captured.err
+    assert "Traceback" not in captured.err

@@ -19,7 +19,10 @@ narrow protocol so neither is load-bearing.
 uv sync                                   # install/refresh the locked environment
 uv run pytest                             # unit tests (live + eval cases deselected)
 uv run pytest tests/test_x.py::test_y     # a single test
-uv run pytest -m live                     # tests that hit the real HF router / LangSmith / W&B
+uv run pytest -m live > live.log 2>&1     # real HF router / LangSmith / W&B. Redirect, do not
+                                          # pipe: the process can hang in weave teardown *after*
+                                          # pytest reports, and `| tail; echo $?` then yields
+                                          # tail's status and none of the summary (F11).
 uv run pytest -m eval                     # the eval suite
 uv run pytest --cov                       # coverage report
 uv run my-agent                           # live checks: one per finding in docs/findings.md
@@ -73,6 +76,28 @@ result. Concretely:
 - Postconditions assert the withheld capability is actually absent from the compiled graph (and
   that the graph bound *some* tools, so the absence cannot pass vacuously) — an allowlist is only
   a request until it is checked.
+- **The parent graph is not the whole allowlist.** `create_deep_agent` auto-adds a general-purpose
+  subagent behind the `task` tool and gives it its own `FilesystemMiddleware` with *no* `tools=`
+  allowlist. Ours reaches it only because deepagents merges middleware by `.name` into the
+  subagent's list too — behaviour we do not control, so `_require_shell_withheld` reads every
+  subagent graph back via `capabilities.subagent_graphs` and asserts there as well (F20).
+- **Nothing is inherited, including the safe option.** `least_privilege_filesystem` passes its
+  `backend` and three context bounds explicitly even though they equal deepagents' defaults, and a
+  load-time check pins them against the wheel (F21). "Inherited a library default" and "chose the
+  safest option" are different claims about the same object, and only one of them survives an
+  upstream change.
+
+**Prompt-injection threat model.** The reason there is no injection filter here is that there is
+nothing for an injected instruction to reach. The filesystem is a `StateBackend` — a dict in graph
+state, so no `.env`, no repo, no path out — there is no network-capable tool, and `execute` is
+withheld (and `StateBackend` is not a `SandboxBackendProtocol`, so it would error anyway). That is
+least privilege *being* the defence rather than a defence being added to it.
+
+Two tests are the tripwire: `test_least_privilege_middleware_runs_on_the_state_backend_by_default`
+and `test_the_state_backend_cannot_run_shell_commands_even_if_asked`. **The moment either goes red
+— a `FilesystemBackend`, a retriever, an HTTP tool, a sandbox — this paragraph stops being true and
+tool results become untrusted input that needs handling.** `run.run_turn` is where that handling
+would go, because it is the only place a turn passes through.
 
 When adding a capability, say in the commit message what needs it and what the blast radius is.
 
@@ -112,6 +137,12 @@ Planned seams (build them as they are needed, not before):
 | `ChatModelSource` | `build() -> BaseChatModel` | Agent construction must not know about HF, base URLs, or tokens. |
 | `TracingBackend` | `activate() -> None` | Tracing install is idempotent and global; callers only need "turn it on". |
 | `EvalRunner` | `run(target, dataset, scorers) -> EvalReport` | Eval consumers never emit spans; tracing consumers never score. Keeping these apart is the point. |
+
+Built:
+
+| Protocol | Method(s) | Why it is separate |
+|---|---|---|
+| `Invokable` (`run.py`) | `invoke(input, config, /) -> Any` | `run_turn` bounds a turn and must not need `create_deep_agent`, `ChatOpenAI`, or a compiled graph to do it. `tests/test_run.py` builds no model and compiles nothing. |
 
 `TracingBackend` and `EvalRunner` are deliberately **not** one `Observability` interface. LangSmith
 and Weave both activate ambiently (env var / `weave.init`) but score through unrelated APIs, and
@@ -183,6 +214,12 @@ Bugs live in the states the code was never written to handle. Write those down a
   the value came from. Model output is *always* an operating error: it is untrusted input.
 - Every loop, retry, and agent turn gets an explicit bound. An agent that loops forever is the
   worst failure mode here; `bounded()` exists for exactly this.
+- **A bound belongs to the thing it bounds, not to the call site.** `RECURSION_LIMIT` lived in
+  `main.py`, so every other caller of `build_agent` inherited langchain-core's default by accident
+  — and that default is *also* 25, which is what made it look like a decision. Both bounds now live
+  on `run.RunBounds` and `run_turn` always sends them. A postcondition must be relative for the
+  same reason: `len(messages) > 1` passes on any non-empty history while the agent contributes
+  nothing, so the check is `> len(sent)`.
 - Split compound checks: `require(a); require(b)` names the failure, `require(a and b)` does not.
 - mypy cannot narrow types through `require()`. Where a check also narrows (`x is not None`), use an
   explicit `if ... raise CheckFailed(...)` — same runtime behaviour, and mypy follows it.
@@ -197,6 +234,14 @@ Two different things; keep them apart.
   source module; a new module gets a new file rather than an extra section in an existing one.
   They test the harness: protocol conformance, wiring, bounds, error paths. For each `require()`,
   a test that trips it — that is what turns a contract into a tested contract.
+- **Assert the claim and its discriminator.** A test that pins library behaviour needs a sibling
+  showing the behaviour is really ours: `test_build_agent_withholds_the_shell_tool_from_every_subagent`
+  is worthless without `test_a_bare_deep_agent_does_grant_the_shell_tool_to_its_subagent`, because
+  the first keeps passing if deepagents stops granting `execute` for its own reasons.
+- **A pinned value that equals the library default cannot be tested by reading it back.** Deleting
+  the argument leaves the same value in place, so the test passes over the mutant. Record the
+  *call* instead (patch the constructor where it is used, delegate to the real one) — F21 is the
+  worked example, found only because a mutant survived.
 - "Offline" is enforced, not assumed: an autouse fixture in `tests/conftest.py` fails any test
   that opens a socket, and steps aside only for `live`. Shared setup (`valid_secret`,
   `deny_secrets`) lives there too — as fixtures, so no test can leak a mutation into the next.
@@ -218,7 +263,7 @@ Two different things; keep them apart.
 Recorded from `inspect` against the installed wheels on 2026-09-17. Re-verify after any `uv sync`
 that moves these versions.
 
-**`docs/findings.md` is the full record** — nineteen verified library and tooling behaviours (F1–F19), each with
+**`docs/findings.md` is the full record** — twenty-two verified library and tooling behaviours (F1–F22), each with
 how it was checked, what the code does about it, and what is still unverified. Read it before
 debugging anything that looks like a library bug, and add to it when you verify something new. The
 summary below covers only what is needed to write code day to day.
@@ -259,7 +304,11 @@ mode` (`mode` is `Literal["isolated", "fork"]`). `CompiledSubAgent` requires
 - `StoreBackend` needs a `store`.
 - `skills=[...]` needs a real backend (e.g. `FilesystemBackend`); it silently loads nothing otherwise.
 - Skills are **not** inherited by subagents — pass `skills` on each subagent spec.
-- A consistent `config={"configurable": {"thread_id": ...}}` is what makes turns share a conversation.
+- A consistent `config={"configurable": {"thread_id": ...}}` is what makes turns share a
+  conversation — *once a `checkpointer` exists*. There is none, so langgraph retains nothing
+  between `invoke` calls and a conversation continues by sending the prior messages back:
+  `run_turn(agent, prompt, history=...)`, which returns exactly what the next call wants.
+- The general-purpose subagent behind `task` gets its own middleware, not the parent's (F20).
 
 **Callbacks and tracing** (verified against langchain-core 1.6.3, langsmith 0.12.6, weave 0.53.9):
 
@@ -396,6 +445,9 @@ src/my_agent/
                       # compiled_tool_names. The allowlist and the proof it held.
   contracts.py        # check_config_contract, pydantic_param_names — the import-time
                       # check that makes as_kwargs() splatting safe.
+  run.py              # Invokable, RunBounds, RunDeadline, run_turn — one bounded turn.
+                      # Owns the step limit, the wall clock, and multi-turn history.
+                      # Imports no deepagents and builds no model.
   main.py             # `uv run my-agent` — composition root. Live checks against the
                       # router, one per finding.
   negative_space.py   # contract helpers: require/unreachable/bounded/check_shape/check_finite
@@ -403,12 +455,14 @@ src/my_agent/
                       # available_backends, langchain_tracer_names.
   mirror.py           # JsonlMirror, run_log_path, mirror_to_file — the local,
                       # always-on JSONL mirror of every agent event.
-tests/                # deterministic, offline by default — one file per source module. One
-                      # exception: test_tracing.py ends with a single -m live test that calls
-                      # the real weave.init() and hits the router.
+tests/                # deterministic, offline by default — one file per source module. Two
+                      # exceptions, each a single -m live test at the end of its file:
+                      # test_tracing.py calls the real weave.init() and hits the router;
+                      # test_run.py proves multi-turn history against a real graph, which
+                      # a fake cannot show (it echoes back whatever it was handed).
   conftest.py         # shared fixtures + the autouse guard that blocks sockets
   test_model.py  test_agent.py  test_capabilities.py  test_contracts.py  test_main.py
-  test_tracing.py  test_mirror.py
+  test_tracing.py  test_mirror.py  test_run.py
 evals/                # model-dependent, -m eval
 docs/
   findings.md         # F1-F19: verified library/tooling behaviour and what the code does

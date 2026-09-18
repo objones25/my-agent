@@ -27,17 +27,17 @@ from my_agent.capabilities import (
     DEFAULT_FILESYSTEM_TOOLS,
     SHELL_TOOL_NAME,
     compiled_tool_names,
+    require_granted,
+    require_withheld,
 )
 from my_agent.mirror import mirror_to_file, run_log_path
 from my_agent.model import ModelConfig, build_model
 from my_agent.negative_space import CheckFailed, require
+from my_agent.run import DeadlineExceeded, run_turn
 from my_agent.tracing import available_backends
 
 EXIT_MISCONFIGURED = 2
 EXIT_CHECK_FAILED = 1
-
-RECURSION_LIMIT = 25
-"""Bound every agent run. An agent that loops forever is the worst failure here."""
 
 TOKEN_CAP = 24
 """Small enough that an ignored cap is unmistakable against an uncapped reply."""
@@ -59,20 +59,6 @@ class CheckResult:
 
 def _tool_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
     return [m for m in messages if m.type == "tool"]
-
-
-def _run(
-    agent: object, prompt: str, callbacks: list[BaseCallbackHandler]
-) -> list[BaseMessage]:
-    """One bounded agent turn, mirrored."""
-    result = agent.invoke(  # type: ignore[attr-defined]
-        {"messages": [{"role": "user", "content": prompt}]},
-        config={"recursion_limit": RECURSION_LIMIT, "callbacks": callbacks},
-    )
-    require("messages" in result, f"agent returned no messages key: {sorted(result)}")
-    messages: list[BaseMessage] = result["messages"]
-    require(len(messages) > 1, "agent added no messages of its own")
-    return messages
 
 
 def _activate_tracing() -> tuple[str, ...]:
@@ -148,14 +134,14 @@ def check_shell_tool_withheld(
 ) -> CheckResult:
     """F4 — `execute` is off. Assert both that it is unbound and that no run can
     call it, which holds regardless of how the model phrases its refusal."""
+    # build_agent already asserts this over the parent graph *and* every subagent
+    # (F20), so it cannot be false here — restated because a live check that only
+    # exercises the model would not say whether the tool was ever bound.
     agent = build_agent(build_model(config))
-    bound = compiled_tool_names(agent)
-    require(bound != frozenset(), "no tools bound at all; the absence check would be vacuous")
-    if SHELL_TOOL_NAME in bound:
-        return CheckResult("F4", "shell tool withheld", False, f"bound: {sorted(bound)}")
+    require_withheld(SHELL_TOOL_NAME, compiled_tool_names(agent), "the compiled graph")
 
-    messages = _run(
-        agent, "Run the shell command `echo hello` and show me the output.", callbacks
+    messages = run_turn(
+        agent, "Run the shell command `echo hello` and show me the output.", callbacks=callbacks
     )
     called = {m.name for m in _tool_messages(messages) if m.name is not None}
     return CheckResult(
@@ -175,11 +161,11 @@ def check_filesystem_tools_still_work(
     agent = build_agent(build_model(config), AgentConfig(permissions=[DENY_SECRETS]))
     # Separates "the model did not try" from "the tool was never there" — without
     # this, a missing tool reports as a model failure.
-    require("write_file" in compiled_tool_names(agent), "write_file is not bound; check is vacuous")
-    messages = _run(
+    require_granted("write_file", compiled_tool_names(agent), "the compiled graph")
+    messages = run_turn(
         agent,
         f"Use write_file to write the text 'pong' to {ALLOWED_PATH}, then read it back.",
-        callbacks,
+        callbacks=callbacks,
     )
     tools = _tool_messages(messages)
     wrote = any(
@@ -200,12 +186,12 @@ def check_permissions_are_enforced(
     """F5 — the big one. Our FilesystemMiddleware replaces the default, so it has
     to forward `_permissions`; if it does not, every rule vanishes silently."""
     agent = build_agent(build_model(config), AgentConfig(permissions=[DENY_SECRETS]))
-    require("write_file" in compiled_tool_names(agent), "write_file is not bound; check is vacuous")
-    messages = _run(
+    require_granted("write_file", compiled_tool_names(agent), "the compiled graph")
+    messages = run_turn(
         agent,
         f"Use write_file to write the text 'hello' to {DENIED_PREFIX}/keys.txt. "
         f"Then tell me whether it succeeded.",
-        callbacks,
+        callbacks=callbacks,
     )
     tools = _tool_messages(messages)
     denied = any("permission denied" in str(m.content).lower() for m in tools)
@@ -234,7 +220,7 @@ CHECKS: tuple[Callable[[ModelConfig, list[BaseCallbackHandler]], CheckResult], .
 
 def _single_turn(config: ModelConfig, prompt: str, callbacks: list[BaseCallbackHandler]) -> int:
     agent = build_agent(build_model(config))
-    messages = _run(agent, prompt, callbacks)
+    messages = run_turn(agent, prompt, callbacks=callbacks)
     reply = messages[-1]
     require(reply.type != "human", f"last message is still our own turn: {reply.type}")
     print(f"reply:  {reply.text}")
@@ -287,11 +273,19 @@ def main() -> int:
 
     with mirror_to_file(log_path) as mirror:
         callbacks: list[BaseCallbackHandler] = [mirror]
-        if prompt:
-            print(f"prompt: {prompt}\n")
-            exit_code = _single_turn(config, prompt, callbacks)
-        else:
-            exit_code = _run_checks(config, callbacks)
+        # A run that outlived its wall clock is an operating error: the router
+        # or a provider was slow. Report it like a missing token rather than
+        # letting a traceback imply the code is broken. `_run_checks` already
+        # converts one into a failed check, so this covers the prompt path.
+        try:
+            if prompt:
+                print(f"prompt: {prompt}\n")
+                exit_code = _single_turn(config, prompt, callbacks)
+            else:
+                exit_code = _run_checks(config, callbacks)
+        except DeadlineExceeded as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            exit_code = EXIT_CHECK_FAILED
 
     # An empty mirror and a quiet run look identical on disk. This is what
     # separates "nothing happened" from "the callbacks were never attached".

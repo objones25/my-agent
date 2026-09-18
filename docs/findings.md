@@ -13,6 +13,9 @@ langchain-openai 1.6.2   langsmith 0.12.6   weave 0.53.9          openai 3.14.1
 Every finding below is pinned by a test or a load-time check, so upstream drift fails loudly rather
 than changing behaviour quietly. Verified 2026-09-17.
 
+F20–F22 were found by asking a narrower question than "does the allowlist hold?": *where else does
+something run, and what did we not choose?* Both answers were load-bearing.
+
 ---
 
 ## F1 — `ChatOpenAI` picks the Responses API from the model name, ignoring `base_url`
@@ -577,6 +580,134 @@ omissions were considered and rejected.
 
 ---
 
+## F20 — a withheld tool comes back through `task`; the parent graph is not the whole allowlist
+
+**Severity: critical.** `capabilities.py` withholds `execute` and `build_agent` asserted it was
+absent. The assertion read the parent graph only, and the parent graph is not the only thing that
+runs.
+
+`create_deep_agent` auto-adds a general-purpose subagent, reachable through the `task` tool, and
+builds it *its own* `FilesystemMiddleware` — with `backend`, `custom_tool_descriptions` and
+`_permissions` forwarded, but **no `tools=` allowlist**, which means `"all"`. Read off the compiled
+graphs:
+
+```
+create_deep_agent(model=m)   subagent → delete edit_file execute glob grep ls read_file write_file
+build_agent(m)               subagent → delete edit_file         glob grep ls read_file write_file
+```
+
+So ours is narrowed — but only because deepagents merges middleware by `.name` into the subagent's
+list as well as the parent's. That merge is behaviour we do not control and nothing depended on it
+deliberately. An upstream change to it would re-grant shell execution through `task` while every
+test stayed green, because no test and no postcondition ever looked at a subagent.
+
+*How it was checked:* `agent.get_subgraphs(recurse=True)` returns `[]` for a deep agent and
+`get_graph(xray=1)` shows only `model`, `tools` and one middleware node — the subagent graphs are
+not reachable through any public API. They live in the `task` tool's closure, under the freevar
+`subagent_graphs`.
+
+*What the code does:* `capabilities.subagent_graphs(agent)` reads that closure, and
+`_require_shell_withheld` now asserts absence across the parent graph **and** every subagent.
+Reaching into a closure is worse than reaching into `nodes["tools"]`, so it is priced the same way
+`compiled_tool_names` already was — every way the structure can move raises `CheckFailed` rather
+than returning an empty mapping that would make the check vacuous: no closure, neither `func` nor
+`coroutine`, a non-mapping value, and an empty mapping are four separate named failures. A `task`
+tool that is simply absent returns `{}`, because nothing can then be dispatched.
+
+The test suite states both halves. `test_build_agent_withholds_the_shell_tool_from_every_subagent`
+is the claim; `test_a_bare_deep_agent_does_grant_the_shell_tool_to_its_subagent` is what keeps it
+honest — without it the first test would keep passing if deepagents stopped granting `execute` to
+subagents for its own reasons, and the narrowing would have quietly become a no-op.
+
+**Mitigating, and not a reason to relax.** `StateBackend` does not implement
+`SandboxBackendProtocol`, and `create_deep_agent`'s own docstring says `execute` "will return an
+error message" for non-sandbox backends. A leak would therefore have been survivable rather than
+fatal *at today's backend* — which is exactly the argument least privilege exists to not depend on.
+
+*Also collapsed here:* the same assertion existed in three phrasings, with the message
+`"no tools bound at all; the absence check would be vacuous"` duplicated verbatim between
+`agent.py` and `main.py`. It is now one `require_withheld(withheld, granted, where)` naming *which*
+graph leaked, with `require_granted` as its positive twin (two more verbatim copies in `main.py`).
+`main.check_shell_tool_withheld` also carried a dead branch: `build_agent` raises when the tool is
+present, so the `CheckResult(..., False, f"bound: ...")` return was unreachable.
+
+*Still unverified:* whether a deny **permission rule** is enforced inside a subagent run. The rules
+do reach it (`_permissions` is forwarded to the subagent middleware, and ours carries them), and
+the parent path is live-verified by the F5 check, but no check has asked a subagent to write to
+`/secrets/**`.
+
+---
+
+## F21 — `least_privilege_filesystem` inherited five settings from a library default
+
+**Severity: important.** CLAUDE.md's least-privilege rule says a setting is "never something
+inherited from a library default." The middleware that exists to enforce that rule was inheriting
+five.
+
+`FilesystemMiddleware.__init__` defaults, read off the installed wheel:
+
+```
+backend                                  = None   -> StateBackend()
+tool_token_limit_before_evict            = 20000
+human_message_token_limit_before_evict   = 50000
+grep_max_count                           = 1000
+max_execute_timeout                      = 3600
+```
+
+`least_privilege_filesystem` passed only `tools` and `_permissions`, so the other five came from
+deepagents. Two of them *rewrite the conversation*: a tool result over 20,000 tokens, or a user
+turn over 50,000, is evicted to the filesystem and replaced with a pointer — a context-engineering
+decision this project never made, and one that appears in the JSONL mirror as a state write nobody
+asked for.
+
+**The backend is the more serious half, for a reason that is not about defaults.** `backend` was
+`None`, so the replacement middleware built a `StateBackend` of its own while `create_deep_agent`
+wires the *caller's* backend into `SkillsMiddleware` and the summarisation middleware. Since our
+middleware displaces its filesystem middleware by name, a caller who supplied a backend would have
+got one agent on two filesystems: skills and summarisation on theirs, every filesystem tool on a
+`StateBackend`. This is F5's failure — a setting that reaches `create_deep_agent` but not its
+replacement — wearing a different hat, and `agent.py`'s own module docstring advertised adding a
+`backend` field as the usual one-line change while that was false.
+
+*What the code does:* the three bounds worth owning are named constants
+(`TOOL_RESULT_TOKEN_LIMIT`, `HUMAN_MESSAGE_TOKEN_LIMIT`, `GREP_MATCH_LIMIT`), passed explicitly,
+asserted as postconditions on the built instance, and pinned at import against the wheel's current
+defaults — so a deepagents change to any of them fails the load with both numbers in the message
+instead of quietly resizing how much of a tool result the model sees. `max_execute_timeout` is
+deliberately *not* pinned: it bounds `execute`, and `execute` is withheld, so pinning it would
+assert something about a tool nobody has. `least_privilege_filesystem` gained a `backend`
+parameter, `_agent_kwargs` forwards `kwargs.get("backend")` into it, and a postcondition refuses a
+middleware whose backend differs from the one `create_deep_agent` will use. Adding the field really
+is one line now.
+
+**A decorative test, caught by mutation.** Every pinned value equals deepagents' current default,
+so reading one back off the built middleware cannot distinguish "we chose it" from "we inherited
+it": deleting all three arguments left the instance-reading test passing. The discriminating test
+records the *constructor call* instead, with the real `FilesystemMiddleware` still building the
+object. Both tests are kept, because they make different claims — one that the bound was sent, one
+that it landed, and `_permissions` was sent and silently dropped once already (F5).
+
+---
+
+## F22 — mypy and pyright disagree about subscripting a non-required `TypedDict` key
+
+**Severity: minor.** A second instance of the F16 pattern, in a different place.
+
+Every key of `langchain_core.runnables.RunnableConfig` is non-required (`total=False`). mypy
+accepts `config["recursion_limit"]`; pyright in `standard` mode reports
+`reportTypedDictNotRequiredAccess` — "access may result in runtime exception". pyright is right:
+the key genuinely may be absent. `.get(...)` satisfies both.
+
+Surfaced while typing `run.py`'s `Invokable` protocol, where the two checkers *agreed* about
+something more interesting: a protocol parameter is contravariant, so declaring
+`invoke(self, input: dict[str, Any], ...)` makes a real `CompiledStateGraph` **fail** to satisfy
+the protocol, because its own `input` is typed `InputT | Command | None`. Both checkers rejected
+it with the same diagnosis. `input` is therefore `Any` and `config` is typed exactly — which is
+what earns the check: `run_turn` builds a real `RunnableConfig`, so a misspelled bound is a type
+error rather than a silently ignored key at run time.
+
+---
+
 ## Live verification
 
 `uv run my-agent` runs one check per finding against the real router and prints PASS/FAIL. As of
@@ -590,9 +721,36 @@ omissions were considered and rejected.
 | F4 | remaining filesystem tools usable | `write_file`, `read_file` both succeeded |
 | F5 | permission rules survive replacement | `write_file` denied on `/secrets/**` |
 
+Re-run 2026-09-18 after the F20/F21 work and the move to `run.run_turn`: still 5/5, exit 0, both
+tracers active.
+
 The checks assert on tool messages and token counts rather than model prose, so they do not depend
 on how the model phrases things. The F5 check was itself verified by breaking the fix and watching
 it go red.
+
+**`uv run pytest -m live` can hang *after* reporting its result — do not pipe it to `tail`.**
+Observed 2026-09-18: the weave coexistence test printed `PASSED` (1.61s call, 2.04s total) and the
+process then hung in teardown while weave's async batch processor retried against a trace server
+answering `404` on `.../call/end`, until `timeout` killed it. This is F11's send-queue hazard, and
+it is *post-summary*, so everything after pytest's own output is background-thread noise.
+
+Piping the run through `tail -12` therefore discarded the summary line and kept only that noise —
+and `pytest ... | tail; echo $?` reports **`tail`'s** exit status, not pytest's, so the run looked
+like a clean exit with no result. Redirect to a file and read pytest's exit code directly:
+
+```bash
+uv run pytest -m live -q > live.log 2>&1; echo "exit: $?"   # not `| tail`
+```
+
+The tests themselves pass; only process exit is affected. Run a single live test by node id when
+one is all you need — it reports in ~2s and the hang costs nothing but the wait.
+
+Every finding added since is pinned offline instead, and each was verified by mutation — the
+change was reverted in place and the test watched go red. Nine mutants, all killed: a silent `{}`
+from `subagent_graphs`, a dropped subagent loop, a removed vacuity guard, `execute` back in the
+allowlist, an unsent step limit, an unattached deadline, a no-op deadline check, `raise_error =
+False`, and a fixed rather than relative message postcondition. A tenth survived and is written up
+in F21.
 
 ## Open / unverified
 

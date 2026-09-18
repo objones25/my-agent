@@ -11,9 +11,14 @@ field with a default: no factory signature change, no factory body change, no
 call site change. That coupling is checked at import rather than assumed, so a
 typo or an upstream rename fails when this module loads, by name.
 
-The one field `build_agent` does not pass straight through is `middleware` —
-see `capabilities.py` for why the shell tool has to be withheld by replacing
-deepagents' own filesystem middleware.
+Two fields `build_agent` does not simply pass through:
+
+- `middleware`, because the shell tool can only be withheld by replacing
+  deepagents' own filesystem middleware — see `capabilities.py`.
+- `backend`, because replacing that middleware means the backend has to be
+  handed to *both* `create_deep_agent` and the replacement. `_agent_kwargs`
+  already forwards it, so the field really is one line; it did not used to be,
+  and the two would have ended up on different filesystems (F21).
 """
 
 from __future__ import annotations
@@ -42,6 +47,8 @@ from my_agent.capabilities import (
     SHELL_TOOL_NAME,
     compiled_tool_names,
     least_privilege_filesystem,
+    require_withheld,
+    subagent_graphs,
 )
 from my_agent.contracts import check_config_contract
 from my_agent.negative_space import require
@@ -210,28 +217,56 @@ def _agent_kwargs(config: AgentConfig) -> dict[str, Any]:
     permissions = list(config.permissions) or None
     kwargs = config.as_kwargs()
     kwargs["permissions"] = permissions
-    kwargs["middleware"] = [least_privilege_filesystem(permissions), *config.middleware]
 
-    # Postcondition: the two places the rules have to land must agree. They are
-    # set three lines apart today, which is exactly how they drift later.
+    # `backend` is read the same way, and for the same reason: deepagents wires
+    # it into skills and summarisation while our middleware owns the filesystem
+    # tools, so a backend that reached only one of them would put one agent on
+    # two filesystems (F21). `.get` rather than `[...]` because `AgentConfig`
+    # has no such field today — this is what makes adding it the one-line change
+    # the class docstring promises.
+    kwargs["middleware"] = [
+        least_privilege_filesystem(permissions, kwargs.get("backend")),
+        *config.middleware,
+    ]
+
+    # Postconditions: every place a setting has to land must agree. They are set
+    # a few lines apart today, which is exactly how they drift later.
     require(
         kwargs["middleware"][0]._permissions == list(permissions or []),
         "assembled middleware does not carry the permissions passed to create_deep_agent",
+    )
+    declared_backend = kwargs.get("backend")
+    require(
+        declared_backend is None or kwargs["middleware"][0].backend is declared_backend,
+        "assembled middleware is on a different backend than create_deep_agent will use",
     )
     return kwargs
 
 
 def _require_shell_withheld(agent: CompiledStateGraph[Any, Any, Any, Any]) -> None:
-    """Assert the withheld capability is really absent from the compiled graph.
+    """Assert the withheld capability is absent from every graph that can run.
 
-    The allowlist is only a request until something reads back what was bound.
+    The allowlist is only a request until something reads back what was bound —
+    and the parent graph is not the only thing that runs. deepagents builds its
+    general-purpose subagent a `FilesystemMiddleware` of its own with *no* tool
+    allowlist, so a subagent is a second place `execute` can appear. Ours
+    reaches it only because deepagents merges middleware by `.name` into the
+    subagent's list too, which is behaviour we do not control (F20) — hence a
+    read-back rather than an assumption.
     """
-    bound = compiled_tool_names(agent)
-    require(bound != frozenset(), "no tools bound at all; the absence check would be vacuous")
+    require_withheld(SHELL_TOOL_NAME, compiled_tool_names(agent), "the compiled graph")
+
+    graphs = subagent_graphs(agent)
+    # deepagents adds a general-purpose subagent unless a caller supplies its
+    # own spec, and `AgentConfig` cannot express one. So an empty mapping here
+    # means the reader lost them, not that none exist.
     require(
-        SHELL_TOOL_NAME not in bound,
-        f"{SHELL_TOOL_NAME} leaked into the agent despite the allowlist: {sorted(bound)}",
+        graphs != {},
+        "no subagent graphs found, so the subagent capability check is vacuous; "
+        "deepagents binds a `task` tool by default and its subagents must be readable",
     )
+    for name, graph in graphs.items():
+        require_withheld(SHELL_TOOL_NAME, compiled_tool_names(graph), f"subagent {name!r}")
 
 
 def build_agent(

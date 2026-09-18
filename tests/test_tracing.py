@@ -24,6 +24,7 @@ from langsmith.utils import get_env_var
 import my_agent.tracing as tracing_module
 from my_agent.agent import build_agent
 from my_agent.model import ModelConfig, build_model
+from my_agent.run import run_turn
 from my_agent.tracing import (
     DEFAULT_WEAVE_PROJECT,
     LANGSMITH_API_KEY_ENV_VAR,
@@ -358,11 +359,11 @@ def test_langsmith_and_weave_trace_the_same_run(monkeypatch: pytest.MonkeyPatch)
     assert "WeaveTracer" in installed, f"Weave tracer missing: {sorted(installed)}"
 
     agent = build_agent(build_model(ModelConfig.from_env()))
-    result = agent.invoke(
-        {"messages": [{"role": "user", "content": "Reply with exactly the word: pong"}]},
-        config={"recursion_limit": 25},
-    )
-    assert result["messages"][-1].type == "ai"
+    # Through `run_turn`, not `agent.invoke`: this was the last place that
+    # restated the step bound by hand, which is the habit the seam exists to
+    # remove (see `run.py`).
+    messages = run_turn(agent, "Reply with exactly the word: pong")
+    assert messages[-1].type == "ai"
 
     still_installed = langchain_tracer_names()
     assert "LangChainTracer" in still_installed

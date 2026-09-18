@@ -13,6 +13,7 @@ in `addopts`, and stepped over here.
 from __future__ import annotations
 
 import socket
+from collections.abc import Callable
 from typing import Any, NoReturn
 
 import pytest
@@ -40,6 +41,25 @@ def deny_secrets() -> FilesystemPermission:
     """One targeted deny rule. Fresh per test, so no test can leak a mutation
     into the next one."""
     return FilesystemPermission(operations=["write"], paths=["/secrets/**"], mode="deny")
+
+
+@pytest.fixture
+def assert_does_not_raise() -> Callable[[Callable[[], object]], None]:
+    """State "this must not raise" as an assertion instead of as an absence.
+
+    A test whose whole body is a call to a contract helper asserts nothing: it
+    passes if the helper is deleted, and it reports a crash rather than a
+    failure when the helper rejects something it should accept. Wrapping the
+    call names the expectation and gives a readable failure either way.
+    """
+
+    def check(call: Callable[[], object]) -> None:
+        try:
+            call()
+        except Exception as exc:
+            pytest.fail(f"expected no exception, got {type(exc).__name__}: {exc}")
+
+    return check
 
 
 @pytest.fixture(autouse=True)
