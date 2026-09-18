@@ -41,7 +41,25 @@ markers = [
     "live: hits a real network endpoint (HF router, LangSmith, W&B). Deselected by default.",
     "eval: an eval-suite case, not a unit test. Deselected by default.",
 ]
-filterwarnings = ["error"]
+filterwarnings = [
+    "error",
+    # Scoped, not widened (CLAUDE.md: "fix it or scope an ignore, do not widen
+    # the setting"). weave.init()'s background HTTP client (used by its
+    # login/trace-upload sender thread) can leave an ssl.SSLSocket for the
+    # garbage collector to finalize. Python's GC turns that into a
+    # ResourceWarning delivered through sys.unraisablehook, and pytest's own
+    # unraisableexception plugin collects those and re-emits them as
+    # warnings.warn(pytest.PytestUnraisableExceptionWarning(...)) from
+    # _pytest.unraisableexception — sometimes during a test's own call phase,
+    # sometimes only at the pytest *session's* teardown
+    # (pytest_unconfigure), which is why no per-test
+    # @pytest.mark.filterwarnings mark can reliably reach it (see
+    # docs/findings.md F11). Not caused by this repo's code. Matched on
+    # category, message, and originating module together so this cannot mask
+    # an unrelated PytestUnraisableExceptionWarning or ResourceWarning raised
+    # anywhere else.
+    'ignore:Exception ignored in.*SSLSocket:pytest.PytestUnraisableExceptionWarning:_pytest\.unraisableexception',
+]
 
 [tool.ruff]
 line-length = 100

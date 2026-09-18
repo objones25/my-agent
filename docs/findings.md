@@ -208,28 +208,58 @@ SDK:*
    with the real assertions never having executed, and a subsequent run — with both warnings
    scoped out on the test — passed.
 
-Both (1) and (2), scoped to the test itself, are fixed with two narrowly-targeted
-`@pytest.mark.filterwarnings(...)` marks, one per warning — per CLAUDE.md's rule for a new
-deprecation warning from a fast-moving dependency ("fix it or scope an ignore, do not widen the
-setting"). Neither is caused by this repo's own code, and the project-wide gate is untouched.
+(1) is fixed with a narrowly-targeted `@pytest.mark.filterwarnings(...)` mark on the test itself —
+per CLAUDE.md's rule for a new deprecation warning from a fast-moving dependency ("fix it or scope
+an ignore, do not widen the setting"). It occurs synchronously, inside the test's own call stack,
+so a per-test mark can reach it.
 
-**Residual, unresolved risk, left open rather than papered over:** the same unclosed socket can
-instead survive until the pytest *session's* teardown (`pytest_unconfigure`, which runs after
-every test has already reported its result) — reproduced once running the full `uv run pytest -m
-live`: the single live test printed `1 passed, 128 deselected`, and the process then crashed with
-an uncaught `PytestUnraisableExceptionWarning` traceback during `gc_collect_harder` at
-`pytest_unconfigure`. No per-test `@pytest.mark.filterwarnings` can reach a warning raised at
-session teardown, so this is not fixable from `tests/test_tracing.py` alone. Explicitly closing
-the client (`WeaveClient.finish(use_progress_bar=False)`) in a `finally` block at the end of the
-test was tried as a fix and reverted: a follow-up live run with that change hung — `finish()`
-blocks until its send queue drains, and a queue stuck behind an earlier run's failed writes (see
-the `weave.trace_server_bindings` 404 "no start found in project" errors observed during this same
-investigation) never drains, turning an occasional teardown warning into a reliable hang, which is
-a strictly worse failure mode than the one it was meant to fix. Closing this fully would need
-either a project-wide `pyproject.toml` `filterwarnings` entry (e.g.
-`"ignore::pytest.PytestUnraisableExceptionWarning"`) or a session-scoped `conftest.py` hook — both
-outside this task's licensed file list (`tests/test_tracing.py`, `docs/findings.md`, `CLAUDE.md`),
-so left as a documented follow-up rather than done here.
+(2) turned out **not** to be fixable per-test, and the investigation into why is itself a finding.
+The warning that actually gets raised is not a plain `ResourceWarning` — the socket's
+`ResourceWarning` is only the informational `__cause__` on a `pytest.PytestUnraisableExceptionWarning`
+that pytest's own `_pytest.unraisableexception.collect_unraisable` constructs and delivers via
+`warnings.warn(pytest.PytestUnraisableExceptionWarning(msg))`. That call site collects unraisable
+exceptions accumulated via `sys.unraisablehook` and re-emits them **either** from inside
+`pytest_runtest_call` (during a specific test) **or** from `pytest_unconfigure` (at the *session's*
+teardown, after every test has already reported its result) — whichever GC pass happens to collect
+the leaked socket first. An earlier `@pytest.mark.filterwarnings("ignore:unclosed:ResourceWarning")`
+mark on the test matched the wrong category entirely (`ResourceWarning`, not
+`PytestUnraisableExceptionWarning`) and never actually caught anything; it appeared to fix a flaky
+run purely by GC-timing luck, which was only caught by later reproducing the crash with that mark
+still in place, running the full `uv run pytest -m live`: the single live test printed `1 passed,
+128 deselected`, and the *process* then crashed at `pytest_unconfigure`'s `gc_collect_harder`. No
+per-test mark can reach a warning raised at session teardown — that plugin hook runs outside any
+single test's marker scope.
+
+Explicitly closing the client (`WeaveClient.finish(use_progress_bar=False)`) in a `finally` block
+at the end of the test was tried as a pre-emptive fix and reverted: a follow-up live run with that
+change **hung** for >90s with no verdict at all. `finish()` blocks until its send queue drains, and
+a queue stuck behind an earlier run's failed writes (`weave.trace_server_bindings` 404s: `"Cannot
+end call ...: no start found in project ..."`, observed during this same investigation) apparently
+never drains — a silent hang is a strictly worse failure mode than the occasional loud crash it was
+meant to fix.
+
+**Resolved** with a project-wide, precisely-scoped `pyproject.toml` `filterwarnings` entry, added
+*alongside* `"error"` rather than replacing it:
+
+```toml
+'ignore:Exception ignored in.*SSLSocket:pytest.PytestUnraisableExceptionWarning:_pytest\.unraisableexception'
+```
+
+Scoped on all three axes `warnings.filterwarnings` supports — message (`"Exception ignored
+in.*SSLSocket"`, matching the exact text `_pytest.unraisableexception.unraisable_hook` builds for
+an unraisable-exception summary, restricted further to ones naming an `SSLSocket`), category
+(`pytest.PytestUnraisableExceptionWarning`, confirmed via `inspect` to be the class actually
+raised, not `ResourceWarning`), and originating module (`_pytest.unraisableexception`, confirmed to
+be that module's own `__name__`) — so it cannot mask an unrelated
+`PytestUnraisableExceptionWarning` (a different unraisable exception, from different code) or any
+plain `ResourceWarning` raised anywhere else, at collection or at session teardown alike. Verified
+two ways: `uv run pytest -m live` now completes and **exits 0** (`1 passed, 128 deselected in
+1.70s`, confirmed via explicit `echo $?`), and a mutation check — temporarily making `require()`
+emit a plain `DeprecationWarning` — still makes the *offline* suite fail loudly (`exit 2`, "5 errors
+during collection"), proving the entry narrows rather than widens the project's warnings policy.
+The now-redundant `@pytest.mark.filterwarnings("ignore:unclosed:ResourceWarning")` mark (the one
+that matched the wrong category) was removed from the test; the `gql`-warning mark for (1) was kept,
+since it covers a genuinely different warning that the project-wide entry does not touch.
 
 ## F12 — LangChain swallows exceptions raised inside a callback handler
 

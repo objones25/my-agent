@@ -351,15 +351,17 @@ Weave's background thread pool and silently ignore the `settings=` argument. Con
 **Running both at once is verified end to end (F11).** `available_backends()` activates every
 configured backend rather than selecting one; a live run confirmed `langchain_tracer_names()`
 reports both `LangChainTracer` and `WeaveTracer` before and after a real agent turn, and neither
-backend's global install displaced the other's. The live test that proves this
-(`tests/test_tracing.py::test_langsmith_and_weave_trace_the_same_run`) needed two narrowly-scoped
-`@pytest.mark.filterwarnings` marks for warnings that `weave.init()` raises from inside its own
-SDK (an old-style `gql` call, and an unclosed-socket `ResourceWarning`) — both orthogonal to
-coexistence and fatal only because of this project's `filterwarnings = ["error"]`; see F11.
-**Known gap:** that same socket can instead surface its `ResourceWarning` at pytest's own *session*
-teardown rather than during the test, which no per-test mark can reach and which has been observed
-to crash a full `uv run pytest -m live` invocation after the test itself already reported passing —
-see F11 for why the obvious fix (`WeaveClient.finish()`) was tried and reverted (it can hang).
+backend's global install displaced the other's. `uv run pytest -m live` completes and exits `0`.
+Getting there needed two fixes for warnings that `weave.init()` raises from inside its own SDK, not
+from anything this repo calls directly — an old-style `gql` call (scoped out with a per-test
+`@pytest.mark.filterwarnings` mark, since it fires synchronously inside the test) and an
+unclosed-socket resource leak that pytest can report either during a test or at the pytest
+*session's* teardown (`pytest_unconfigure`, unreachable by any per-test mark — scoped out with a
+`pyproject.toml` `filterwarnings` entry instead, added alongside `"error"`, matched on category +
+message + originating module so it cannot mask an unrelated warning). Both orthogonal to
+coexistence and fatal only because of this project's `filterwarnings = ["error"]`; see F11 for the
+full mechanism, including why the more obvious fix (`WeaveClient.finish()`) was tried and reverted
+(it can hang on a stuck send queue).
 
 ## Repo layout
 

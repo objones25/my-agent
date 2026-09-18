@@ -257,7 +257,6 @@ def test_langchain_tracer_names_reports_the_installed_tracers(
 @pytest.mark.filterwarnings(
     "ignore:Using variable_values and operation_name arguments.*:DeprecationWarning"
 )
-@pytest.mark.filterwarnings("ignore:unclosed:ResourceWarning")
 def test_langsmith_and_weave_trace_the_same_run(monkeypatch: pytest.MonkeyPatch) -> None:
     """The coexistence question CLAUDE.md left open, answered by measurement.
 
@@ -282,30 +281,23 @@ def test_langsmith_and_weave_trace_the_same_run(monkeypatch: pytest.MonkeyPatch)
     the full trace. Per CLAUDE.md's own rule for a new deprecation warning from
     a fast-moving dependency — "fix it or scope an ignore, do not widen the
     setting" — this scopes an ignore to the one warning, on the one test that
-    can reach it; the global `filterwarnings` gate is untouched.
+    can reach it; the global `filterwarnings` gate is untouched otherwise.
 
-    The second ignore covers a different, also-observed source of flakiness:
-    `weave.init()`'s async HTTP client (used for its login/trace-upload
-    background threads) leaves at least one `ssl.SSLSocket` for GC to close,
-    which pytest's unraisable-exception hook promotes to a
-    `PytestUnraisableExceptionWarning` — fatal, again, under this project's
-    `filterwarnings = ["error"]`, and independent of the coexistence
-    assertions below (repeated live runs showed this failing the test with the
-    real assertions never having run). A resource-cleanup quirk in weave's own
-    SDK, not something this repo's code can fix; scoped the same way as above.
-
-    Known residual risk, left unresolved rather than papered over (see F11):
-    the same socket can instead survive until the *session's* teardown
-    (`pytest_unconfigure`, after every test has already reported its result),
-    which no per-test `@pytest.mark.filterwarnings` can reach — that crash was
-    reproduced once running `uv run pytest -m live` end to end. Explicitly
-    closing the client (`WeaveClient.finish()`) in a `finally` block was tried
-    and reverted: `finish()` can block indefinitely flushing a queue that a
-    prior run's failed writes leave stuck, turning an occasional teardown
-    warning into a reliable hang — worse than the problem it was meant to
-    solve. Fixing this fully needs either a project-wide `pyproject.toml`
-    `filterwarnings` entry or a session-scoped `conftest.py` hook, both outside
-    this test file's remit.
+    A second, related warning — an unclosed `ssl.SSLSocket` left by weave's
+    async HTTP client — is deliberately *not* handled with a per-test mark
+    here. It surfaces as a `pytest.PytestUnraisableExceptionWarning`
+    (`category`, not `ResourceWarning` — an earlier `ignore:unclosed:
+    ResourceWarning` mark on this test matched the wrong category and never
+    actually caught it; its apparent effect was GC-timing luck, confirmed by
+    the crash still reproducing with it in place) raised from
+    `_pytest.unraisableexception`, sometimes during this test's own call phase
+    and sometimes only at the pytest *session's* teardown
+    (`pytest_unconfigure`, after every test has already reported its result).
+    A per-test mark cannot reach the latter, so this one is scoped at the
+    project level instead — see the `filterwarnings` entry in `pyproject.toml`
+    and F11 in `docs/findings.md` for the full story, including why
+    `WeaveClient.finish()` was tried as an alternative fix and reverted (it
+    can hang).
 
     The repo's own `.env` spells the flag `LANGSMITH_TRACING=True` (capital T),
     and langsmith compares that value to the literal string "true" — so under
