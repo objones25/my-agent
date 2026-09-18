@@ -1,7 +1,7 @@
 [project]
 name = "my-agent"
 version = "0.1.0"
-description = "Add your description here"
+description = "A contract- and eval-driven deep-agent harness on deepagents, with the domain deliberately undecided"
 readme = "README.md"
 authors = [
     { name = "objones25", email = "59661118+objones25@users.noreply.github.com" }

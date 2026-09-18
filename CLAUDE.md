@@ -163,7 +163,7 @@ model = ChatOpenAI(**config.as_kwargs(), use_responses_api=USE_RESPONSES_API)
 agent = create_deep_agent(model=model, **agent_config.as_kwargs())
 ```
 
-`create_deep_agent` has 17 keyword parameters. Threading them through `build_agent` one at a time
+`create_deep_agent` has 16 keyword parameters. Threading them through `build_agent` one at a time
 would mean editing its signature *and* its body every time the agent gains `subagents`, `skills`,
 `backend`, `permissions`, or `interrupt_on` — and defaults do not help, because the edit is still a
 modification of a function that was supposed to be closed. With a parameter object, adding a
@@ -291,7 +291,10 @@ Two different things; keep them apart.
 - **A passing suite is not a passing state if the tests cannot fail.** Before trusting new tests,
   break the code they cover and watch them go red. The last split was verified with five such
   mutants; a test that survives one is decorative.
-- Never run the suite under `python -O`: the assertions inside the tests vanish and everything passes.
+- Do not run the suite under `python -O`: it exits 1 rather than lying to you. pytest emits
+  `PytestConfigWarning` because `assert` statements in test bodies are not executed, and
+  `filterwarnings = ["error"]` makes that fatal. The reason the flag is dangerous elsewhere still
+  stands — `-O` deletes every `assert`, which is why `src/` uses `require()` instead.
 - `filterwarnings = ["error"]` is set. A new deprecation warning from these fast-moving libraries
   fails the build on purpose — fix it or scope an ignore, do not widen the setting.
 
