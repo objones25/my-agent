@@ -404,11 +404,18 @@ choosing — `name` identifies the backend rather than describing an instance. T
 docstring records the constraint so the next implementation does not reach for an instance
 attribute and fail pyright in the other direction.
 
+pyright is now a dev dependency and configured in `pyproject.toml`, so `uv run pyright` is part of
+the gate rather than something the editor notices later. It runs in `standard` mode, pinned
+explicitly because pyright's default has moved between releases. Not `strict`: that reports 46
+issues, and the two largest groups argue against this codebase's design rather than finding bugs in
+it — `reportUnnecessaryIsInstance` flags the defensive `require(isinstance(...))` checks that
+negative-space programming exists to add, and `reportPrivateUsage` flags the deliberate
+`_permissions` access in `agent.py`. The remainder are `reportUnknown*` from untyped
+langgraph/deepagents surfaces.
+
 *Still unverified:* whether other protocol members in this repo have the same divergence. Nothing
 else here declares a protocol variable, so there is nothing else to check yet — but any new
-protocol with a non-method member should be run past both checkers before it is relied on. pyright
-is not currently in the dev dependencies or any gate; `npx pyright src tests` is a one-line manual
-check.
+protocol with a non-method member should be run past both checkers before it is relied on.
 
 ---
 

@@ -26,6 +26,7 @@ build-backend = "hatchling.build"
 [dependency-groups]
 dev = [
     "mypy>=2.3.1",
+    "pyright>=1.1.414",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
     "pytest-cov>=7.1.0",
@@ -80,6 +81,22 @@ strict = true
 warn_unreachable = true
 disallow_any_explicit = false
 files = ["src", "tests"]
+
+# Second type checker, on purpose. mypy and pyright disagree about what satisfies a
+# protocol variable (docs/findings.md F16), and that divergence shipped once already:
+# CI was green while the editor showed errors on merged code. Running both is what
+# turns that into a build failure instead of a squiggle.
+[tool.pyright]
+include = ["src", "tests"]
+pythonVersion = "3.13"
+# Pinned, not inferred — pyright's default mode has moved between releases.
+# NOT "strict", and not for noise reasons: strict reports 46 issues, of which
+# reportUnnecessaryIsInstance flags the defensive `require(isinstance(...))` checks that
+# negative-space programming exists to add, and reportPrivateUsage flags the deliberate
+# `_permissions` access in agent.py. Strict here would argue against the architecture.
+# The rest are reportUnknown* from untyped langgraph/deepagents surfaces. Measured
+# 2026-09-17 with pyright 1.1.414; re-measure before changing this.
+typeCheckingMode = "standard"
 
 [tool.coverage.run]
 source = ["src"]

@@ -26,6 +26,7 @@ uv run my-agent                           # live checks: one per finding in docs
 uv run my-agent "your prompt here"        # one ordinary turn instead
 uv run ruff check . --fix                 # lint
 uv run mypy                               # type check (strict; src + tests)
+uv run pyright                            # second type checker (standard; see F16)
 uv run python -m doctest src/my_agent/negative_space.py   # contract helpers' doctests
 
 # Negative-space audit. First command is the CI gate, second is advisory.
@@ -226,6 +227,7 @@ summary below covers only what is needed to write code day to day.
 deepagents 0.7.15   langchain 1.4.1        langchain-core 1.6.3   langgraph 1.2.11
 langchain-openai 1.6.2   langsmith 0.12.6   weave 0.53.9          openai 3.14.1
 pytest 9.1.1        mypy 2.3.1             ruff 0.16.8            Python 3.13
+pyright 1.1.414
 ```
 
 **`langchain_openai.ChatOpenAI`, not `init_chat_model`.** `init_chat_model(model, *,
