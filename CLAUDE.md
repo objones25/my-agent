@@ -16,6 +16,8 @@ narrow protocol so neither is load-bearing.
 ## Commands
 
 ```bash
+./scripts/check.sh                        # every offline gate, in order. What CI and the
+                                          # pre-commit hook both run; the list lives only here.
 uv sync                                   # install/refresh the locked environment
 uv run pytest                             # unit tests (live + eval cases deselected)
 uv run pytest tests/test_x.py::test_y     # a single test
@@ -247,6 +249,15 @@ Bugs live in the states the code was never written to handle. Write those down a
 
 Two different things; keep them apart.
 
+- **The gate sequence lives in `scripts/check.sh` and nowhere else.** The pre-commit hook and
+  `.github/workflows/ci.yml` both call it and re-list nothing, because three copies of a command
+  list is three things to forget. The live and eval suites stay out: they need the network and
+  cost money.
+- **The pre-commit hook is configured but not installed.** `git rev-parse --git-common-dir` in a
+  worktree resolves to the main checkout's `.git`, and hooks live there — installing it now would
+  make every commit in the main checkout and every other worktree run `scripts/check.sh`, which
+  does not exist on branches that predate this one. Activating it is a deliberate one-time step
+  after this branch merges: `uv run pre-commit install`.
 - **Unit tests** (`tests/`, default selection) are deterministic and offline. One test file per
   source module; a new module gets a new file rather than an extra section in an existing one.
   They test the harness: protocol conformance, wiring, bounds, error paths. For each `require()`,

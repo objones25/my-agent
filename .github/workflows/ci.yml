@@ -1,0 +1,28 @@
+# Calls scripts/check.sh and nothing else, so CI cannot drift from what a
+# developer runs locally.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install
+
+      - name: Install the locked environment
+        run: uv sync --locked
+
+      - name: Offline gate
+        run: ./scripts/check.sh

@@ -1,0 +1,12 @@
+# One hook, calling the one script. Deliberately not a list of ruff/mypy hooks:
+# that would be a second copy of the gate sequence, free to drift from
+# scripts/check.sh and from CI.
+repos:
+  - repo: local
+    hooks:
+      - id: offline-gate
+        name: offline gate (scripts/check.sh)
+        entry: scripts/check.sh
+        language: system
+        pass_filenames: false
+        always_run: true
