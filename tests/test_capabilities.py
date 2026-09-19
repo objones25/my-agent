@@ -30,7 +30,7 @@ from deepagents.middleware.summarization import (
 from deepagents.profiles import _builtin_profiles
 from langchain_core.language_models import BaseChatModel
 from langchain_core.language_models.fake_chat_models import ParrotFakeChatModel
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langgraph.graph.state import CompiledStateGraph
 from pydantic import Field, SecretStr
@@ -500,6 +500,46 @@ def test_bounded_compaction_replaces_deepagents_own_rather_than_joining_it() -> 
 # compiled agent with a real oversized history and assert on what the model
 # was actually handed.
 # --------------------------------------------------------------------------
+
+
+class CallsOneTool(BaseChatModel):
+    """Issues one scripted tool call, then stops.
+
+    `StateBackend` refuses to read or write outside a graph run, so a
+    filesystem bound can only be exercised by a real dispatch. This is the
+    smallest model that produces one.
+    """
+
+    tool: str = "read_file"
+    args: dict[str, Any] = Field(default_factory=dict)
+    calls: int = 0
+
+    @property
+    def _llm_type(self) -> str:
+        return "calls-one-tool"
+
+    def bind_tools(self, tools: Any, **kwargs: Any) -> BaseChatModel:
+        return self
+
+    def _generate(self, messages: Any, stop: Any = None, run_manager: Any = None, **kw: Any) -> Any:
+        self.calls += 1
+        if self.calls == 1:
+            message = AIMessage("", tool_calls=[{"name": self.tool, "args": self.args, "id": "c1"}])
+        else:
+            message = AIMessage("done")
+        return ChatResult(generations=[ChatGeneration(message=message)])
+
+
+def _tool_messages(files: dict[str, Any], tool: str, args: dict[str, Any]) -> list[ToolMessage]:
+    """Run one tool call against a pre-populated `StateBackend`.
+
+    Files are passed on `invoke` because `StateBackend` cannot be written from
+    outside a graph execution -- its own error message says so.
+    """
+    agent = build_agent(CallsOneTool(tool=tool, args=args), AgentConfig())
+    input_state = cast(Any, {"messages": [("user", "go")], "files": files})
+    out = agent.invoke(input_state, {"recursion_limit": 25})
+    return [m for m in out["messages"] if isinstance(m, ToolMessage)]
 
 
 class RecordsWhatItWasAsked(BaseChatModel):
