@@ -61,3 +61,14 @@ def test_the_guard_blocks_an_unconnected_datagram_send() -> None:
         pytest.raises(RuntimeError, match="opened a socket"),
     ):
         sock.sendto(b"x", ("127.0.0.1", 9))
+
+
+def test_the_guard_blocks_sendmsg() -> None:
+    """`sendmsg` is the same connectionless exit as `sendto` under a different
+    name: it also carries its own destination address and needs no prior
+    `connect`, so a guard that only patches `sendto` misses it."""
+    with (
+        socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock,
+        pytest.raises(RuntimeError, match="opened a socket"),
+    ):
+        sock.sendmsg([b"x"], [], 0, ("127.0.0.1", 9))

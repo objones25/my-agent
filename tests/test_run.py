@@ -1340,11 +1340,20 @@ def test_the_token_limit_is_an_operating_error_not_a_broken_contract() -> None:
 def test_a_turn_whose_model_returned_nothing_at_all_still_produces_a_result() -> None:
     """An `AIMessage` with neither content nor tool calls is a real provider
     outcome. `run_turn` must return a `TurnResult` rather than trip a
-    postcondition — the turn happened, it just said nothing."""
+    postcondition — the turn happened, it just said nothing.
+
+    `result.failed_tool_calls == ()` and `result[-1].text == ""` only restate
+    what `FakeGraph` was constructed with. The actual claim under test is that
+    `run_turn`'s own postconditions — in particular the relative message check
+    (`len(messages) > len(sent)`) — do not raise on this shape; `len(result)
+    == 2` is what exercises that, since the one-message prompt plus the empty
+    `AIMessage` is the smallest input that satisfies it.
+    """
     agent = FakeGraph({"messages": [HumanMessage("say something"), AIMessage("")]})
 
     result = run_turn(agent, "say something")
 
+    assert len(result) == 2
     assert result.failed_tool_calls == ()
     assert result[-1].text == ""
 

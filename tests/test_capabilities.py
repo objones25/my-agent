@@ -600,6 +600,7 @@ def test_a_small_read_comes_back_whole() -> None:
     messages = _tool_messages({"/s.txt": {"content": small}}, "read_file", {"file_path": "/s.txt"})
 
     result = str(messages[0].content)
+    assert "line 49" in result  # the last line actually made it back, not just some
     assert "truncated due to size" not in result
 
 
@@ -622,6 +623,7 @@ def test_the_line_limit_cuts_a_long_file_before_the_character_bound_can() -> Non
 
     result = str(messages[0].content)
     assert result.count("\n") <= 100
+    assert "line 0" in result and "line 3999" not in result  # cut by line count, not content
     assert "truncated due to size" not in result
 
 
