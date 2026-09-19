@@ -907,6 +907,45 @@ def test_a_completed_turn_with_no_tools_at_all_reports_no_failures() -> None:
     assert run_turn(FakeGraph(), "ping").failed_tool_calls == ()
 
 
+def test_a_turn_cut_off_before_the_answer_began_is_not_answered() -> None:
+    """F36: `finish_reason == "length"` with no text and no tool calls means the
+    model never opened its final channel. Printing that as an empty reply and
+    exiting 0 reports a turn that did not happen."""
+    cut_off = AIMessage(
+        "",
+        response_metadata={"finish_reason": "length"},
+        usage_metadata={
+            "input_tokens": 84,
+            "output_tokens": 24,
+            "total_tokens": 108,
+            "output_token_details": {"reasoning": 21},
+        },
+    )
+    result = TurnResult(messages=[HumanMessage("count to 200"), cut_off])
+
+    assert result.answered is False
+
+
+def test_an_ordinary_turn_is_answered() -> None:
+    """The discriminator. Without it `answered` hardwired to `False` passes."""
+    result = TurnResult(messages=[HumanMessage("hi"), AIMessage("hello")])
+
+    assert result.answered is True
+
+
+def test_a_turn_cut_off_after_calling_a_tool_is_answered() -> None:
+    """A length-capped turn that still produced a tool call did real work. Only
+    the no-text-and-no-calls combination means nothing started."""
+    cut_off = AIMessage(
+        "",
+        tool_calls=[{"name": "ls", "args": {}, "id": "c1"}],
+        response_metadata={"finish_reason": "length"},
+    )
+    result = TurnResult(messages=[HumanMessage("list files"), cut_off])
+
+    assert result.answered is True
+
+
 class FanningOutModel(BaseChatModel):
     """A model that asks for `width` tools a turn until it is cut off.
 

@@ -427,6 +427,18 @@ def _single_turn(config: ModelConfig, prompt: str, callbacks: list[BaseCallbackH
             file=sys.stderr,
         )
         return EXIT_CHECK_FAILED
+
+    # F36: an empty reply is not always a short one. `finish_reason == "length"`
+    # with no text and no tool calls means the cap landed inside gpt-oss's
+    # reasoning channel and the final channel never opened — the answer did not
+    # start, so nothing above was truncated. A report, not an error: the turn
+    # still finished and spent no other bound, so the exit code stays 0.
+    if not result.answered:
+        print(
+            "note: the reply above is empty because the turn was cut off before its answer "
+            "began, not because the model had nothing to say; raise the token cap",
+            file=sys.stderr,
+        )
     return 0
 
 

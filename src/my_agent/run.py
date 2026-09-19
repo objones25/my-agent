@@ -335,6 +335,24 @@ class TurnResult:
         return tuple(m for m in self.messages if isinstance(m, ToolMessage) and m.status == "error")
 
     @property
+    def answered(self) -> bool:
+        """False when the model was cut off before its answer began.
+
+        F36: under harmony a response opens an analysis channel, reasons, then
+        opens a final channel. `finish_reason == "length"` with neither text nor
+        tool calls means the cap landed inside the reasoning and the final
+        channel was never opened — the answer did not start, so there is nothing
+        to have been truncated. A fact about the run, like `failed_tool_calls`,
+        not a judgement of the prose.
+        """
+        last = self.messages[-1] if self.messages else None
+        if not isinstance(last, AIMessage):
+            return True
+        if last.response_metadata.get("finish_reason") != "length":
+            return True
+        return bool(last.text) or bool(last.tool_calls)
+
+    @property
     def action_requests(self) -> tuple[Mapping[str, Any], ...]:
         """Every tool call awaiting approval, flattened across interrupts.
 
