@@ -782,6 +782,17 @@ def test_a_huge_human_message_that_is_not_last_is_never_evicted() -> None:
     demonstrate nothing useful if it moved with the constant, since this
     test's claim is about position, not size, and a literal keeps "huge"
     meaning something concrete rather than "whatever the constant is now".
+
+    **This test's claim is orthogonal to `HUMAN_MESSAGE_TOKEN_LIMIT`'s
+    value.** It forbids a behaviour -- evicting a non-last message -- that no
+    change to the constant can produce; deepagents' `_check_eviction_needed`
+    only ever inspects `messages[-1]`. Do not read a pass here as evidence
+    about the threshold: only a change to that `messages[-1]`-only eviction
+    logic in deepagents itself could turn this test red. (Measured: lowering
+    `HUMAN_MESSAGE_TOKEN_LIMIT` to 10 does not fail this test either --
+    trailing `"now answer"` is 10 characters against a 40-character threshold
+    at that limit, so nothing is evicted regardless of position, which proves
+    nothing about the claim this test exists to check.)
     """
     assert 4 * HUMAN_MESSAGE_TOKEN_LIMIT < 201_000  # oversized under today's limit, if it mattered
     huge = "z" * 201_000

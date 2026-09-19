@@ -1429,6 +1429,19 @@ exception handler or an `asyncio.all_tasks()` assertion at teardown, and it is u
 because nothing in `src/` is async. **It is the first thing to fix if async ever lands** — before
 the first async test, not after.
 
+**A mutant on a pinned bound fails collection, not the test it targets — and that hides whether the
+test itself discriminates.** `_PINNED_FS_BOUNDS` (`capabilities.py:235-264`) asserts
+`GREP_MATCH_LIMIT`, `TOOL_RESULT_TOKEN_LIMIT` and `HUMAN_MESSAGE_TOKEN_LIMIT` each equal
+`FilesystemMiddleware`'s own default at import, so `sed`-ing any one of them makes the whole file
+error out before a single test runs — a stronger failure than the assertion it was meant to trip,
+but a different one. To mutation-verify a test built on one of these bounds, the pin has to be
+relaxed in the same mutation: `sed -i '' 's/_FS_SIGNATURE\[_name\].default == _pinned/True/'
+src/my_agent/capabilities.py`, alongside the constant change — never committed, verification only.
+And because all three constants equal the library's own defaults, a behavioural test built on one of
+them proves the *mechanism* fires but cannot tell "we chose this value" from "deepagents' default
+did" — that claim is carried by the call-recording tests instead (F21), not by driving a real agent
+through the bound.
+
 **The `src/` doctests run outside the socket guard.** `--doctest-modules` is set and `src` is a
 `testpaths` entry alongside `tests`, but a `conftest.py` is directory-scoped, so those items get
 neither `_forbid_network` nor any other `tests/` fixture. Confirmed with `pytest --setup-show`: a
