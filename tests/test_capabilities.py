@@ -567,6 +567,54 @@ def test_grep_under_the_limit_returns_everything_and_says_nothing_about_truncati
     assert "maximum match count" not in result
 
 
+def test_an_oversized_read_is_truncated_with_a_marker() -> None:
+    """`TOOL_RESULT_TOKEN_LIMIT` in the only units it is enforced in: characters,
+    at `NUM_CHARS_PER_TOKEN` per token. Ten very long lines clear the line limit
+    and reach the character bound."""
+    fat = "".join("y" * 20_000 + "\n" for _ in range(10))
+    assert len(fat) > 4 * TOOL_RESULT_TOKEN_LIMIT  # the fixture must actually be over it
+
+    messages = _tool_messages(
+        {"/fat.txt": {"content": fat}}, "read_file", {"file_path": "/fat.txt"}
+    )
+
+    result = str(messages[0].content)
+    assert len(result) < len(fat)
+    assert "truncated due to size" in result
+
+
+def test_a_small_read_comes_back_whole() -> None:
+    """The discriminator: `read_file` does not mark everything truncated."""
+    small = "".join(f"line {i}\n" for i in range(50))
+
+    messages = _tool_messages({"/s.txt": {"content": small}}, "read_file", {"file_path": "/s.txt"})
+
+    result = str(messages[0].content)
+    assert "truncated due to size" not in result
+
+
+def test_the_line_limit_cuts_a_long_file_before_the_character_bound_can() -> None:
+    """**The reachable surface of `TOOL_RESULT_TOKEN_LIMIT` is narrower than it
+    looks.** `read_file` keeps 100 lines by default, so an ordinary long file is
+    already small by the time the character bound is consulted and the
+    truncation marker never appears. Measured: 4,000 lines and 134,890
+    characters came back as ~3,000 characters, unmarked.
+
+    Stated as a test so that a change to either limit has to confront the
+    interaction rather than discover it.
+    """
+    many = "".join(f"line {i} padding padding padding\n" for i in range(4000))
+    assert len(many) > 4 * TOOL_RESULT_TOKEN_LIMIT
+
+    messages = _tool_messages(
+        {"/many.txt": {"content": many}}, "read_file", {"file_path": "/many.txt"}
+    )
+
+    result = str(messages[0].content)
+    assert result.count("\n") <= 100
+    assert "truncated due to size" not in result
+
+
 class RecordsWhatItWasAsked(BaseChatModel):
     """A model that answers nothing and remembers everything it was sent.
 
