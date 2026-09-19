@@ -1348,6 +1348,50 @@ about the router. The live call is what settled it. Same lesson as F21 from the 
 *Still unverified:* whether the other ten providers volunteer usage on a streamed response. Only the
 one that answered on 2026-09-19 is covered, and it is not recorded which one that was.
 
+## F38 — a large message in the middle of a conversation escapes every context bound
+
+**Severity: important, and precisely scoped.** Three separate mechanisms each bound context in a
+different way, and all three share one blind spot: a large message that is not the last one and not
+old enough to compact.
+
+**Compaction (F31) only compacts what is older than `keep`.** `COMPACTION_KEEP_MESSAGES` is 6 — a
+floor, not a target — so a conversation of 6 or fewer messages has nothing eligible to compact at
+any token threshold, no matter how far over `COMPACTION_TRIGGER_TOKENS` it runs. Measured
+(`test_compaction_cannot_fire_while_every_message_fits_inside_what_it_keeps`): three messages worth
+~104,000 approximate tokens — comfortably over the 96,000 trigger — reached the model whole, all
+416,000 characters of the largest one included.
+
+**Human-message eviction only looks at the last message.** deepagents'
+`_check_eviction_needed` (`filesystem.py:3376`) reads `messages[-1]` and nothing else:
+`if messages and isinstance(messages[-1], HumanMessage): ...`. A `HumanMessage` of any size sitting
+one position earlier is never inspected, so `HUMAN_MESSAGE_TOKEN_LIMIT` never sees it. Measured
+(`test_a_huge_human_message_that_is_not_last_is_never_evicted`): a 201,000-character `HumanMessage`
+followed by one more turn comes back with no `lc_evicted_to` tag at all — the identical fixture size
+that *does* get evicted when it is last (the adjacent eviction test) is untouched purely because of
+position.
+
+**`TOOL_RESULT_TOKEN_LIMIT` truncates at 80,000 characters (`NUM_CHARS_PER_TOKEN * 20,000`), but
+`read_file`'s 100-line default (`DEFAULT_READ_LIMIT`) cuts most long files first.** Measured
+(`test_the_line_limit_cuts_a_long_file_before_the_character_bound_can`): a 4,000-line, 134,890-
+character file — over four times the character bound — came back as ~3,000 characters with no
+truncation marker, because line 100 arrived long before byte 80,000. The character bound is only
+reachable on files with few, very long lines (or content that does not arrive through `read_file`
+at all, such as a `ToolMessage` built directly, which is the shape the compaction test above uses).
+
+**Put together: a large `HumanMessage` or tool result sitting mid-conversation is bounded by none of
+the three.** Each mechanism does exactly what it documents — compaction protects recent context,
+eviction protects the next request, the character limit protects one read — and none of the three
+was written to cover the others' gap.
+
+*What we do:* nothing yet. The shape is now tested rather than argued, so a change to any of the
+three bounds has to confront it instead of discovering it later. Note what this is not: `RunTokenBudget`
+(F35) still bounds the **run** in tokens regardless of where in the conversation they sit, so this is
+a context-window risk — the model sees less than the full history, or sees more than the window can
+hold — not an unbounded-spend risk.
+
+*Still unverified:* whether a real conversation reaches this shape in practice. Producing one needs
+a domain, which is deliberately TBD (see "Scope discipline").
+
 ---
 
 ## Observability API reference
@@ -1588,3 +1632,7 @@ Each of these is also noted at the finding it belongs to.
 - Whether the router's other ten providers volunteer token usage on a streamed response (F37). The
   one that answered on 2026-09-19 does, which is the only reason streaming would not blind
   `RunTokenBudget`; it is not recorded which provider that was.
+- Whether a real conversation ever produces a large message that is neither last nor old enough to
+  compact (F38). Compaction, human-message eviction and the tool-result character bound have each
+  been measured individually; none of the three has been measured against a real conversation, so
+  the gap between them is proven in isolation, not in use.
