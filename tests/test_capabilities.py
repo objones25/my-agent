@@ -713,3 +713,65 @@ def test_compaction_cannot_fire_while_every_message_fits_inside_what_it_keeps() 
     assert len(sent_to_model) == len(history) + 1
     assert not any("has been summarized" in (m.text or "") for m in sent_to_model)
     assert max(len(m.text) for m in sent_to_model) > 400_000
+
+
+def test_an_oversized_trailing_human_message_is_evicted_to_the_backend() -> None:
+    """`HUMAN_MESSAGE_TOKEN_LIMIT` enforced, not merely configured.
+
+    Measured against the installed wheel (`filesystem.py`
+    `_apply_eviction_and_truncate` / `_build_truncated_human_message`): the
+    tagged `HumanMessage` kept in graph *state* carries the full original text
+    -- only `additional_kwargs["lc_evicted_to"]` changes. Truncation is
+    computed fresh from that full text and applied solely to the message list
+    handed to the model on each request, which is why the assertion on length
+    reads from `model.seen`, not from `out["messages"]`.
+    """
+    huge = "z" * (4 * HUMAN_MESSAGE_TOKEN_LIMIT + 1_000)
+    model = RecordsWhatItWasAsked()
+    agent = build_agent(model, AgentConfig())
+
+    out = agent.invoke({"messages": [HumanMessage(huge)]}, {"recursion_limit": 25})
+
+    evicted = [
+        m
+        for m in out["messages"]
+        if isinstance(m, HumanMessage) and m.additional_kwargs.get("lc_evicted_to")
+    ]
+    assert evicted != []
+
+    sent_to_model = model.seen[0]
+    truncated = [
+        m
+        for m in sent_to_model
+        if isinstance(m, HumanMessage) and m.additional_kwargs.get("lc_evicted_to")
+    ]
+    assert truncated != []
+    assert len(truncated[0].text) < len(huge)
+
+
+def test_a_huge_human_message_that_is_not_last_is_never_evicted() -> None:
+    """**The bound examines `messages[-1]` and nothing else.**
+
+    A message just as large, one position from the end, is untouched. Combined
+    with compaction -- which cannot reach anything inside `keep` -- a large
+    `HumanMessage` in the middle of a conversation escapes both context bounds.
+    Neither mechanism is wrong; each does what it documents. This is the test
+    that stops "the conversation is bounded" from being read as a claim either
+    of them makes about that shape.
+    """
+    huge = "z" * (4 * HUMAN_MESSAGE_TOKEN_LIMIT + 1_000)
+    model = RecordsWhatItWasAsked()
+    agent = build_agent(model, AgentConfig())
+
+    out = agent.invoke(
+        {"messages": [HumanMessage(huge), HumanMessage("now answer")]},
+        {"recursion_limit": 25},
+    )
+
+    evicted = [
+        m
+        for m in out["messages"]
+        if isinstance(m, HumanMessage) and m.additional_kwargs.get("lc_evicted_to")
+    ]
+    assert evicted == []
+    assert any(len(m.text) == len(huge) for m in out["messages"] if isinstance(m, HumanMessage))
