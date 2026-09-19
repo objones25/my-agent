@@ -34,6 +34,18 @@ def records(stream: io.StringIO) -> list[dict[str, Any]]:
     return [json.loads(line) for line in stream.getvalue().splitlines()]
 
 
+_VOLATILE_RECORD_FIELDS = frozenset({"ts", "run_id", "parent_run_id"})
+"""Fields whose values are a clock or a UUID, so any digit can appear in them.
+
+A test that searches a record for a literal has to exclude these or it is also
+searching a random number generator.
+"""
+
+
+def _without_volatile_fields(record: dict[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in record.items() if k not in _VOLATILE_RECORD_FIELDS}
+
+
 @pytest.fixture
 def stream() -> io.StringIO:
     return io.StringIO()
@@ -542,9 +554,15 @@ def test_tool_end_flags_an_artifact_without_copying_it(
         content="done", tool_call_id="c", artifact={"rows": list(range(1000))}
     )
     mirror.on_tool_end(message, run_id=RUN_ID)
-    output = records(stream)[0]["output"]
-    assert output["has_artifact"] is True
-    assert "999" not in stream.getvalue()
+    record = records(stream)[0]
+    assert record["output"]["has_artifact"] is True
+    # The artifact's own contents must appear nowhere in the record, so this
+    # searches the whole thing rather than just `output` — but not the fields
+    # whose values are clocks and UUIDs. Scanning the raw stream for "999" made
+    # this test fail roughly one run in a hundred: a microsecond field reading
+    # `.999123`, or a `run_id` whose hex happened to contain `999`, is not the
+    # artifact leaking. Both are real, both were measured.
+    assert "999" not in json.dumps(_without_volatile_fields(record))
 
 
 # --------------------------------------------------------------------------
