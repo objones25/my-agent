@@ -266,3 +266,35 @@ def test_a_single_turn_whose_tools_all_ran_says_nothing_about_failures(
 
     assert exit_code == 0
     assert capsys.readouterr().err == ""
+
+
+# --------------------------------------------------------------------------
+# What the CLI says about a turn cut off before its answer began (F36)
+# --------------------------------------------------------------------------
+
+
+def _turn_cut_off_before_the_answer_began() -> TurnResult:
+    """The exact shape F36 records: `finish_reason == "length"` with no text
+    and no tool calls, meaning the cap landed inside the reasoning channel and
+    the final channel never opened."""
+    return TurnResult(
+        messages=[
+            HumanMessage("count to 200"),
+            AIMessage("", response_metadata={"finish_reason": "length"}),
+        ]
+    )
+
+
+def test_a_single_turn_notes_when_the_reply_was_cut_off_before_it_began(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The gap this closes: an empty reply printed with exit code 0 reads as
+    "the model had nothing to say" when it actually means "the token cap never
+    let the model start". Still exit 0 — no other bound was spent."""
+    config = _stub_turn(monkeypatch, _turn_cut_off_before_the_answer_began())
+
+    exit_code = main_module._single_turn(config, "count to 200", [])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "cut off before its answer began" in captured.err

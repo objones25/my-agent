@@ -946,6 +946,30 @@ def test_a_turn_cut_off_after_calling_a_tool_is_answered() -> None:
     assert result.answered is True
 
 
+def test_a_turn_with_no_messages_at_all_is_answered() -> None:
+    """Pins the empty-list edge: `answered` must not index `messages[-1]`
+    unguarded. There is no cut-off answer to report when there is no turn."""
+    result = TurnResult(messages=[])
+
+    assert result.answered is True
+
+
+def test_a_turn_that_ended_on_a_tool_result_is_answered() -> None:
+    """Pins the trailing-non-`AIMessage` edge: a turn that ended on a
+    `ToolMessage` (mid-conversation, not yet the model's turn to reply) is not
+    the same shape as a model cut off before its answer began, so it reads as
+    answered rather than as the F36 case."""
+    result = TurnResult(
+        messages=[
+            HumanMessage("hi"),
+            AIMessage("x"),
+            ToolMessage("ok", tool_call_id="1", name="ls"),
+        ]
+    )
+
+    assert result.answered is True
+
+
 class FanningOutModel(BaseChatModel):
     """A model that asks for `width` tools a turn until it is cut off.
 
@@ -1328,7 +1352,7 @@ def test_a_turn_whose_model_returned_nothing_at_all_still_produces_a_result() ->
 def test_duplicate_tool_call_ids_let_one_result_answer_two_calls() -> None:
     """**A limitation, asserted so it is known rather than discovered.**
 
-    `_unanswered_tool_calls` (`src/my_agent/run.py:574`) collects requested ids
+    `_unanswered_tool_calls` (`src/my_agent/run.py:592`) collects requested ids
     into a list and answered ids into a *set*, then filters by membership. Two
     calls sharing an id are therefore both satisfied by a single `ToolMessage`,
     so a genuinely unanswered second call passes the check.
