@@ -1280,6 +1280,74 @@ a fingerprint is not a provider name (F25 is the reason to pin `:provider`). Als
 `reasoning: 0` is a model decision or a provider one; it happened once, on the turn that read a
 `ToolMessage` back and restated it.
 
+## F37 — streaming never asks for token usage; this router volunteers it anyway
+
+**Severity: low as measured, and the reasoning is the point.** A predicted defeat of `RunTokenBudget`
+that does not reproduce live. Recorded because the mechanism is real, the bound survives on
+behaviour nobody requested, and the prediction was wrong in an instructive direction.
+
+**The mechanism, read off the installed wheels.** Three steps, each verified:
+
+1. `stream_mode="messages"` attaches langgraph's `StreamMessagesHandler`, which is a
+   `langchain_core.tracers._streaming._StreamingCallbackHandler`. `BaseChatModel._should_stream`
+   returns `True` whenever one is attached, so a node that calls `model.invoke()` is switched onto
+   `_stream` by the *presence of the handler*. This is a property of streaming, not of async: sync
+   `graph.stream(stream_mode="messages")` does it too, and `stream_mode="values"` does not.
+2. `langchain_openai` asks the provider for usage only when told to
+   (`chat_models/base.py:1786` and `:2077`): `if stream_usage: kwargs["stream_options"] =
+   {"include_usage": stream_usage}`.
+3. The default is off **for us specifically** (`chat_models/base.py:1358-1375`): `stream_usage`
+   auto-enables only when `self.openai_api_base is None and "OPENAI_BASE_URL" not in os.environ`.
+   `ModelConfig.base_url` always carries `HF_ROUTER_BASE_URL` and `build_model` asserts it, so
+   `stream_usage` stays `None` and `_should_stream_usage` falls through to `self.stream_usage or
+   False`.
+
+**The prediction:** streamed chunks carry no `usage_metadata`, `RunTokenBudget` counts nothing, and
+F35's bound stops bounding while `unmeasured_calls` climbs. Reproduced against a **fake** model:
+`tokens=0, unmeasured_calls=1`.
+
+**Live result (2026-09-19, `openai/gpt-oss-120b`, unpinned routing) — the prediction is false
+here.** A real `build_agent` graph, the real `RunTokenBudget`, one prompt per mode:
+
+```
+stream_mode=values                 chunks=  2  tokens=2116  unmeasured=0
+stream_mode=updates                chunks=  4  tokens=2116  unmeasured=0
+stream_mode=messages               chunks= 18  tokens=2116  unmeasured=0
+stream_mode=['values','messages']  chunks=  8  tokens=2116  unmeasured=0
+invoke (baseline)                              tokens=2116  unmeasured=0
+```
+
+Identical to the non-streamed baseline in every mode. Separately, at the `ChatOpenAI` layer:
+`stream_usage` unset and `stream_usage=True` produced the *same* 8 chunks with exactly one carrying
+usage (`total_tokens=114`, matching `invoke`). **The router emits a final usage chunk whether or not
+`include_usage` is requested**, so the flag changes nothing on this path.
+
+**Why record a non-bug.** The bound holds because of a provider behaviour this project does not
+request, does not control and did not know about. F25 already establishes that the router's eleven
+providers disagree about basics; one that omits the final usage chunk blinds the bound, and unpinned
+routing means which provider answers is not a decision anyone made. What makes that survivable is
+`unmeasured_calls` (F35) — written so a blind bound would not be silent — and it is read by nothing
+outside a unit test today.
+
+*What we do:* nothing. No streaming is built, and on the YAGNI grounds in CLAUDE.md none should be
+until something consumes it. If it ever is: set `stream_usage=True` explicitly — it costs nothing,
+it is a decision rather than a gift, and this measurement is only about the provider that happened
+to answer — and assert `unmeasured_calls == 0` across a streamed turn. That assertion is the
+deliverable, more than the feature.
+
+**Two adjacent traps, both measured, if streaming ever lands.** `stream_mode="messages"` alone
+carries no `__interrupt__` at all, and v3's `GraphRunStream.output` omits it even when
+`.interrupted` is `True` — either one recreates F29 exactly. And v3 streaming emits
+`LangChainBetaWarning` from `langgraph/pregel/main.py`, which `filterwarnings = ["error"]` turns
+into a failed build.
+
+**A caveat about how this was nearly got wrong.** The fake-model reproduction was real and the
+mechanism it exercised was real, but a fake that omits chunk usage is evidence about the fake, not
+about the router. The live call is what settled it. Same lesson as F21 from the other direction.
+
+*Still unverified:* whether the other ten providers volunteer usage on a streamed response. Only the
+one that answered on 2026-09-19 is covered, and it is not recorded which one that was.
+
 ---
 
 ## Observability API reference
@@ -1456,7 +1524,11 @@ The tests themselves pass; only process exit is affected. Run a single live test
 is all you need — it reports in ~2s and the wait costs nothing but the wait.
 
 Every finding added since F11 is pinned offline instead, and each was verified by mutation — the
-change reverted in place and the test watched go red. Fourteen mutants, all killed: a silent `{}`
+change reverted in place and the test watched go red. **The ledger below stops at F24/F29 and has
+not been extended for F30–F36** (call limits, request size, `RunTokenBudget`, the compaction bound,
+`failed_tool_calls`); those findings' tests exist and several record pre-fix measurements in their
+own docstrings, but they have not been through the revert-and-watch-it-go-red step recorded here.
+Fourteen mutants, all killed: a silent `{}`
 from `subagent_graphs`, a dropped subagent loop, a removed vacuity guard, `execute` back in the
 allowlist, an unsent step limit, an unattached deadline, a no-op deadline check, `raise_error =
 False`, a fixed rather than relative message postcondition, and — added with F24 and F29 — a dropped
@@ -1482,3 +1554,6 @@ Each of these is also noted at the finding it belongs to.
 - Whether every provider frames a harmony response identically, and whether a `reasoning: 0`
   response is a model decision or a provider one (F36). Two fingerprints in one run agreed on the
   frame; the routed provider is not recorded, so that is agreement between unknowns.
+- Whether the router's other ten providers volunteer token usage on a streamed response (F37). The
+  one that answered on 2026-09-19 does, which is the only reason streaming would not blind
+  `RunTokenBudget`; it is not recorded which provider that was.

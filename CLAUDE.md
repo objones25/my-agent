@@ -1,7 +1,7 @@
 # CLAUDE.md
 
 Guidance for Claude Code in this repository. `README.md` says what the project is; this is the
-contributor's contract, and **`docs/findings.md` (F1–F36) is the evidence behind it** — read it
+contributor's contract, and **`docs/findings.md` (F1–F37) is the evidence behind it** — read it
 before debugging anything that looks like a library bug, and add to it when you verify something
 new.
 
@@ -255,7 +255,12 @@ Keep them apart. 352 offline tests and 2 live as of 2026-09-18.
 - **Unit tests** (`tests/`, default selection) are deterministic and offline. One test file per
   source module; a new module gets a new file, not an extra section in an existing one. They test
   the harness: protocol conformance, wiring, bounds, error paths. For each `require()`, a test that
-  trips it — that is what turns a contract into a tested contract.
+  trips it — that is what turns a contract into a tested contract. **This is the goal, not the
+  current state: ~105 `require()` sites, and `run.py` alone has seven with no test that trips them**
+  (the `__interrupt__` shape check, both `bounds must be RunBounds` sites, the non-mapping result,
+  and `resume_turn`'s preconditions). Line coverage hides it — `require()` is a function, so the
+  raise lives in `negative_space.py` and the call site reads as covered whether or not the predicate
+  ever went false.
 - **Evals** (`evals/`, `-m eval`) measure model-dependent behaviour and are allowed to be
   non-deterministic and slow. A failing eval is a signal, not a broken build. Empty today.
 - `-m live` marks anything touching the HF router, LangSmith or W&B. `addopts` carries `-m "not live
@@ -398,7 +403,7 @@ Everything in this table lives in `src/my_agent/`.
 `tests/` mirrors that one file per module, offline by default, plus `conftest.py` for shared
 fixtures and the socket guard. The only `-m live` tests are one each at the end of `test_tracing.py`
 (calls the real `weave.init()` and hits the router) and `test_run.py` (proves multi-turn history
-against a real graph, which a fake cannot show). `evals/` is empty. `docs/findings.md` holds F1–F36
+against a real graph, which a fake cannot show). `evals/` is empty. `docs/findings.md` holds F1–F37
 plus the repo-gates, deepagents-surface, test-infrastructure and observability appendices;
 `scripts/audit_negative_space.py` is **vendored** from the negative-space-programming skill — do not
 hand-edit it, refresh by re-copying (it is excluded from ruff and mypy).
