@@ -1294,7 +1294,7 @@ behaviour nobody requested, and the prediction was wrong in an instructive direc
    `_stream` by the *presence of the handler*. This is a property of streaming, not of async: sync
    `graph.stream(stream_mode="messages")` does it too, and `stream_mode="values"` does not.
 2. `langchain_openai` asks the provider for usage only when told to
-   (`chat_models/base.py:1786` and `:2077`): `if stream_usage: kwargs["stream_options"] =
+   (`chat_models/base.py:1787-1788` and `:2078-2079`): `if stream_usage: kwargs["stream_options"] =
    {"include_usage": stream_usage}`.
 3. The default is off **for us specifically** (`chat_models/base.py:1358-1375`): `stream_usage`
    auto-enables only when `self.openai_api_base is None and "OPENAI_BASE_URL" not in os.environ`.
@@ -1373,14 +1373,14 @@ position.
 **`TOOL_RESULT_TOKEN_LIMIT` truncates at 80,000 characters (`NUM_CHARS_PER_TOKEN * 20,000`), but
 `read_file`'s 100-line default (`DEFAULT_READ_LIMIT`) cuts most long files first.** Measured
 (`test_the_line_limit_cuts_a_long_file_before_the_character_bound_can`): a 4,000-line, 134,890-
-character file — over four times the character bound — came back as ~3,000 characters with no
+character file — over 1.6 times the character bound — came back as ~3,000 characters with no
 truncation marker, because line 100 arrived long before byte 80,000. The character bound is only
 reachable on files with few, very long lines.
 
-**Put together: a large `HumanMessage` or tool result sitting mid-conversation is bounded by none of
-the three.** Each mechanism does exactly what it documents — compaction protects recent context,
-eviction protects the next request, the character limit protects one read — and none of the three
-was written to cover the others' gap.
+**Put together: a large `HumanMessage` sitting mid-conversation is bounded by none of the three.**
+Each mechanism does exactly what it documents — compaction protects recent context, eviction
+protects the next request, the character limit protects one read — and none of the three was
+written to cover the others' gap.
 
 *What we do:* nothing yet. The shape is now tested rather than argued, so a change to any of the
 three bounds has to confront it instead of discovering it later. Note what this is not: `RunTokenBudget`
@@ -1389,7 +1389,9 @@ a context-window risk — the model sees less than the full history, or sees mor
 hold — not an unbounded-spend risk.
 
 *Still unverified:* whether a real conversation reaches this shape in practice. Producing one needs
-a domain, which is deliberately TBD (see "Scope discipline").
+a domain, which is deliberately TBD (see "Scope discipline"). Also unverified: whether a
+`ToolMessage` that reaches state by a path other than `read_file` (and so skips both the line limit
+and the character truncation) would land in the same unbounded gap — nothing here measures that.
 
 ---
 
@@ -1598,10 +1600,14 @@ The tests themselves pass; only process exit is affected. Run a single live test
 is all you need — it reports in ~2s and the wait costs nothing but the wait.
 
 Every finding added since F11 is pinned offline instead, and each was verified by mutation — the
-change reverted in place and the test watched go red. **The ledger below stops at F24/F29 and has
-not been extended for F30–F36** (call limits, request size, `RunTokenBudget`, the compaction bound,
-`failed_tool_calls`); those findings' tests exist and several record pre-fix measurements in their
-own docstrings, but they have not been through the revert-and-watch-it-go-red step recorded here.
+change reverted in place and the test watched go red. **The ledger immediately below stops at
+F24/F29; `feat/behavioural-tests` (below that) extends it to `GREP_MATCH_LIMIT`,
+`TOOL_RESULT_TOKEN_LIMIT`, `HUMAN_MESSAGE_TOKEN_LIMIT`, the compaction bound (F31/F38) and
+`TurnResult.answered` (F36). Still not through this step**: the rest of F30 (call limits, request
+size), `RunTokenBudget` (F35) and `failed_tool_calls` outside what F24/F29 already cover; those
+findings' tests exist and several record pre-fix measurements in their own docstrings, but nobody
+has reverted the fix and watched them go red.
+
 Fourteen mutants, all killed: a silent `{}`
 from `subagent_graphs`, a dropped subagent loop, a removed vacuity guard, `execute` back in the
 allowlist, an unsent step limit, an unattached deadline, a no-op deadline check, `raise_error =
@@ -1609,6 +1615,14 @@ False`, a fixed rather than relative message postcondition, and — added with F
 subagent step-limit rebind, an untranslated `GraphRecursionError`, an unchecked unanswered tool
 call, a `paused` property hardwired to `False`, and a dropped checkpointer dead-end check. One
 survived and is written up in F21.
+
+**`feat/behavioural-tests` added roughly eight more, recorded only in the branch's own commit
+messages** (not restated as source comments, so cited here instead): `GREP_MATCH_LIMIT` raised and
+lowered, both caught by the import-time pinned-bound `require()` before either target test could run
+(`4aa81fb`); `TOOL_RESULT_TOKEN_LIMIT` raised and lowered, same mechanism (`dba5410`);
+`HUMAN_MESSAGE_TOKEN_LIMIT` raised, same mechanism (`77f5a90`); the compaction discriminator's own
+fixture, undersized enough to pass under every trigger tried until this branch resized it
+(`d3ae394`); and `TurnResult.answered` hardwired to `True` (`eab87ca`) and to `False` (`3fe212a`).
 
 ## Open / unverified
 
