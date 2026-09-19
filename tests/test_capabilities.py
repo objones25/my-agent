@@ -28,10 +28,14 @@ from deepagents.middleware.summarization import (
     create_summarization_middleware,
 )
 from deepagents.profiles import _builtin_profiles
+from langchain_core.language_models import BaseChatModel
 from langchain_core.language_models.fake_chat_models import ParrotFakeChatModel
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
 from langgraph.graph.state import CompiledStateGraph
-from pydantic import SecretStr
+from pydantic import Field, SecretStr
 
+from my_agent.agent import AgentConfig, build_agent
 from my_agent.capabilities import (
     COMPACTION_ARG_TRUNCATION_MESSAGES,
     COMPACTION_KEEP_MESSAGES,
@@ -485,3 +489,327 @@ def test_bounded_compaction_replaces_deepagents_own_rather_than_joining_it() -> 
     theirs = create_summarization_middleware(ParrotFakeChatModel(), StateBackend())
 
     assert ours.name == theirs.name
+
+
+# --------------------------------------------------------------------------
+# Compaction: that it fires, not merely that it was configured to
+#
+# Every test above reads a threshold back off a constructor. That proves the
+# number was passed and nothing about whether the mechanism runs -- which is
+# exactly how F31 survived the project's whole life. These drive a real
+# compiled agent with a real oversized history and assert on what the model
+# was actually handed.
+# --------------------------------------------------------------------------
+
+
+class CallsOneTool(BaseChatModel):
+    """Issues one scripted tool call, then stops.
+
+    `StateBackend` refuses to read or write outside a graph run, so a
+    filesystem bound can only be exercised by a real dispatch. This is the
+    smallest model that produces one.
+    """
+
+    tool: str = "read_file"
+    args: dict[str, Any] = Field(default_factory=dict)
+    calls: int = 0
+
+    @property
+    def _llm_type(self) -> str:
+        return "calls-one-tool"
+
+    def bind_tools(self, tools: Any, **kwargs: Any) -> BaseChatModel:
+        return self
+
+    def _generate(self, messages: Any, stop: Any = None, run_manager: Any = None, **kw: Any) -> Any:
+        self.calls += 1
+        if self.calls == 1:
+            message = AIMessage("", tool_calls=[{"name": self.tool, "args": self.args, "id": "c1"}])
+        else:
+            message = AIMessage("done")
+        return ChatResult(generations=[ChatGeneration(message=message)])
+
+
+def _tool_messages(files: dict[str, Any], tool: str, args: dict[str, Any]) -> list[ToolMessage]:
+    """Run one tool call against a pre-populated `StateBackend`.
+
+    Files are passed on `invoke` because `StateBackend` cannot be written from
+    outside a graph execution -- its own error message says so.
+    """
+    agent = build_agent(CallsOneTool(tool=tool, args=args), AgentConfig())
+    input_state = cast(Any, {"messages": [("user", "go")], "files": files})
+    out = agent.invoke(input_state, {"recursion_limit": 25})
+    return [m for m in out["messages"] if isinstance(m, ToolMessage)]
+
+
+def test_grep_stops_at_the_match_limit() -> None:
+    """`GREP_MATCH_LIMIT` is a bound on a capability we granted. Read back off
+    the middleware it is only a number that was passed; here it is the number
+    of matches that actually came back.
+
+    Fixture size and expected count are literals (1,200 and 1,000), not
+    derived from `GREP_MATCH_LIMIT`. A fixture sized as `GREP_MATCH_LIMIT +
+    200` and an expectation of `GREP_MATCH_LIMIT` both move in lockstep with
+    the constant under test, so a mutant that changes it moves the test's own
+    goalposts and the test cannot fail. The guard below still ties the
+    literals to the constant, so a deliberate change to the bound is caught
+    here rather than discovered later.
+    """
+    assert GREP_MATCH_LIMIT < 1200  # the fixture must actually exceed today's limit
+    files = {f"/f{i}.txt": {"content": "needle\n"} for i in range(1200)}
+
+    messages = _tool_messages(files, "grep", {"pattern": "needle"})
+
+    result = str(messages[0].content)
+    assert result.count("/f") == 1000
+    assert "maximum match count" in result
+
+
+def test_grep_under_the_limit_returns_everything_and_says_nothing_about_truncation() -> None:
+    """The discriminator. Without it the test above passes just as well if grep
+    silently caps every search, which is a different and worse bug."""
+    files = {f"/f{i}.txt": {"content": "needle\n"} for i in range(5)}
+
+    messages = _tool_messages(files, "grep", {"pattern": "needle"})
+
+    result = str(messages[0].content)
+    assert result.count("/f") == 5
+    assert "maximum match count" not in result
+
+
+def test_an_oversized_read_is_truncated_with_a_marker() -> None:
+    """`TOOL_RESULT_TOKEN_LIMIT` in the only units it is enforced in: characters,
+    at `NUM_CHARS_PER_TOKEN` per token. Ten very long lines clear the line limit
+    and reach the character bound."""
+    fat = "".join("y" * 20_000 + "\n" for _ in range(10))
+    assert len(fat) > 4 * TOOL_RESULT_TOKEN_LIMIT  # the fixture must actually be over it
+
+    messages = _tool_messages(
+        {"/fat.txt": {"content": fat}}, "read_file", {"file_path": "/fat.txt"}
+    )
+
+    result = str(messages[0].content)
+    assert len(result) < len(fat)
+    assert "truncated due to size" in result
+
+
+def test_a_small_read_comes_back_whole() -> None:
+    """The discriminator: `read_file` does not mark everything truncated."""
+    small = "".join(f"line {i}\n" for i in range(50))
+
+    messages = _tool_messages({"/s.txt": {"content": small}}, "read_file", {"file_path": "/s.txt"})
+
+    result = str(messages[0].content)
+    assert "line 49" in result  # the last line actually made it back, not just some
+    assert "truncated due to size" not in result
+
+
+def test_the_line_limit_cuts_a_long_file_before_the_character_bound_can() -> None:
+    """**The reachable surface of `TOOL_RESULT_TOKEN_LIMIT` is narrower than it
+    looks.** `read_file` keeps 100 lines by default, so an ordinary long file is
+    already small by the time the character bound is consulted and the
+    truncation marker never appears. Measured: 4,000 lines and 134,890
+    characters came back as ~3,000 characters, unmarked.
+
+    Stated as a test so that a change to either limit has to confront the
+    interaction rather than discover it.
+    """
+    many = "".join(f"line {i} padding padding padding\n" for i in range(4000))
+    assert len(many) > 4 * TOOL_RESULT_TOKEN_LIMIT
+
+    messages = _tool_messages(
+        {"/many.txt": {"content": many}}, "read_file", {"file_path": "/many.txt"}
+    )
+
+    result = str(messages[0].content)
+    assert result.count("\n") <= 100
+    assert "line 0" in result and "line 3999" not in result  # cut by line count, not content
+    assert "truncated due to size" not in result
+
+
+class RecordsWhatItWasAsked(BaseChatModel):
+    """A model that answers nothing and remembers everything it was sent.
+
+    Compaction rewrites the request on its way to the model, so the only place
+    its effect is observable is the argument list of the call it precedes.
+    """
+
+    seen: list[list[Any]] = Field(default_factory=list)
+
+    @property
+    def _llm_type(self) -> str:
+        return "records-what-it-was-asked"
+
+    def bind_tools(self, tools: Any, **kwargs: Any) -> BaseChatModel:
+        return self
+
+    def _generate(self, messages: Any, stop: Any = None, run_manager: Any = None, **kw: Any) -> Any:
+        self.seen.append(list(messages))
+        return ChatResult(generations=[ChatGeneration(message=AIMessage(content="ok"))])
+
+
+def _history(messages: int, chars_each: int) -> list[Any]:
+    """A human/ai conversation of a stated size. `chars_each // 4` is what
+    `count_tokens_approximately` will score each human turn at."""
+    out: list[Any] = []
+    for i in range(messages // 2):
+        out.append(HumanMessage("filler text. " * (chars_each // 13)))
+        out.append(AIMessage(f"noted {i}"))
+    out.append(HumanMessage("now answer"))
+    return out
+
+
+def test_compaction_actually_shrinks_what_the_model_sees() -> None:
+    """The behavioural claim every other compaction test in this file assumes.
+
+    A 21-message history worth ~104,000 approximate tokens is over
+    `COMPACTION_TRIGGER_TOKENS`, so the model must be handed fewer messages
+    than were sent, with a summary standing in for the ones that were dropped.
+    """
+    model = RecordsWhatItWasAsked()
+    agent = build_agent(model, AgentConfig())
+    history = _history(20, 41_600)
+
+    agent.invoke({"messages": history}, {"recursion_limit": 25})
+
+    sent_to_model = model.seen[0]
+    assert len(sent_to_model) < len(history)
+    assert any("has been summarized" in (m.text or "") for m in sent_to_model)
+
+
+def test_a_conversation_under_the_trigger_reaches_the_model_intact() -> None:
+    """The discriminator. Without it the test above keeps passing on the day
+    something truncates every conversation for an unrelated reason.
+
+    Sized at ~40,000 approximate tokens: comfortably under the trigger, and far
+    enough above zero that a trigger set much *lower* than ours compacts it and
+    turns this red. A history of a few hundred tokens would pass under almost
+    any threshold and so would discriminate nothing -- measured, as a surviving
+    mutant, before it was resized.
+    """
+    model = RecordsWhatItWasAsked()
+    agent = build_agent(model, AgentConfig())
+    history = _history(20, 16_000)
+
+    agent.invoke({"messages": history}, {"recursion_limit": 25})
+
+    sent_to_model = model.seen[0]
+    assert len(sent_to_model) == len(history) + 1  # + the system prompt
+    assert not any("has been summarized" in (m.text or "") for m in sent_to_model)
+
+
+def test_compaction_cannot_fire_while_every_message_fits_inside_what_it_keeps() -> None:
+    """**A bound that does not bind on the shape this agent actually produces.**
+
+    `keep=("messages", 6)` is a floor, not a target: compaction only has
+    something to compact once there are more messages than it keeps. Three
+    messages worth ~104,000 approximate tokens -- comfortably over the trigger
+    -- reach the model whole.
+
+    That shape is not hypothetical. A filesystem agent's expensive turn is one
+    `read_file` returning one enormous `ToolMessage`, and no token threshold
+    reaches it. Measured, not reasoned: the model was handed all 416,000
+    characters.
+    """
+    model = RecordsWhatItWasAsked()
+    agent = build_agent(model, AgentConfig())
+    history: list[Any] = [
+        HumanMessage("filler text. " * 32_000),
+        AIMessage("noted"),
+        HumanMessage("go"),
+    ]
+
+    agent.invoke({"messages": history}, {"recursion_limit": 25})
+
+    sent_to_model = model.seen[0]
+    assert len(sent_to_model) == len(history) + 1
+    assert not any("has been summarized" in (m.text or "") for m in sent_to_model)
+    assert max(len(m.text) for m in sent_to_model) > 400_000
+
+
+def test_an_oversized_trailing_human_message_is_evicted_to_the_backend() -> None:
+    """`HUMAN_MESSAGE_TOKEN_LIMIT` enforced, not merely configured.
+
+    Measured against the installed wheel (`filesystem.py`
+    `_apply_eviction_and_truncate` / `_build_truncated_human_message`): the
+    tagged `HumanMessage` kept in graph *state* carries the full original text
+    -- only `additional_kwargs["lc_evicted_to"]` changes. Truncation is
+    computed fresh from that full text and applied solely to the message list
+    handed to the model on each request, which is why the assertion on length
+    reads from `model.seen`, not from `out["messages"]`.
+
+    The fixture size (201,000 characters) is a literal, not
+    `4 * HUMAN_MESSAGE_TOKEN_LIMIT + 1_000`: a size derived from the constant
+    under test grows with it, so a mutant that raises the constant keeps this
+    message oversized under the new threshold too and the test cannot fail.
+    The guard ties the literal to today's threshold (200,000 characters) so a
+    deliberate change to the bound is caught here.
+    """
+    assert 4 * HUMAN_MESSAGE_TOKEN_LIMIT < 201_000  # the fixture must actually exceed today's limit
+    huge = "z" * 201_000
+    model = RecordsWhatItWasAsked()
+    agent = build_agent(model, AgentConfig())
+
+    out = agent.invoke({"messages": [HumanMessage(huge)]}, {"recursion_limit": 25})
+
+    evicted = [
+        m
+        for m in out["messages"]
+        if isinstance(m, HumanMessage) and m.additional_kwargs.get("lc_evicted_to")
+    ]
+    assert evicted != []
+
+    sent_to_model = model.seen[0]
+    truncated = [
+        m
+        for m in sent_to_model
+        if isinstance(m, HumanMessage) and m.additional_kwargs.get("lc_evicted_to")
+    ]
+    assert truncated != []
+    assert len(truncated[0].text) < len(huge)
+
+
+def test_a_huge_human_message_that_is_not_last_is_never_evicted() -> None:
+    """**The bound examines `messages[-1]` and nothing else.**
+
+    A message just as large, one position from the end, is untouched. Combined
+    with compaction -- which cannot reach anything inside `keep` -- a large
+    `HumanMessage` in the middle of a conversation escapes both context bounds.
+    Neither mechanism is wrong; each does what it documents. This is the test
+    that stops "the conversation is bounded" from being read as a claim either
+    of them makes about that shape.
+
+    Same literal fixture size as the eviction test above, for the same
+    reason: a size derived from `HUMAN_MESSAGE_TOKEN_LIMIT` would still
+    demonstrate nothing useful if it moved with the constant, since this
+    test's claim is about position, not size, and a literal keeps "huge"
+    meaning something concrete rather than "whatever the constant is now".
+
+    **This test's claim is orthogonal to `HUMAN_MESSAGE_TOKEN_LIMIT`'s
+    value.** It forbids a behaviour -- evicting a non-last message -- that no
+    change to the constant can produce; deepagents' `_check_eviction_needed`
+    only ever inspects `messages[-1]`. Do not read a pass here as evidence
+    about the threshold: only a change to that `messages[-1]`-only eviction
+    logic in deepagents itself could turn this test red. (Measured: lowering
+    `HUMAN_MESSAGE_TOKEN_LIMIT` to 10 does not fail this test either --
+    trailing `"now answer"` is 10 characters against a 40-character threshold
+    at that limit, so nothing is evicted regardless of position, which proves
+    nothing about the claim this test exists to check.)
+    """
+    assert 4 * HUMAN_MESSAGE_TOKEN_LIMIT < 201_000  # oversized under today's limit, if it mattered
+    huge = "z" * 201_000
+    model = RecordsWhatItWasAsked()
+    agent = build_agent(model, AgentConfig())
+
+    out = agent.invoke(
+        {"messages": [HumanMessage(huge), HumanMessage("now answer")]},
+        {"recursion_limit": 25},
+    )
+
+    evicted = [
+        m
+        for m in out["messages"]
+        if isinstance(m, HumanMessage) and m.additional_kwargs.get("lc_evicted_to")
+    ]
+    assert evicted == []
+    assert any(len(m.text) == len(huge) for m in out["messages"] if isinstance(m, HumanMessage))

@@ -907,6 +907,69 @@ def test_a_completed_turn_with_no_tools_at_all_reports_no_failures() -> None:
     assert run_turn(FakeGraph(), "ping").failed_tool_calls == ()
 
 
+def test_a_turn_cut_off_before_the_answer_began_is_not_answered() -> None:
+    """F36: `finish_reason == "length"` with no text and no tool calls means the
+    model never opened its final channel. Printing that as an empty reply and
+    exiting 0 reports a turn that did not happen."""
+    cut_off = AIMessage(
+        "",
+        response_metadata={"finish_reason": "length"},
+        usage_metadata={
+            "input_tokens": 84,
+            "output_tokens": 24,
+            "total_tokens": 108,
+            "output_token_details": {"reasoning": 21},
+        },
+    )
+    result = TurnResult(messages=[HumanMessage("count to 200"), cut_off])
+
+    assert result.answered is False
+
+
+def test_an_ordinary_turn_is_answered() -> None:
+    """The discriminator. Without it `answered` hardwired to `False` passes."""
+    result = TurnResult(messages=[HumanMessage("hi"), AIMessage("hello")])
+
+    assert result.answered is True
+
+
+def test_a_turn_cut_off_after_calling_a_tool_is_answered() -> None:
+    """A length-capped turn that still produced a tool call did real work. Only
+    the no-text-and-no-calls combination means nothing started."""
+    cut_off = AIMessage(
+        "",
+        tool_calls=[{"name": "ls", "args": {}, "id": "c1"}],
+        response_metadata={"finish_reason": "length"},
+    )
+    result = TurnResult(messages=[HumanMessage("list files"), cut_off])
+
+    assert result.answered is True
+
+
+def test_a_turn_with_no_messages_at_all_is_answered() -> None:
+    """Pins the empty-list edge: `answered` must not index `messages[-1]`
+    unguarded. There is no cut-off answer to report when there is no turn."""
+    result = TurnResult(messages=[])
+
+    assert result.answered is True
+
+
+def test_a_turn_that_ended_on_a_tool_result_is_answered() -> None:
+    """Pins the trailing-non-`AIMessage` edge: a turn that ended on a
+    `ToolMessage` (mid-conversation, not yet the model's turn to reply) is not
+    the same shape as a model cut off before its answer began, so it reads as
+    answered rather than as the F36 case."""
+    result = TurnResult(
+        messages=[
+            HumanMessage("hi"),
+            AIMessage("x"),
+            ToolMessage("ok", tool_call_id="1", name="ls"),
+        ]
+    )
+
+    assert result.answered is True
+
+
 class FanningOutModel(BaseChatModel):
     """A model that asks for `width` tools a turn until it is cut off.
 
@@ -1267,3 +1330,59 @@ def test_the_token_limit_is_an_operating_error_not_a_broken_contract() -> None:
     caller of ours passing something impossible."""
     assert issubclass(TokenLimitExceeded, RuntimeError)
     assert not issubclass(TokenLimitExceeded, CheckFailed)
+
+
+# --------------------------------------------------------------------------
+# Adversarial model behaviour: paths the harness already claims to handle.
+# --------------------------------------------------------------------------
+
+
+def test_a_turn_whose_model_returned_nothing_at_all_still_produces_a_result() -> None:
+    """An `AIMessage` with neither content nor tool calls is a real provider
+    outcome. `run_turn` must return a `TurnResult` rather than trip a
+    postcondition — the turn happened, it just said nothing.
+
+    `result.failed_tool_calls == ()` and `result[-1].text == ""` only restate
+    what `FakeGraph` was constructed with. The actual claim under test is that
+    `run_turn`'s own postconditions — in particular the relative message check
+    (`len(messages) > len(sent)`) — do not raise on this shape; `len(result)
+    == 2` is what exercises that, since the one-message prompt plus the empty
+    `AIMessage` is the smallest input that satisfies it.
+    """
+    agent = FakeGraph({"messages": [HumanMessage("say something"), AIMessage("")]})
+
+    result = run_turn(agent, "say something")
+
+    assert len(result) == 2
+    assert result.failed_tool_calls == ()
+    assert result[-1].text == ""
+
+
+def test_duplicate_tool_call_ids_let_one_result_answer_two_calls() -> None:
+    """**A limitation, asserted so it is known rather than discovered.**
+
+    `_unanswered_tool_calls` (`src/my_agent/run.py:592`) collects requested ids
+    into a list and answered ids into a *set*, then filters by membership. Two
+    calls sharing an id are therefore both satisfied by a single `ToolMessage`,
+    so a genuinely unanswered second call passes the check.
+
+    A provider that reuses ids within one `AIMessage` is not something this
+    harness has seen, and counting by multiplicity would be a small change. The
+    reason to record it rather than fix it: nothing today produces the shape,
+    and an unused branch is a branch nobody tests. If a provider ever does,
+    this test names the behaviour to change.
+    """
+    calls = [
+        {"name": "ls", "args": {}, "id": "dup"},
+        {"name": "read_file", "args": {"file_path": "/a"}, "id": "dup"},
+    ]
+    history = [
+        HumanMessage("go"),
+        AIMessage("", tool_calls=calls),
+        ToolMessage("ok", tool_call_id="dup", name="ls"),
+    ]
+    agent = FakeGraph({"messages": [*history, HumanMessage("next"), AIMessage("done")]})
+
+    result = run_turn(agent, "next", history=history)
+
+    assert result[-1].text == "done"
