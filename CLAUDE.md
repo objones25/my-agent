@@ -250,7 +250,7 @@ Bugs live in the states the code was never written to handle. Write those down a
 
 ## Testing and evals
 
-Keep them apart. 352 offline tests and 2 live as of 2026-09-18.
+Keep them apart. 375 offline tests and 2 live as of 2026-09-19.
 
 - **Unit tests** (`tests/`, default selection) are deterministic and offline. One test file per
   source module; a new module gets a new file, not an extra section in an existing one. They test
@@ -394,7 +394,7 @@ Everything in this table lives in `src/my_agent/`.
 | `agent.py` | `AgentConfig`, `build_agent`. Takes a `BaseChatModel` and imports nothing from `model.py` — `main.py` is the only place the two meet. Compiles **twice**: the second build is what puts a step limit on the `task` subagent (F24). |
 | `capabilities.py` | The allowlist and the proof it held: `DEFAULT_FILESYSTEM_TOOLS`, `least_privilege_filesystem`, `compiled_tools`, `compiled_tool_names`, `subagent_graphs`, `bound_step_limit`, `require_withheld`/`require_granted`, plus the bounds on granted capabilities (`SUBAGENT_STEP_LIMIT`, `GREP_MATCH_LIMIT`, the eviction limits, `bounded_compaction` and `CONTEXT_WINDOW_TOKENS`) and the `DEEPAGENTS_PLUGIN_GROUPS` pin. |
 | `contracts.py` | `check_config_contract`, `pydantic_param_names` — the import-time check that makes `as_kwargs()` splatting safe. |
-| `run.py` | `Invokable`, `RunBounds`, `RunDeadline`, `RunTokenBudget`, `TurnResult`, `run_turn`, `resume_turn` — one bounded turn, with three outcomes: finished, failed (`DeadlineExceeded`, `StepLimitExceeded`, `TokenLimitExceeded`, `ResumeLimitExceeded`) or paused for approval, and `failed_tool_calls` for a turn that finished without doing what it says. Owns the step limit, the wall clock and token budget across a pause, the resume count, the thread and multi-turn history. Imports no deepagents and builds no model. |
+| `run.py` | `Invokable`, `RunBounds`, `RunDeadline`, `RunTokenBudget`, `TurnResult`, `run_turn`, `resume_turn` — one bounded turn, with three outcomes: finished, failed (`DeadlineExceeded`, `StepLimitExceeded`, `TokenLimitExceeded`, `ResumeLimitExceeded`) or paused for approval, `failed_tool_calls` for a turn that finished without doing what it says, and `answered` for a turn cut off before its answer began. Owns the step limit, the wall clock and token budget across a pause, the resume count, the thread and multi-turn history. Imports no deepagents and builds no model. |
 | `main.py` | `uv run my-agent` — the composition root, and the live checks (one per finding). |
 | `negative_space.py` | `require`/`unreachable`/`bounded`, and the only doctests in `src/`. |
 | `tracing.py` | `TracingBackend`, `LangSmithTracing`, `WeaveTracing`, `available_backends`, `langchain_tracer_names`. |

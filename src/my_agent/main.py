@@ -436,7 +436,8 @@ def _single_turn(config: ModelConfig, prompt: str, callbacks: list[BaseCallbackH
     if not result.answered:
         print(
             "note: the reply above is empty because the turn was cut off before its answer "
-            "began, not because the model had nothing to say; raise the token cap",
+            "began, not because the model had nothing to say; set REASONING_EFFORT=low or "
+            "raise the provider's output cap",
             file=sys.stderr,
         )
     return 0
