@@ -545,13 +545,23 @@ def _tool_messages(files: dict[str, Any], tool: str, args: dict[str, Any]) -> li
 def test_grep_stops_at_the_match_limit() -> None:
     """`GREP_MATCH_LIMIT` is a bound on a capability we granted. Read back off
     the middleware it is only a number that was passed; here it is the number
-    of matches that actually came back."""
-    files = {f"/f{i}.txt": {"content": "needle\n"} for i in range(GREP_MATCH_LIMIT + 200)}
+    of matches that actually came back.
+
+    Fixture size and expected count are literals (1,200 and 1,000), not
+    derived from `GREP_MATCH_LIMIT`. A fixture sized as `GREP_MATCH_LIMIT +
+    200` and an expectation of `GREP_MATCH_LIMIT` both move in lockstep with
+    the constant under test, so a mutant that changes it moves the test's own
+    goalposts and the test cannot fail. The guard below still ties the
+    literals to the constant, so a deliberate change to the bound is caught
+    here rather than discovered later.
+    """
+    assert GREP_MATCH_LIMIT < 1200  # the fixture must actually exceed today's limit
+    files = {f"/f{i}.txt": {"content": "needle\n"} for i in range(1200)}
 
     messages = _tool_messages(files, "grep", {"pattern": "needle"})
 
     result = str(messages[0].content)
-    assert result.count("/f") == GREP_MATCH_LIMIT
+    assert result.count("/f") == 1000
     assert "maximum match count" in result
 
 
@@ -725,8 +735,16 @@ def test_an_oversized_trailing_human_message_is_evicted_to_the_backend() -> None
     computed fresh from that full text and applied solely to the message list
     handed to the model on each request, which is why the assertion on length
     reads from `model.seen`, not from `out["messages"]`.
+
+    The fixture size (201,000 characters) is a literal, not
+    `4 * HUMAN_MESSAGE_TOKEN_LIMIT + 1_000`: a size derived from the constant
+    under test grows with it, so a mutant that raises the constant keeps this
+    message oversized under the new threshold too and the test cannot fail.
+    The guard ties the literal to today's threshold (200,000 characters) so a
+    deliberate change to the bound is caught here.
     """
-    huge = "z" * (4 * HUMAN_MESSAGE_TOKEN_LIMIT + 1_000)
+    assert 4 * HUMAN_MESSAGE_TOKEN_LIMIT < 201_000  # the fixture must actually exceed today's limit
+    huge = "z" * 201_000
     model = RecordsWhatItWasAsked()
     agent = build_agent(model, AgentConfig())
 
@@ -758,8 +776,15 @@ def test_a_huge_human_message_that_is_not_last_is_never_evicted() -> None:
     Neither mechanism is wrong; each does what it documents. This is the test
     that stops "the conversation is bounded" from being read as a claim either
     of them makes about that shape.
+
+    Same literal fixture size as the eviction test above, for the same
+    reason: a size derived from `HUMAN_MESSAGE_TOKEN_LIMIT` would still
+    demonstrate nothing useful if it moved with the constant, since this
+    test's claim is about position, not size, and a literal keeps "huge"
+    meaning something concrete rather than "whatever the constant is now".
     """
-    huge = "z" * (4 * HUMAN_MESSAGE_TOKEN_LIMIT + 1_000)
+    assert 4 * HUMAN_MESSAGE_TOKEN_LIMIT < 201_000  # oversized under today's limit, if it mattered
+    huge = "z" * 201_000
     model = RecordsWhatItWasAsked()
     agent = build_agent(model, AgentConfig())
 
