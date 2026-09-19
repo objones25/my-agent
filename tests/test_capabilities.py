@@ -542,6 +542,31 @@ def _tool_messages(files: dict[str, Any], tool: str, args: dict[str, Any]) -> li
     return [m for m in out["messages"] if isinstance(m, ToolMessage)]
 
 
+def test_grep_stops_at_the_match_limit() -> None:
+    """`GREP_MATCH_LIMIT` is a bound on a capability we granted. Read back off
+    the middleware it is only a number that was passed; here it is the number
+    of matches that actually came back."""
+    files = {f"/f{i}.txt": {"content": "needle\n"} for i in range(GREP_MATCH_LIMIT + 200)}
+
+    messages = _tool_messages(files, "grep", {"pattern": "needle"})
+
+    result = str(messages[0].content)
+    assert result.count("/f") == GREP_MATCH_LIMIT
+    assert "maximum match count" in result
+
+
+def test_grep_under_the_limit_returns_everything_and_says_nothing_about_truncation() -> None:
+    """The discriminator. Without it the test above passes just as well if grep
+    silently caps every search, which is a different and worse bug."""
+    files = {f"/f{i}.txt": {"content": "needle\n"} for i in range(5)}
+
+    messages = _tool_messages(files, "grep", {"pattern": "needle"})
+
+    result = str(messages[0].content)
+    assert result.count("/f") == 5
+    assert "maximum match count" not in result
+
+
 class RecordsWhatItWasAsked(BaseChatModel):
     """A model that answers nothing and remembers everything it was sent.
 
