@@ -74,6 +74,13 @@ def _forbid_network(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPa
             "mark it `live` if it genuinely needs the network."
         )
 
+    # Connect-shaped exits.
     monkeypatch.setattr(socket.socket, "connect", deny)
     monkeypatch.setattr(socket.socket, "connect_ex", deny)
     monkeypatch.setattr(socket, "create_connection", deny)
+    # Exits that never call connect, and so were open while the suite claimed
+    # to be offline: a name lookup is egress on its own, and a datagram send
+    # puts a packet on the wire with no connection to intercept.
+    monkeypatch.setattr(socket, "getaddrinfo", deny)
+    monkeypatch.setattr(socket, "gethostbyname", deny)
+    monkeypatch.setattr(socket.socket, "sendto", deny)

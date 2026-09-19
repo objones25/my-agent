@@ -1411,6 +1411,24 @@ usefully without one.
 
 ## Test-infrastructure specifics
 
+**The socket guard was connect-shaped, and three exits are not.** `_forbid_network` patched
+`socket.socket.connect`, `connect_ex` and `socket.create_connection` — every TCP path, including
+async and TLS ones, bottoms out in the first of those, so anything that opens a *connection* was
+caught. What was not: `socket.getaddrinfo` and `socket.gethostbyname` (a name lookup is egress on
+its own and never calls connect) and `socket.socket.sendto` (a datagram goes on the wire with no
+connection to intercept). All three now deny, and `tests/test_conftest.py` asserts each one —
+watched red against the old three-patch guard before the fix, which is the only reason to believe
+they can fail. Before that file existed the guard had **no tests at all**, so "offline is enforced,
+not assumed" was itself an assumption.
+
+Deliberately *not* covered: an exception raised inside a fire-and-forget `asyncio.create_task`. The
+guard fires and the traceback prints, but an unretrieved task exception goes to
+`loop.call_exception_handler` → `logger.error`, which is logging rather than a warning, so
+`filterwarnings = ["error"]` never converts it and the test still passes. That needs an asyncio
+exception handler or an `asyncio.all_tasks()` assertion at teardown, and it is unreachable today
+because nothing in `src/` is async. **It is the first thing to fix if async ever lands** — before
+the first async test, not after.
+
 **The `src/` doctests run outside the socket guard.** `--doctest-modules` is set and `src` is a
 `testpaths` entry alongside `tests`, but a `conftest.py` is directory-scoped, so those items get
 neither `_forbid_network` nor any other `tests/` fixture. Confirmed with `pytest --setup-show`: a
