@@ -1375,8 +1375,7 @@ position.
 (`test_the_line_limit_cuts_a_long_file_before_the_character_bound_can`): a 4,000-line, 134,890-
 character file — over four times the character bound — came back as ~3,000 characters with no
 truncation marker, because line 100 arrived long before byte 80,000. The character bound is only
-reachable on files with few, very long lines (or content that does not arrive through `read_file`
-at all, such as a `ToolMessage` built directly, which is the shape the compaction test above uses).
+reachable on files with few, very long lines.
 
 **Put together: a large `HumanMessage` or tool result sitting mid-conversation is bounded by none of
 the three.** Each mechanism does exactly what it documents — compaction protects recent context,
