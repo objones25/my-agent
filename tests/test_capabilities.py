@@ -28,10 +28,14 @@ from deepagents.middleware.summarization import (
     create_summarization_middleware,
 )
 from deepagents.profiles import _builtin_profiles
+from langchain_core.language_models import BaseChatModel
 from langchain_core.language_models.fake_chat_models import ParrotFakeChatModel
+from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
 from langgraph.graph.state import CompiledStateGraph
-from pydantic import SecretStr
+from pydantic import Field, SecretStr
 
+from my_agent.agent import AgentConfig, build_agent
 from my_agent.capabilities import (
     COMPACTION_ARG_TRUNCATION_MESSAGES,
     COMPACTION_KEEP_MESSAGES,
@@ -485,3 +489,114 @@ def test_bounded_compaction_replaces_deepagents_own_rather_than_joining_it() -> 
     theirs = create_summarization_middleware(ParrotFakeChatModel(), StateBackend())
 
     assert ours.name == theirs.name
+
+
+# --------------------------------------------------------------------------
+# Compaction: that it fires, not merely that it was configured to
+#
+# Every test above reads a threshold back off a constructor. That proves the
+# number was passed and nothing about whether the mechanism runs -- which is
+# exactly how F31 survived the project's whole life. These drive a real
+# compiled agent with a real oversized history and assert on what the model
+# was actually handed.
+# --------------------------------------------------------------------------
+
+
+class RecordsWhatItWasAsked(BaseChatModel):
+    """A model that answers nothing and remembers everything it was sent.
+
+    Compaction rewrites the request on its way to the model, so the only place
+    its effect is observable is the argument list of the call it precedes.
+    """
+
+    seen: list[list[Any]] = Field(default_factory=list)
+
+    @property
+    def _llm_type(self) -> str:
+        return "records-what-it-was-asked"
+
+    def bind_tools(self, tools: Any, **kwargs: Any) -> BaseChatModel:
+        return self
+
+    def _generate(self, messages: Any, stop: Any = None, run_manager: Any = None, **kw: Any) -> Any:
+        self.seen.append(list(messages))
+        return ChatResult(generations=[ChatGeneration(message=AIMessage(content="ok"))])
+
+
+def _history(messages: int, chars_each: int) -> list[Any]:
+    """A human/ai conversation of a stated size. `chars_each // 4` is what
+    `count_tokens_approximately` will score each human turn at."""
+    out: list[Any] = []
+    for i in range(messages // 2):
+        out.append(HumanMessage("filler text. " * (chars_each // 13)))
+        out.append(AIMessage(f"noted {i}"))
+    out.append(HumanMessage("now answer"))
+    return out
+
+
+def test_compaction_actually_shrinks_what_the_model_sees() -> None:
+    """The behavioural claim every other compaction test in this file assumes.
+
+    A 21-message history worth ~104,000 approximate tokens is over
+    `COMPACTION_TRIGGER_TOKENS`, so the model must be handed fewer messages
+    than were sent, with a summary standing in for the ones that were dropped.
+    """
+    model = RecordsWhatItWasAsked()
+    agent = build_agent(model, AgentConfig())
+    history = _history(20, 41_600)
+
+    agent.invoke({"messages": history}, {"recursion_limit": 25})
+
+    sent_to_model = model.seen[0]
+    assert len(sent_to_model) < len(history)
+    assert any("has been summarized" in (m.text or "") for m in sent_to_model)
+
+
+def test_a_conversation_under_the_trigger_reaches_the_model_intact() -> None:
+    """The discriminator. Without it the test above keeps passing on the day
+    something truncates every conversation for an unrelated reason.
+
+    Sized at ~40,000 approximate tokens: comfortably under the trigger, and far
+    enough above zero that a trigger set much *lower* than ours compacts it and
+    turns this red. A history of a few hundred tokens would pass under almost
+    any threshold and so would discriminate nothing -- measured, as a surviving
+    mutant, before it was resized.
+    """
+    model = RecordsWhatItWasAsked()
+    agent = build_agent(model, AgentConfig())
+    history = _history(20, 16_000)
+
+    agent.invoke({"messages": history}, {"recursion_limit": 25})
+
+    sent_to_model = model.seen[0]
+    assert len(sent_to_model) == len(history) + 1  # + the system prompt
+    assert not any("has been summarized" in (m.text or "") for m in sent_to_model)
+
+
+def test_compaction_cannot_fire_while_every_message_fits_inside_what_it_keeps() -> None:
+    """**A bound that does not bind on the shape this agent actually produces.**
+
+    `keep=("messages", 6)` is a floor, not a target: compaction only has
+    something to compact once there are more messages than it keeps. Three
+    messages worth ~104,000 approximate tokens -- comfortably over the trigger
+    -- reach the model whole.
+
+    That shape is not hypothetical. A filesystem agent's expensive turn is one
+    `read_file` returning one enormous `ToolMessage`, and no token threshold
+    reaches it. Measured, not reasoned: the model was handed all 416,000
+    characters.
+    """
+    model = RecordsWhatItWasAsked()
+    agent = build_agent(model, AgentConfig())
+    history: list[Any] = [
+        HumanMessage("filler text. " * 32_000),
+        AIMessage("noted"),
+        HumanMessage("go"),
+    ]
+
+    agent.invoke({"messages": history}, {"recursion_limit": 25})
+
+    sent_to_model = model.seen[0]
+    assert len(sent_to_model) == len(history) + 1
+    assert not any("has been summarized" in (m.text or "") for m in sent_to_model)
+    assert max(len(m.text) for m in sent_to_model) > 400_000
