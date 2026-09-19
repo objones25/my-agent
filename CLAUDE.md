@@ -250,7 +250,7 @@ Bugs live in the states the code was never written to handle. Write those down a
 
 ## Testing and evals
 
-Keep them apart. 375 offline tests and 2 live as of 2026-09-19.
+Keep them apart. 376 offline tests and 2 live as of 2026-09-19.
 
 - **Unit tests** (`tests/`, default selection) are deterministic and offline. One test file per
   source module; a new module gets a new file, not an extra section in an existing one. They test
