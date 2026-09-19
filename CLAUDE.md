@@ -1,7 +1,7 @@
 # CLAUDE.md
 
 Guidance for Claude Code in this repository. `README.md` says what the project is; this is the
-contributor's contract, and **`docs/findings.md` (F1–F35) is the evidence behind it** — read it
+contributor's contract, and **`docs/findings.md` (F1–F36) is the evidence behind it** — read it
 before debugging anything that looks like a library bug, and add to it when you verify something
 new.
 
@@ -398,7 +398,7 @@ Everything in this table lives in `src/my_agent/`.
 `tests/` mirrors that one file per module, offline by default, plus `conftest.py` for shared
 fixtures and the socket guard. The only `-m live` tests are one each at the end of `test_tracing.py`
 (calls the real `weave.init()` and hits the router) and `test_run.py` (proves multi-turn history
-against a real graph, which a fake cannot show). `evals/` is empty. `docs/findings.md` holds F1–F35
+against a real graph, which a fake cannot show). `evals/` is empty. `docs/findings.md` holds F1–F36
 plus the repo-gates, deepagents-surface, test-infrastructure and observability appendices;
 `scripts/audit_negative_space.py` is **vendored** from the negative-space-programming skill — do not
 hand-edit it, refresh by re-copying (it is excluded from ruff and mypy).

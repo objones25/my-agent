@@ -345,8 +345,9 @@ check — but any new protocol with a non-method member should be run past both 
 **Severity: important.** A cost lever that was running at the provider's default, and it silently
 changes what a token cap means.
 
-`openai/gpt-oss-120b` reasons on essentially every call. From a real `uv run my-agent` run,
-reasoning tokens as a share of output:
+`openai/gpt-oss-120b` reasons on essentially every call — essentially, not quite: F36 records a
+measured call with `reasoning: 0`. From a real `uv run my-agent` run, reasoning tokens as a share of
+output:
 
 | check | reasoning | output |
 |---|---|---|
@@ -355,9 +356,15 @@ reasoning tokens as a share of output:
 | F4 shell refusal | 74 | 146 |
 
 The F2 row is the one that matters: with `TOKEN_CAP = 24`, reasoning consumed 21 of the 24 and the
-visible answer got 3, which is why that record's text is empty. **A token cap on a reasoning model
-is mostly a reasoning cap.** The check still verifies what it claims — the cap is honoured — but it
-is not evidence that 24 tokens buys 24 tokens of answer.
+visible answer got **none**. The remaining 3 are not a squeezed answer — they are the harmony header
+that *opens* the reasoning channel, spent before the first reasoning token. The response was cut
+mid-reasoning, the final channel was never opened, and that is why the record's text is empty; F36
+reconstructs the frame token by token. The floor for a non-empty answer is `reasoning + 11`, so this
+call would have needed a cap of 32 to show a single word.
+
+**A token cap on a reasoning model is mostly a reasoning cap** — here it was entirely one. The check
+still verifies what it claims — the cap is honoured — but it is not evidence that 24 tokens buys 24
+tokens of answer, or any.
 
 `reasoning_effort` is a Chat Completions body parameter. The router *documents* `none, minimal,
 low, medium, high, xhigh` — **three of those are rejected on the wire, and `REASONING_EFFORTS` has
@@ -1193,6 +1200,86 @@ to grade itself without `output_tokens`, so a change would not go unnoticed for 
 Carries across a pause exactly as `elapsed_s` does (F33): `TurnResult.tokens` accumulates and
 `resume_turn` runs on `token_limit - tokens`.
 
+## F36 — an empty response text is not a truncated answer; it is an answer that never started
+
+**Severity: low — an observability defect, not a behavioural one.** The log's `""` reads as "the
+model said almost nothing"; it means "the model was still reasoning". Different diagnosis, same
+record.
+
+`logs/20260918T201908Z-db00e749.jsonl` line 4 — the F2 token-cap check — records `output_tokens:
+24`, `reasoning: 21`, `finish_reason: "length"`, `outputs: [""]`. The obvious reading is that
+reasoning took 21 and the answer got the leftover 3 and was too short to survive. Wrong on both
+counts: the answer got **zero**, and the 3 were spent before the reasoning, not after it.
+
+gpt-oss speaks harmony, so a response is a sequence of channels rather than a string, and the
+channel markers are billed as output tokens. The frame, counted with the model's own tokenizer:
+
+```
+<|channel|>analysis<|message|>                  3 tokens   the prompt ends at <|start|>assistant
+    ...reasoning...                           rsn tokens   output_token_details.reasoning
+<|end|>                                         1 token
+<|start|>assistant<|channel|>final<|message|>   5 tokens
+    ...answer...                          content tokens   the only part that reaches outputs[]
+<|return|>                                      1 token
+```
+
+A completed reasoning response therefore bills `reasoning + content + 10`, and a response that skips
+the analysis channel bills `content + 4`. Every `llm_end` in that run reconciles to the token,
+`residual = output_tokens - reasoning - tokens(text)`:
+
+| lines | residual | reading |
+|---|---|---|
+| 2, 10, 70, 86 | **10** | complete: both channels opened and closed |
+| 46 | **4** | `reasoning: 0` — the analysis channel was never opened |
+| 4, 78, 82 | **3** | cut mid-reasoning; only the analysis header was emitted |
+| 80 | **8** | reasoning finished, cut 4 tokens into the 5-token final header |
+| 22, 34, 58 | 30, 34 | not truncated: the commentary header plus JSON arguments, which the mirror records under `tool_calls`, not `outputs` |
+
+Three consequences:
+
+- **The floor for a non-empty answer is `reasoning + 11` tokens.** Line 4 would have needed a cap of
+  32 to show one word. This is F17's point sharpened: the cap was not *mostly* a reasoning cap, it
+  was entirely one.
+- **`""` under `finish_reason: "length"` is a distinguishable state, and the residual says where the
+  cut landed** — 3 means still reasoning, 4–9 means reasoning finished and the answer was about to
+  begin, ≥10 with empty text means a genuinely empty answer. Line 80 is the middle case and would
+  have produced text one token later.
+- **An empty `outputs` on a tool-calling record is not truncation at all.** Those tokens are real
+  output; they live in `tool_calls` because that is where langchain puts them.
+
+Reproducer — offline, no router call, using the tokenizer `langchain-openai` already pulls in
+(tiktoken 0.14.0):
+
+```python
+import json, tiktoken
+enc = tiktoken.get_encoding("o200k_harmony")          # gpt-oss's own tokenizer
+for line in open("logs/<run>.jsonl"):
+    d = json.loads(line)
+    if d.get("event") != "llm_end" or not d.get("usage"):
+        continue
+    u = d["usage"]
+    text = "".join(d.get("outputs") or [])
+    print(u["output_tokens"] - u["output_token_details"].get("reasoning", 0)
+          - len(enc.encode(text)), d["metadata"]["finish_reason"])
+```
+
+*What we do:* nothing in code. The mirror already records `finish_reason`, `output_tokens` and
+`reasoning` (F18), which is everything the reconstruction needs — the ambiguity is in the reader,
+not the record. If it becomes worth closing, the cheap version is a derived flag on `llm_end`
+(`finish_reason == "length" and not outputs and not tool_calls` → cut before the answer began),
+which needs no tokenizer on the hot path.
+
+*Why this is not pinned by an offline test:* `o200k_harmony`'s BPE ranks are downloaded on first use
+and cached under `data-gym-cache`, so the `_forbid_network` fixture would fail a cold run. Pinning it
+properly means vendoring the ranks, which costs more than the finding is worth.
+
+*Still unverified:* whether every provider frames responses identically. Weak evidence that it is a
+model property rather than a provider one: this run carries two distinct `system_fingerprint`s and
+the 10-token frame held on both. The routed provider itself is not recorded — unpinned routing plus
+a fingerprint is not a provider name (F25 is the reason to pin `:provider`). Also unverified whether
+`reasoning: 0` is a model decision or a provider one; it happened once, on the turn that read a
+`ToolMessage` back and restated it.
+
 ---
 
 ## Observability API reference
@@ -1392,3 +1479,6 @@ Each of these is also noted at the finding it belongs to.
 - Whether HITL behaves the same against the live router as against the fake model it is proven with
   (F29). The pause is a middleware decision taken before the model is called again, so it should —
   but "should" is what this file exists to replace.
+- Whether every provider frames a harmony response identically, and whether a `reasoning: 0`
+  response is a model decision or a provider one (F36). Two fingerprints in one run agreed on the
+  frame; the routed provider is not recorded, so that is agreement between unknowns.
