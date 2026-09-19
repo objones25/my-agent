@@ -1306,3 +1306,50 @@ def test_the_token_limit_is_an_operating_error_not_a_broken_contract() -> None:
     caller of ours passing something impossible."""
     assert issubclass(TokenLimitExceeded, RuntimeError)
     assert not issubclass(TokenLimitExceeded, CheckFailed)
+
+
+# --------------------------------------------------------------------------
+# Adversarial model behaviour: paths the harness already claims to handle.
+# --------------------------------------------------------------------------
+
+
+def test_a_turn_whose_model_returned_nothing_at_all_still_produces_a_result() -> None:
+    """An `AIMessage` with neither content nor tool calls is a real provider
+    outcome. `run_turn` must return a `TurnResult` rather than trip a
+    postcondition — the turn happened, it just said nothing."""
+    agent = FakeGraph({"messages": [HumanMessage("say something"), AIMessage("")]})
+
+    result = run_turn(agent, "say something")
+
+    assert result.failed_tool_calls == ()
+    assert result[-1].text == ""
+
+
+def test_duplicate_tool_call_ids_let_one_result_answer_two_calls() -> None:
+    """**A limitation, asserted so it is known rather than discovered.**
+
+    `_unanswered_tool_calls` (`src/my_agent/run.py:574`) collects requested ids
+    into a list and answered ids into a *set*, then filters by membership. Two
+    calls sharing an id are therefore both satisfied by a single `ToolMessage`,
+    so a genuinely unanswered second call passes the check.
+
+    A provider that reuses ids within one `AIMessage` is not something this
+    harness has seen, and counting by multiplicity would be a small change. The
+    reason to record it rather than fix it: nothing today produces the shape,
+    and an unused branch is a branch nobody tests. If a provider ever does,
+    this test names the behaviour to change.
+    """
+    calls = [
+        {"name": "ls", "args": {}, "id": "dup"},
+        {"name": "read_file", "args": {"file_path": "/a"}, "id": "dup"},
+    ]
+    history = [
+        HumanMessage("go"),
+        AIMessage("", tool_calls=calls),
+        ToolMessage("ok", tool_call_id="dup", name="ls"),
+    ]
+    agent = FakeGraph({"messages": [*history, HumanMessage("next"), AIMessage("done")]})
+
+    result = run_turn(agent, "next", history=history)
+
+    assert result[-1].text == "done"
