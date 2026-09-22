@@ -348,12 +348,17 @@ def installed_caching_probes() -> tuple[str, ...]:
     changing what is installed, and so the import-time check below and the test
     that asserts the same thing cannot drift apart.
     """
-    found = tuple(m for m in DEEPAGENTS_CACHING_PROBE_MODULES if util.find_spec(m) is not None)
+    # Precondition, not decoration: an empty probe list makes the import-time
+    # check below pass by asking about nothing, which is the same vacuity
+    # `require_withheld` refuses. (The postcondition this replaced asserted
+    # `found <= DEEPAGENTS_CACHING_PROBE_MODULES`, which the comprehension makes
+    # true by construction — a check that could not fail.)
     require(
-        set(found) <= set(DEEPAGENTS_CACHING_PROBE_MODULES),
-        f"probe returned a module it was not asked about: {found}",
+        len(DEEPAGENTS_CACHING_PROBE_MODULES) > 0,
+        "the caching probe list is empty, so the pin below would hold vacuously; "
+        "deepagents probes for langchain_aws and langchain_fireworks by name",
     )
-    return found
+    return tuple(m for m in DEEPAGENTS_CACHING_PROBE_MODULES if util.find_spec(m) is not None)
 
 
 _INSTALLED_CACHING = installed_caching_probes()

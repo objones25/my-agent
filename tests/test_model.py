@@ -12,6 +12,7 @@ All offline: `ChatOpenAI` builds lazily and makes no request.
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Callable
 from typing import Any
 
 import pytest
@@ -401,3 +402,52 @@ def test_the_router_base_url_is_not_a_url_any_other_provider_answers() -> None:
     somewhere else."""
     assert "huggingface" in HF_ROUTER_BASE_URL
     assert "openai.com" not in HF_ROUTER_BASE_URL
+
+
+# --------------------------------------------------------------------------
+# build_model's read-back postconditions, driven
+#
+# ChatOpenAI falls back to OPENAI_API_BASE / OPENAI_BASE_URL and rewrites
+# `temperature` for some model families, so what was asked for is not
+# necessarily what came back. Each check below guards a silent redirect; none
+# had a test, because forcing one false needs a ChatOpenAI that accepts a
+# setting and reports a different one.
+# --------------------------------------------------------------------------
+
+
+def _overriding_chat_openai(attribute: str, value: Any) -> Callable[..., ChatOpenAI]:
+    """A `ChatOpenAI` factory that builds the real client, then reports one
+    setting differently — a library that took an argument and used another."""
+
+    def build(**kwargs: Any) -> ChatOpenAI:
+        model = ChatOpenAI(**kwargs)
+        object.__setattr__(model, attribute, value)
+        return model
+
+    return build
+
+
+@pytest.mark.parametrize(
+    ("attribute", "value", "expected"),
+    [
+        ("openai_api_base", "https://api.openai.com/v1", "base_url was overridden"),
+        ("model_name", "gpt-4o", "model was overridden"),
+        ("use_responses_api", True, "use_responses_api must stay False"),
+    ],
+)
+def test_build_model_refuses_a_setting_the_client_overrode(
+    monkeypatch: pytest.MonkeyPatch,
+    valid_secret: SecretStr,
+    attribute: str,
+    value: Any,
+    expected: str,
+) -> None:
+    """A silent redirect to `api.openai.com` would otherwise surface as a
+    confusing auth failure much later, and a `use_responses_api` that flipped
+    would route the request to an endpoint the router does not serve (F1)."""
+    monkeypatch.setattr(
+        "my_agent.model.ChatOpenAI", _overriding_chat_openai(attribute, value)
+    )
+
+    with pytest.raises(CheckFailed, match=expected):
+        build_model(ModelConfig(api_key=valid_secret))

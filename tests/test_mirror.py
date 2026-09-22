@@ -10,7 +10,7 @@ import io
 import json
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
@@ -661,3 +661,18 @@ def test_a_request_with_no_tools_still_records_a_size() -> None:
     assert size["tools_bytes"] == 0
     assert size["tool_count"] == 0
     assert size["messages_bytes"] > 0
+
+
+def test_the_mirror_refuses_a_stream_it_cannot_write_to() -> None:
+    """Every record goes through `.write`. A stream without one fails on the
+    first event of a run rather than at construction, which is the worst moment
+    to discover the log was never going to work."""
+    with pytest.raises(CheckFailed, match="stream must be writable"):
+        JsonlMirror(cast(Any, object()))
+
+
+def test_run_log_path_rejects_an_empty_run_id() -> None:
+    """An empty id makes the filename collide with the next run's, so two runs
+    would interleave in one file and neither could be read back."""
+    with pytest.raises(CheckFailed, match="run_id must not be empty"):
+        run_log_path(run_id="")

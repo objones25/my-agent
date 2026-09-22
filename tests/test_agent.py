@@ -35,7 +35,12 @@ from langgraph.errors import GraphRecursionError
 from langgraph.graph.state import CompiledStateGraph
 from pydantic import SecretStr
 
-from my_agent.agent import KNOWN_CREATE_DEEP_AGENT_PARAMS, AgentConfig, _agent_kwargs, build_agent
+from my_agent.agent import (
+    KNOWN_CREATE_DEEP_AGENT_PARAMS,
+    AgentConfig,
+    _agent_kwargs,
+    build_agent,
+)
 from my_agent.capabilities import (
     COMPACTION_TRIGGER_TOKENS,
     DEFAULT_FILESYSTEM_TOOLS,
@@ -963,3 +968,151 @@ def test_build_agent_refuses_an_output_key_it_would_silently_drop(
 
     with pytest.raises(CheckFailed, match="receipts"):
         build_agent(ParrotFakeChatModel())
+
+
+# --------------------------------------------------------------------------
+# The read-back postconditions, driven
+# --------------------------------------------------------------------------
+
+
+def test_agent_kwargs_refuses_middleware_that_lost_the_permission_rules(
+    monkeypatch: pytest.MonkeyPatch, deny_secrets: FilesystemPermission
+) -> None:
+    """The settings are assembled a few lines apart, which is exactly how they
+    drift. `permissions` reaching `create_deep_agent` while the middleware
+    carrying them does not is a silent loss of every rule (F5)."""
+
+    def rule_dropping(permissions: Any, backend: Any) -> FilesystemMiddleware:
+        return least_privilege_filesystem(None, backend)
+
+    monkeypatch.setattr("my_agent.agent.least_privilege_filesystem", rule_dropping)
+
+    with pytest.raises(CheckFailed, match="does not carry the permissions"):
+        _agent_kwargs(AgentConfig(permissions=[deny_secrets]), ParrotFakeChatModel())
+
+
+def test_agent_kwargs_refuses_middleware_on_a_different_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One backend object for every consumer of one. Two would put a single
+    agent on two filesystems, with the tools writing where compaction and skills
+    cannot read (F21, F34)."""
+
+    def elsewhere(permissions: Any, _backend: Any) -> FilesystemMiddleware:
+        return least_privilege_filesystem(permissions, StateBackend())
+
+    monkeypatch.setattr("my_agent.agent.least_privilege_filesystem", elsewhere)
+
+    with pytest.raises(CheckFailed, match="different backend"):
+        _agent_kwargs(AgentConfig(), ParrotFakeChatModel())
+
+
+def test_agent_kwargs_refuses_a_second_compaction_middleware() -> None:
+    """deepagents merges by `.name`, so two here means ours joined the stack
+    rather than replacing the one sized above the context window. Counted rather
+    than assumed, because a caller may legitimately supply their own — that is a
+    decision to surface, not to silently take second place behind."""
+    theirs = SummarizationMiddleware(ParrotFakeChatModel(), backend=StateBackend())
+
+    with pytest.raises(CheckFailed, match="compaction middlewares"):
+        _agent_kwargs(AgentConfig(middleware=[theirs]), ParrotFakeChatModel())
+
+
+def test_build_agent_refuses_a_subagent_rebind_that_did_not_take(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`with_config` returns a copy, so an assertion on the original would pass
+    while the graph actually handed over kept 9999."""
+    monkeypatch.setattr("my_agent.agent.bound_step_limit", lambda _graph: LIBRARY_STEP_LIMIT)
+
+    with pytest.raises(CheckFailed, match="did not take"):
+        build_agent(ParrotFakeChatModel())
+
+
+def test_build_agent_refuses_a_subagent_left_at_the_library_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The read-back after the rebuild. Applying the limit is handing deepagents
+    a spec; whether it survives the round trip is deepagents' behaviour, not
+    ours, so one `task` dispatch outliving every bound `run_turn` sends has to
+    be a failed build rather than a discovery."""
+    # The test module's own binding, captured before monkeypatch touches
+    # `my_agent.agent`'s — so the stub can still call the real reader.
+    real = bound_step_limit
+    seen = 0
+
+    def second_call_lies(graph: Any) -> int | None:
+        nonlocal seen
+        seen += 1
+        # The first call is the rebind's own postcondition; let that pass so the
+        # build reaches `_require_subagents_bounded`, which is the check here.
+        return real(graph) if seen == 1 else LIBRARY_STEP_LIMIT
+
+    monkeypatch.setattr("my_agent.agent.bound_step_limit", second_call_lies)
+
+    with pytest.raises(CheckFailed, match=f"runs to {LIBRARY_STEP_LIMIT} steps"):
+        build_agent(ParrotFakeChatModel())
+
+
+def test_build_agent_refuses_a_factory_that_returned_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`create_deep_agent` returning None would make every capability assertion
+    below it fail with an AttributeError instead of naming the cause."""
+    monkeypatch.setattr("my_agent.agent.create_deep_agent", lambda **_kwargs: None)
+
+    with pytest.raises(CheckFailed, match="returned None"):
+        build_agent(ParrotFakeChatModel())
+
+
+def test_build_agent_refuses_a_bounded_rebuild_that_returned_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The discriminator for the test above: the *second* build is the one that
+    puts a step limit on `task`, and it has its own null check because a failure
+    there leaves an agent that compiled fine and is unbounded."""
+    real = create_deep_agent
+    calls = 0
+
+    def fails_on_the_rebuild(**kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        return real(**kwargs) if calls == 1 else None
+
+    monkeypatch.setattr("my_agent.agent.create_deep_agent", fails_on_the_rebuild)
+
+    with pytest.raises(CheckFailed, match="None on the bounded rebuild"):
+        build_agent(ParrotFakeChatModel())
+
+
+def test_build_agent_refuses_a_parent_rebind_that_did_not_take(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same copy-semantics trap as the subagent rebind, on the parent."""
+    # The test module's own binding, captured before monkeypatch touches
+    # `my_agent.agent`'s — so the stub can still call the real reader.
+    real = bound_step_limit
+    seen = 0
+
+    def last_call_lies(graph: Any) -> int | None:
+        nonlocal seen
+        seen += 1
+        # Counted, not assumed: `build_agent` calls this five times, because
+        # each `require(...)` interpolates it into the failure message and an
+        # f-string argument is evaluated whether or not the check fails. Calls
+        # one to three belong to the subagent rebind and its read-back; the
+        # fourth is the parent's own postcondition.
+        return real(graph) if seen < 4 else LIBRARY_STEP_LIMIT
+
+    monkeypatch.setattr("my_agent.agent.bound_step_limit", last_call_lies)
+
+    with pytest.raises(CheckFailed, match="binding the parent step limit did not take"):
+        build_agent(ParrotFakeChatModel())
+
+
+def test_build_agent_rejects_a_config_that_is_not_an_agent_config() -> None:
+    """A precondition, not a read-back, but the same family: a dict of the right
+    shape would splat into `create_deep_agent` and skip every validation
+    `AgentConfig.__post_init__` performs."""
+    with pytest.raises(CheckFailed, match="expected an AgentConfig"):
+        build_agent(ParrotFakeChatModel(), cast(Any, {"name": "mine"}))

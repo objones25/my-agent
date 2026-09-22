@@ -77,3 +77,17 @@ def test_contract_check_rejects_an_uninspectable_callee() -> None:
 
     with pytest.raises(CheckFailed, match="introspect"):
         check_config_contract(AnyConfig, frozenset(), "mystery", frozenset())
+
+
+def test_contract_check_rejects_a_config_class_with_no_fields() -> None:
+    """The vacuity guard. Every check below it compares the config's field names
+    against the callee's parameters, and an empty set is a subset of anything —
+    so a dataclass that lost its fields would pass the contract by having
+    nothing to contradict it."""
+
+    @dataclass(frozen=True)
+    class Empty:
+        pass
+
+    with pytest.raises(CheckFailed, match="has no fields"):
+        check_config_contract(Empty, frozenset({"a"}), "callee", frozenset())

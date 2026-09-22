@@ -23,7 +23,7 @@ from deepagents import (
 )
 from deepagents.backends import FilesystemBackend, StateBackend
 from deepagents.backends.protocol import SandboxBackendProtocol
-from deepagents.middleware import _prompt_caching
+from deepagents.middleware import SummarizationMiddleware, _prompt_caching
 from deepagents.middleware.summarization import (
     compute_summarization_defaults,
     create_summarization_middleware,
@@ -57,6 +57,7 @@ from my_agent.capabilities import (
     TASK_DISPATCH_LIMIT,
     TOOL_CALL_LIMIT,
     TOOL_RESULT_TOKEN_LIMIT,
+    bound_step_limit,
     bounded_compaction,
     call_limits,
     compiled_output_keys,
@@ -948,3 +949,174 @@ def test_the_output_key_reader_refuses_a_graph_it_cannot_read() -> None:
     in `build_agent` vacuous — every unknown key absent because none was found."""
     with pytest.raises(CheckFailed, match="output schema"):
         compiled_output_keys(cast(Any, SimpleNamespace(output_schema=None)))
+
+
+# --------------------------------------------------------------------------
+# The read-back postconditions, driven
+#
+# Every check below is of the form "we passed X; did X land?". They guard
+# private attributes of library objects, which is exactly why they exist — and
+# why none of them had a test: forcing one false needs a library object that
+# accepts a setting and does not keep it. `monkeypatch` on the name
+# `capabilities.py` actually calls is how, the same technique
+# `test_the_backend_and_context_bounds_are_stated_rather_than_inherited` uses.
+# --------------------------------------------------------------------------
+
+
+def _forgetful_filesystem(attribute: str, value: Any) -> Callable[..., FilesystemMiddleware]:
+    """A `FilesystemMiddleware` factory that builds the real thing, then drops
+    one setting on the floor — a library that accepted an argument and did not
+    keep it."""
+
+    def build(**kwargs: Any) -> FilesystemMiddleware:
+        middleware = FilesystemMiddleware(**kwargs)
+        object.__setattr__(middleware, attribute, value)
+        return middleware
+
+    return build
+
+
+@pytest.mark.parametrize(
+    ("attribute", "value", "expected"),
+    [
+        ("backend", None, "kept no backend"),
+        ("_tool_token_limit_before_evict", 1, "tool-result token bound"),
+        ("_human_message_token_limit_before_evict", 1, "human-message token bound"),
+        ("_grep_max_count", 1, "grep match bound"),
+        ("_permissions", [], "permission rules"),
+    ],
+)
+def test_least_privilege_filesystem_refuses_a_setting_that_did_not_land(
+    monkeypatch: pytest.MonkeyPatch,
+    deny_secrets: FilesystemPermission,
+    attribute: str,
+    value: Any,
+    expected: str,
+) -> None:
+    """Passing a bound and having it land are different claims. All five of
+    these guard private API, so each is one upstream rename away from silently
+    dropping a context bound or every permission rule."""
+    monkeypatch.setattr(
+        "my_agent.capabilities.FilesystemMiddleware", _forgetful_filesystem(attribute, value)
+    )
+
+    with pytest.raises(CheckFailed, match=expected):
+        least_privilege_filesystem([deny_secrets])
+
+
+def _forgetful_compaction(attribute: str, value: Any) -> Callable[..., Any]:
+    """The same, for the compaction middleware. `_lc_helper` is the object that
+    actually evaluates the thresholds, so two of these sabotage it rather than
+    the wrapper."""
+
+    def build(model: Any, **kwargs: Any) -> Any:
+        middleware = SummarizationMiddleware(model, **kwargs)
+        target: Any = middleware
+        name = attribute
+        if attribute.startswith("helper."):
+            target, name = middleware._lc_helper, attribute.removeprefix("helper.")
+        object.__setattr__(target, name, value)
+        return middleware
+
+    return build
+
+
+@pytest.mark.parametrize(
+    ("attribute", "value", "expected"),
+    [
+        ("helper.trigger", ("tokens", 1), "did not retain its trigger"),
+        ("helper.keep", ("messages", 1), "how much conversation it keeps"),
+        ("_truncate_args_trigger", None, "tool-argument truncation trigger"),
+        ("_truncate_args_keep", None, "how many messages keep their arguments"),
+        ("_backend", "somewhere else", "different backend"),
+    ],
+)
+def test_bounded_compaction_refuses_a_threshold_that_did_not_land(
+    monkeypatch: pytest.MonkeyPatch,
+    attribute: str,
+    value: Any,
+    expected: str,
+) -> None:
+    """deepagents wraps langchain's middleware and normalises what it was
+    handed, so every one of these is read off the object that evaluates it
+    rather than off the constructor call — and a wrapper that stopped forwarding
+    would leave the agent compacting at the library's own threshold, which is
+    33% above the window we assume (F31)."""
+    monkeypatch.setattr(
+        "my_agent.capabilities.SummarizationMiddleware", _forgetful_compaction(attribute, value)
+    )
+
+    with pytest.raises(CheckFailed, match=expected):
+        bounded_compaction(ParrotFakeChatModel(), StateBackend())
+
+
+def test_call_limits_refuse_two_middlewares_that_share_a_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The names are the library's to choose (`ToolCallLimitMiddleware[task]`
+    today), and deepagents merges middleware by `.name` — so a collision would
+    mean the task bound silently replacing the global one, leaving a run bounded
+    at 3 tool calls or at 24 dispatches depending on which won."""
+
+    class Colliding(ToolCallLimitMiddleware):
+        # `.name` is a read-only property on the real class, which is the point:
+        # the value is the library's, so a collision is something it could hand
+        # us rather than something we could pass.
+        @property
+        def name(self) -> str:
+            return "ToolCallLimitMiddleware"
+
+    def colliding(**kwargs: Any) -> ToolCallLimitMiddleware:
+        return Colliding(**kwargs)
+
+    monkeypatch.setattr("my_agent.capabilities.ToolCallLimitMiddleware", colliding)
+
+    with pytest.raises(CheckFailed, match="share a middleware name"):
+        call_limits()
+
+
+def test_bound_step_limit_refuses_a_limit_that_is_not_a_number() -> None:
+    """A limit read back as a string would make every comparison against it
+    quietly false, which is how a bound stops being a bound without failing."""
+    graph = cast(Any, SimpleNamespace(config={"recursion_limit": "25"}))
+
+    with pytest.raises(CheckFailed, match="not an int"):
+        bound_step_limit(graph)
+
+
+def test_the_caching_probe_refuses_an_empty_list_of_modules(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty probe list makes the import-time pin hold by asking about
+    nothing — the same vacuity `require_withheld` refuses."""
+    monkeypatch.setattr("my_agent.capabilities.DEEPAGENTS_CACHING_PROBE_MODULES", ())
+
+    with pytest.raises(CheckFailed, match="probe list is empty"):
+        installed_caching_probes()
+
+
+def test_the_output_key_reader_refuses_a_schema_it_cannot_introspect() -> None:
+    """`get_type_hints` raises on a schema whose annotations reference a name
+    that no longer resolves — an upstream rename mid-refactor. Returning an
+    empty set there would make `build_agent`'s pin pass by checking nothing."""
+
+    class Unresolvable:
+        __annotations__ = {"messages": "NoSuchTypeAnywhere"}
+
+    graph = cast(Any, SimpleNamespace(output_schema=Unresolvable))
+
+    with pytest.raises(CheckFailed, match="cannot be introspected"):
+        compiled_output_keys(graph)
+
+
+def test_the_output_key_reader_refuses_a_schema_declaring_nothing() -> None:
+    """The vacuity guard: a schema with no keys makes every unknown key absent
+    because none was found."""
+
+    class Empty:
+        pass
+
+    graph = cast(Any, SimpleNamespace(output_schema=Empty))
+
+    with pytest.raises(CheckFailed, match="declares no keys"):
+        compiled_output_keys(graph)
