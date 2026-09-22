@@ -1574,6 +1574,78 @@ five-constant mutation now fails four tests.
 
 ---
 
+## F43 — `_invoke` read one key and dropped the state
+
+**Severity: important.** F40 gave `TurnResult` a `files` field, which fixed the symptom and left the
+shape of the bug intact: `_invoke` still read named keys out of the result and discarded whatever
+else came back.
+
+What a compiled deep agent actually declares it may return:
+
+```python
+typing.get_type_hints(agent.output_schema)   # ['files', 'messages', 'structured_response']
+```
+
+`structured_response` was being dropped. It is empty on every path today, because `AgentConfig` has
+no `response_format` field — but adding one is the single-line change `AgentConfig`'s own docstring
+promises, and the caller who made it would have found `run_turn` silently discarding the only thing
+they added it for. Proven against a graph returning the declared shape: `files` surfaced,
+`structured_response` and an unrecognised key both vanished.
+
+Two further facts from the same introspection:
+
+- **The declared output class does not mention `files`.** `OutputAgentState` names `messages` and
+  `structured_response` only; `files` is contributed by `FilesystemMiddleware`, which is exactly how
+  a key that arrives on every turn stays invisible to anyone reading the type.
+- **The graph's internal channels are wider than its output.** `run_tool_call_count` and
+  `thread_tool_call_count` — the call-limit counters — are state channels but not output keys, so
+  they do not come back from `invoke` and `TurnResult` cannot report how many calls a run made.
+  `failed_tool_calls` counts the blocked ones from the messages instead.
+
+*What we do:* `TurnResult.state` carries every key the graph returned except `messages` and
+`__interrupt__`, which have fields of their own — excluded because the messages are the bulk of a
+turn's memory and two copies can disagree. `files` and `structured_response` are properties over it,
+so the keys with a documented meaning keep a name while an unrecognised key is still *there* rather
+than destroyed.
+
+Carried whole rather than one field per key on purpose: the keys are not ours to enumerate, and a
+middleware a domain adds tomorrow lands in `state` without `run.py` changing. What stops that being
+silent is a pin: `agent.KNOWN_OUTPUT_STATE_KEYS` plus `capabilities.compiled_output_keys`, asserted
+in `build_agent`, so a newly declared output key fails the build and someone decides whether it
+deserves a property. The same argument as `KNOWN_CREATE_DEEP_AGENT_PARAMS`, one layer down — that
+pin catches a new parameter, this catches a new output. The reader raises rather than returning an
+empty set when the structure moves, because a reader that finds no keys would make every
+"is this key known?" check pass by checking nothing.
+
+### The filesystem does not survive the turn
+
+Worth stating beside `files`, because it is easy to assume otherwise. `run_turn` sends
+`{"messages": sent}` and nothing else, and with no checkpointer langgraph retains nothing, so the
+agent's filesystem is empty at the start of every turn. Measured 2026-09-22 — a file written in turn
+one is gone in turn two of the same conversation, `history=` passed:
+
+```
+turn 1 files: ['/a.txt']
+turn 2 files: ['/b.txt']        # same agent, same conversation
+carried? False
+```
+
+The conversation continues across turns; the filesystem does not. `CLAUDE.md` says
+`run_turn(agent, prompt, history=...)` "returns exactly what the next call wants", which is now
+narrower than it reads: `TurnResult` carries `files`, and the next call has no way to accept them.
+
+Two readings, pointing opposite ways. It is *convenient*: because state resets, `files` is always
+precisely "what this turn wrote", which is a cleaner verification artifact than a cumulative
+filesystem. It is also a *gap*: an agent that writes notes in turn one cannot read them in turn two,
+and any multi-turn domain hits it immediately.
+
+*What we do:* nothing. The fix is a `checkpointer` — already an `AgentConfig` field — and it would
+also make `files` cumulative, so the read-back stops meaning "this turn". Which of the two readings
+matters depends on the domain, and inventing multi-turn filesystem persistence now would be the
+YAGNI this repo spends a section refusing. Recorded so the choice is made rather than discovered.
+
+---
+
 ## Observability API reference
 
 Not findings — API surfaces recorded so the next piece of work does not have to re-derive them.

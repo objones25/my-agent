@@ -57,6 +57,7 @@ from my_agent.capabilities import (
     bound_step_limit,
     bounded_compaction,
     call_limits,
+    compiled_output_keys,
     compiled_tool_names,
     least_privilege_filesystem,
     require_withheld,
@@ -68,6 +69,7 @@ from my_agent.negative_space import CheckFailed, require
 __all__ = [
     "DEFAULT_AGENT_NAME",
     "DEFAULT_SYSTEM_PROMPT",
+    "KNOWN_OUTPUT_STATE_KEYS",
     "AgentConfig",
     "build_agent",
 ]
@@ -135,6 +137,21 @@ require(
     f"create_deep_agent no longer accepts {sorted(_REMOVED_PARAMS)}; "
     f"AgentConfig and this pin must change together",
 )
+
+KNOWN_OUTPUT_STATE_KEYS = frozenset({"files", "messages", "structured_response"})
+"""Every state key a compiled agent declared it may return, when this was reviewed.
+
+`TurnResult.state` carries whatever comes back, so a new key is not lost — but
+nothing would *say* it had appeared, and a key nobody reviewed is a key nobody
+decided to surface. That is not hypothetical: `files` arrived this way, declared
+by `FilesystemMiddleware`, returned on every turn and read by nothing until F40.
+
+The same argument as `KNOWN_CREATE_DEEP_AGENT_PARAMS`, one layer down — that pin
+catches a new *parameter*, this catches a new *output*. Adding the name here is
+the deliberate acceptance, and the place to ask whether `TurnResult` should give
+it a property of its own the way `files` has one.
+"""
+
 
 _AGENT_INJECTED_PARAMS = frozenset({"model"})
 
@@ -489,6 +506,16 @@ def build_agent(
     # there is no allowlist of ours left to assert.
     if not _replaces_filesystem_middleware(agent_config):
         _require_shell_withheld(agent)
+
+    # A key the graph returns and nobody reviewed. `TurnResult.state` will carry
+    # it either way; this is what makes its arrival a decision.
+    unknown = compiled_output_keys(agent) - KNOWN_OUTPUT_STATE_KEYS
+    require(
+        not unknown,
+        f"the compiled agent declares output state keys nobody has reviewed: {sorted(unknown)}. "
+        f"TurnResult.state carries them, but decide whether each deserves a property of its own "
+        f"the way `files` has one, then add it to KNOWN_OUTPUT_STATE_KEYS.",
+    )
 
     # The floor under `RunBounds.step_limit`, and the other half of F24.
     # `create_agent` binds `recursion_limit: 9999` onto every graph it compiles,

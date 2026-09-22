@@ -944,3 +944,22 @@ def test_run_turn_still_overrides_the_parents_bound_limit() -> None:
         run_turn(build_agent(model), "loop", bounds=RunBounds(step_limit=4))
 
     assert model.calls < PARENT_STEP_LIMIT
+
+
+def test_build_agent_refuses_an_output_key_it_would_silently_drop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same door `KNOWN_CREATE_DEEP_AGENT_PARAMS` guards, one layer down.
+
+    `TurnResult.state` carries whatever the graph returns, so a new key is not
+    *lost* — but nothing would say it had appeared, and a key nobody reviewed is
+    a key nobody decided to surface. `files` arrived exactly this way: declared
+    by middleware, returned on every turn, read by nothing.
+    """
+    monkeypatch.setattr(
+        "my_agent.agent.compiled_output_keys",
+        lambda _agent: frozenset({"files", "messages", "structured_response", "receipts"}),
+    )
+
+    with pytest.raises(CheckFailed, match="receipts"):
+        build_agent(ParrotFakeChatModel())

@@ -59,6 +59,7 @@ from my_agent.capabilities import (
     TOOL_RESULT_TOKEN_LIMIT,
     bounded_compaction,
     call_limits,
+    compiled_output_keys,
     compiled_tool_names,
     installed_caching_probes,
     least_privilege_filesystem,
@@ -930,3 +931,20 @@ def test_the_capability_bounds_are_the_numbers_that_were_chosen() -> None:
     assert COMPACTION_TRIGGER_TOKENS == 96_000
     assert COMPACTION_KEEP_MESSAGES == 6
     assert COMPACTION_ARG_TRUNCATION_MESSAGES == 20
+
+
+def test_the_compiled_output_keys_are_the_ones_run_turn_knows_about() -> None:
+    """`TurnResult` carries the graph's state, and `agent.py` pins which keys
+    that may be. Read off the *compiled* graph rather than off `OutputAgentState`,
+    because `files` is contributed by middleware and is absent from the declared
+    class."""
+    agent = build_agent(ParrotFakeChatModel())
+
+    assert compiled_output_keys(agent) == frozenset({"files", "messages", "structured_response"})
+
+
+def test_the_output_key_reader_refuses_a_graph_it_cannot_read() -> None:
+    """A reader that returns nothing on a changed structure would make the pin
+    in `build_agent` vacuous — every unknown key absent because none was found."""
+    with pytest.raises(CheckFailed, match="output schema"):
+        compiled_output_keys(cast(Any, SimpleNamespace(output_schema=None)))

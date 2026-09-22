@@ -93,8 +93,16 @@ def _handlers(config: RunnableConfig | None) -> list[BaseCallbackHandler]:
 class FakeGraph:
     """The narrowest thing `run_turn` can accept: something with `.invoke`."""
 
-    def __init__(self, result: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        result: dict[str, Any] | None = None,
+        extra_state: dict[str, Any] | None = None,
+    ) -> None:
         self.result = result if result is not None else _two_messages()
+        # A real graph returns its whole state, not only the messages; this is
+        # how a test says so without compiling one.
+        if extra_state:
+            self.result = {**self.result, **extra_state}
         self.payload: dict[str, Any] | None = None
         self.config: RunnableConfig | None = None
 
@@ -1446,3 +1454,53 @@ def test_the_default_bounds_object_carries_those_same_values() -> None:
     assert DEFAULT_RUN_BOUNDS.deadline_s == 600.0
     assert DEFAULT_RUN_BOUNDS.token_limit == 500_000
     assert DEFAULT_RUN_BOUNDS.resume_limit == 3
+
+
+def test_a_turn_carries_every_state_key_the_graph_returned() -> None:
+    """`_invoke` read `messages` and dropped the rest of the state.
+
+    `files` was the key that mattered enough to notice (F40), but reading one
+    named key is the same mistake at a smaller scale: the compiled output schema
+    declares `['files', 'messages', 'structured_response']`, and a middleware may
+    add more. Anything the graph reports and this class cannot hold is
+    information the harness destroys at the only point it is available.
+    """
+    graph = FakeGraph(
+        extra_state={
+            "files": {"/a.txt": {"content": "x"}},
+            "structured_response": {"verdict": "pass"},
+            "some_future_key": 42,
+        }
+    )
+
+    result = run_turn(graph, "go")
+
+    assert result.state["some_future_key"] == 42
+    assert result.structured_response == {"verdict": "pass"}
+    assert dict(result.files) == {"/a.txt": {"content": "x"}}
+
+
+def test_the_state_a_turn_carries_excludes_what_has_its_own_field() -> None:
+    """The discriminator, and the reason this is not just `result.raw`.
+
+    `messages` and `__interrupt__` are already `TurnResult` fields. Repeating
+    them in `state` would double the memory a turn holds — the messages are the
+    bulk of it — and leave two copies that a later edit can disagree about.
+    """
+    graph = FakeGraph(extra_state={"files": {}})
+
+    result = run_turn(graph, "go")
+
+    assert "messages" not in result.state
+    assert "__interrupt__" not in result.state
+    assert result.messages
+
+
+def test_a_turn_against_a_graph_with_no_extra_state_carries_none() -> None:
+    """Absence is a legitimate state: a fake graph carries no filesystem, and a
+    `StateBackend` never written to reports none either."""
+    result = run_turn(FakeGraph(), "go")
+
+    assert result.state == {}
+    assert result.structured_response is None
+    assert result.files == {}

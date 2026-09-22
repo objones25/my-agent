@@ -16,7 +16,7 @@ import inspect
 from collections.abc import Callable, Collection
 from importlib import util
 from importlib.metadata import entry_points
-from typing import Any, get_args
+from typing import Any, get_args, get_type_hints
 
 from deepagents import FilesystemMiddleware, FilesystemPermission, FsToolName
 from deepagents.backends import StateBackend
@@ -51,6 +51,7 @@ __all__ = [
     "bound_step_limit",
     "bounded_compaction",
     "call_limits",
+    "compiled_output_keys",
     "compiled_tool_names",
     "compiled_tools",
     "installed_caching_probes",
@@ -548,6 +549,33 @@ def bounded_compaction(model: BaseChatModel, backend: BackendProtocol) -> Summar
         "would land where the filesystem tools cannot read them",
     )
     return middleware
+
+
+def compiled_output_keys(agent: CompiledStateGraph[Any, Any, Any, Any]) -> frozenset[str]:
+    """State keys a compiled agent declares it may return.
+
+    Read off the compiled graph rather than off `OutputAgentState`, because the
+    declared class names `messages` and `structured_response` only — `files` is
+    contributed by `FilesystemMiddleware` and appears in neither, which is
+    exactly how a returned key stays invisible (F43).
+
+    Reaches through langgraph internals, so the structure is pinned: a reader
+    that returned nothing when the shape moved would make every "is this key
+    known?" check pass by finding no keys at all.
+    """
+    schema = getattr(agent, "output_schema", None)
+    if schema is None:
+        raise CheckFailed("compiled agent exposes no output schema; graph structure changed")
+    try:
+        hints = get_type_hints(schema)
+    except Exception as exc:
+        raise CheckFailed(
+            f"the compiled agent's output schema cannot be introspected ({type(exc).__name__}); "
+            f"graph structure changed"
+        ) from exc
+    if not hints:
+        raise CheckFailed("the compiled agent's output schema declares no keys at all")
+    return frozenset(hints)
 
 
 def compiled_tools(agent: CompiledStateGraph[Any, Any, Any, Any]) -> dict[str, Any]:
