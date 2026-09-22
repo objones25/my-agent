@@ -264,24 +264,38 @@ Bugs live in the states the code was never written to handle. Write those down a
 
 ## Testing and evals
 
-Keep them apart. 392 offline tests and 2 live as of 2026-09-21.
+Keep them apart. 437 offline tests and 2 live as of 2026-09-22.
 
 - **Unit tests** (`tests/`, default selection) are deterministic and offline. One test file per
   source module; a new module gets a new file, not an extra section in an existing one. They test
   the harness: protocol conformance, wiring, bounds, error paths. For each `require()`, a test that
-  trips it — that is what turns a contract into a tested contract. **This is the goal, not the
-  current state.** Counted by AST walk 2026-09-21: **107 `require()` calls and
-  13 explicit `raise CheckFailed`, 120 sites in all, of which 56 are tripped by a test** — 47%.
-  Fifteen of the remaining 64 are import-time and not triggerable without
-  reloading the module against a patched library, which no test does. The remainder are almost
-  entirely the read-back *postconditions* the code's own comments call load-bearing
-  (`capabilities.py`'s five `least_privilege_filesystem` checks and five compaction checks,
-  `agent.py`'s assembled-middleware checks, `model.py`'s three `build_model` checks); the
-  monkeypatch technique that would force them false is already used twice elsewhere and simply not
-  applied to these. `run.py` has seven untripped (the `__interrupt__` shape check, both `bounds must
-  be RunBounds` sites, the non-mapping result, `resume_turn`'s two agent/paused preconditions, and
-  `RunDeadline.elapsed_s`'s backwards-clock check, which is a duplicate of the one in
-  `_require_time_left` that *is* tripped). Line coverage hides all of it — `require()` is a
+  trips it — that is what turns a contract into a tested contract. **Outside two named
+  exclusions, that is now the state rather than the goal.** Measured 2026-09-22 by wrapping
+  `require()` in a pytest plugin that logs its call site whenever it raises, then diffing against
+  an AST walk — not by reading coverage, and not by counting by hand: **108 `require()` sites, 83
+  tripped; 16 `raise CheckFailed` sites, 15 tripped.** The 26 that remain are exactly two groups:
+
+    - **15 import-time**, which no test can trip without `importlib.reload` against a patched
+      library. Reachable in principle; nothing here does it yet.
+    - **11 in `main.py`**, left alone deliberately — it is scaffolding, and a check there is worth
+      a findings entry rather than a fix round.
+
+  Nothing else in `src/` has an untripped check. **Keep it that way**: a new `require()` lands with
+  the test that trips it, or the count above stops being true and nobody notices, which is the
+  failure this project spent a branch measuring. Two techniques cover almost everything — a bad
+  argument for a precondition, and `monkeypatch` on the name the module actually calls for a
+  read-back postcondition, building the real library object and then dropping one setting
+  (`_forgetful_filesystem` in `tests/test_capabilities.py` is the pattern).
+
+  Two traps met while doing it. **A `require()` message is evaluated whether or not the check
+  fails** — `require(cond, f"...{read_back(x)}")` calls `read_back` every time, which is why
+  `build_agent` calls `bound_step_limit` five times and not three; a test that stubs such a helper
+  by call count must count, not assume. And **two sites with the same message cannot be told
+  apart**: `RunDeadline`'s two backwards-clock checks were byte-identical, so `match="backwards"`
+  matched either and the pair read as covered while only one had a test. Give every check a message
+  no other check could produce.
+
+  Line coverage hides all of it — `require()` is a
   function, so the
   raise lives in `negative_space.py` and the call site reads as covered whether or not the predicate
   ever went false.

@@ -1885,9 +1885,11 @@ Each of these is also noted at the finding it belongs to.
   graph at all (F41). The closure hunt that finds `subagent_graphs` finds no middleware list, so
   the caching door is pinned before the fact rather than asserted after it — the only door here
   with no read-back.
-- Whether the remaining 49 non-import-time untripped check sites can be driven by the monkeypatch
-  technique already used twice in `tests/` (see "Testing and evals" in `CLAUDE.md`). Nothing
-  suggests they cannot; nobody has tried.
+- Whether the 15 import-time check sites can be tripped by a test. They need `importlib.reload`
+  against a monkeypatched library and no test here does that, so they are the last group with no
+  coverage outside `main.py` — 83 of 108 `require()` sites and 15 of 16 `raise CheckFailed` sites
+  are tripped as of 2026-09-22, measured by wrapping `require()` in a pytest plugin rather than by
+  reading coverage. The remaining 11 are in `main.py` and deliberately left.
 
 - A **provider-pinned** model id (`org/model:groq`) on the token cap (F2), on `reasoning_effort`
   (F17, F26) and on the context window (F25). Only the router's own selection is covered, and F25 is

@@ -17,7 +17,8 @@ from __future__ import annotations
 import io
 import re
 from collections.abc import Callable
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 from uuid import uuid4
 
 import pytest
@@ -1504,3 +1505,95 @@ def test_a_turn_against_a_graph_with_no_extra_state_carries_none() -> None:
     assert result.state == {}
     assert result.structured_response is None
     assert result.files == {}
+
+
+# --------------------------------------------------------------------------
+# The last seven checks in this module with no test that trips them
+#
+# Measured by instrumenting `require()` to log its call site whenever it raises
+# and running the suite. These were what remained: the two shape checks on what
+# a graph hands back, the three type preconditions nothing had passed a wrong
+# type to, and the backwards-clock check on the accounting path.
+# --------------------------------------------------------------------------
+
+
+def test_the_deadline_refuses_a_backwards_clock_while_accounting() -> None:
+    """The *other* backwards-clock check. `_require_time_left`'s has a test;
+    this one feeds `TurnResult.elapsed_s`, so a negative value hands the next
+    resume a budget larger than the turn had left — the opposite of a bound.
+
+    Its message used to be byte-identical to the enforcement path's, so no
+    `match=` could tell the two apart and the pair read as covered.
+    """
+    deadline = RunDeadline(10.0, clock=FakeClock(0.0, -5.0))
+
+    with pytest.raises(CheckFailed, match="accounting for the turn"):
+        _ = deadline.elapsed_s
+
+
+def test_run_turn_rejects_a_result_that_is_not_a_mapping() -> None:
+    """`_invoke` subscripts what comes back. A graph returning a list would
+    otherwise fail with a `TypeError` from inside this module rather than
+    naming the library that changed."""
+    graph = FakeGraph(result=cast(Any, [HumanMessage("hi"), AIMessage("there")]))
+
+    with pytest.raises(CheckFailed, match="not a mapping"):
+        run_turn(graph, "go")
+
+
+def test_run_turn_rejects_interrupts_it_cannot_read() -> None:
+    """The shape check on a pause. `interrupts` is built by filtering for
+    `Interrupt` objects, so a langgraph that reported pauses some other way
+    would yield an empty tuple — a paused turn indistinguishable from a
+    finished one, which is the exact failure F29 exists for."""
+    # Typed loosely on purpose: the whole point is a payload shaped the way
+    # langgraph does *not* currently shape one.
+    result: dict[str, Any] = {
+        **_two_messages(),
+        "__interrupt__": [{"action_requests": [{"name": "write_file"}]}],
+    }
+    graph = FakeGraph(result=result)
+
+    with pytest.raises(CheckFailed, match="are Interrupt"):
+        run_turn(graph, "go")
+
+
+def test_run_turn_rejects_bounds_that_are_not_run_bounds() -> None:
+    """A duck-typed stand-in with the right attribute names would reach
+    `_run_config` and be sent as a `recursion_limit`, so the turn would run
+    under numbers that never passed `RunBounds.__post_init__`."""
+    loose = cast(Any, SimpleNamespace(step_limit=1, deadline_s=1.0, token_limit=1, resume_limit=0))
+
+    with pytest.raises(CheckFailed, match="bounds must be RunBounds"):
+        run_turn(FakeGraph(), "go", bounds=loose)
+
+
+def test_resume_turn_rejects_something_that_cannot_be_invoked() -> None:
+    """The resume half of `run_turn`'s own precondition. A resume path that
+    skipped it would fail with an `AttributeError` after the bounds had already
+    been computed and the resume counted."""
+    paused = run_turn(PausingGraph(), "write it", thread_id="t1")
+
+    with pytest.raises(CheckFailed, match="invoke"):
+        resume_turn(cast(Any, object()), paused, [{"type": "approve"}])
+
+
+def test_resume_turn_rejects_something_that_is_not_a_turn_result() -> None:
+    """`paused` carries the thread the pending interrupt lives in and the
+    budgets already spent. A look-alike would resume the wrong checkpoint with a
+    fresh budget — the two defects F33 closed, reached from a new direction."""
+    impostor = cast(Any, SimpleNamespace(paused=True, thread_id="t1", elapsed_s=0.0, tokens=0))
+
+    with pytest.raises(CheckFailed, match="must be the TurnResult"):
+        resume_turn(FakeGraph(), impostor, [{"type": "approve"}])
+
+
+def test_resume_turn_rejects_bounds_that_are_not_run_bounds() -> None:
+    """The same precondition as `run_turn`'s, on the path that subtracts the
+    spent budget from them. Unvalidated bounds here mean a resume computing its
+    remainder from numbers nothing checked."""
+    paused = run_turn(PausingGraph(), "write it", thread_id="t1")
+    loose = cast(Any, SimpleNamespace(step_limit=1, deadline_s=1.0, token_limit=1, resume_limit=3))
+
+    with pytest.raises(CheckFailed, match="bounds must be RunBounds"):
+        resume_turn(FakeGraph(), paused, [{"type": "approve"}], bounds=loose)

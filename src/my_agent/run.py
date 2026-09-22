@@ -497,7 +497,17 @@ class RunDeadline(BaseCallbackHandler):
         """Wall clock since construction. What `TurnResult.elapsed_s` accumulates,
         and therefore what the next resume has subtracted from its budget."""
         elapsed = self._clock() - self._started
-        require(elapsed >= 0.0, f"clock ran backwards: {elapsed}s elapsed since the run started")
+        # Distinct wording from `_require_time_left`'s identical check on
+        # purpose: the two messages used to be byte-identical, so a test
+        # matching on the text could not say which site it had tripped — and
+        # only one of them had a test. This one feeds `TurnResult.elapsed_s`,
+        # so a negative value here hands the next resume a budget *larger* than
+        # the turn had left.
+        require(
+            elapsed >= 0.0,
+            f"clock ran backwards while accounting for the turn: {elapsed}s elapsed since the "
+            f"run started, which would give a resume more budget than the turn has left",
+        )
         return elapsed
 
     def _require_time_left(self) -> None:
