@@ -198,7 +198,13 @@ def test_model_config_fields_are_all_real_chatopenai_keywords(valid_secret: Secr
         f.alias for f in ChatOpenAI.model_fields.values() if f.alias is not None
     }
 
-    assert set(ModelConfig(api_key=valid_secret).as_kwargs()) <= accepted
+    kwargs = ModelConfig(api_key=valid_secret).as_kwargs()
+
+    # A subset assertion is vacuously true of an empty dict: with `as_kwargs`
+    # stubbed to `return {}` this test passed (measured 2026-09-21), reporting a
+    # contract held over no fields at all.
+    assert set(kwargs) == {f.name for f in dataclasses.fields(ModelConfig)}
+    assert set(kwargs) <= accepted
 
 
 def test_model_config_does_not_carry_the_factory_injected_parameter(
@@ -366,3 +372,32 @@ def test_from_env_still_falls_back_to_every_default(valid_key: str) -> None:
         DEFAULT_MAX_RETRIES,
         None,
     )
+
+
+def test_the_router_defaults_are_the_values_that_were_chosen() -> None:
+    """Literals, because every other test compares a constant to itself.
+
+    Measured 2026-09-21: `HF_ROUTER_BASE_URL` was changed to
+    `"https://api.openai.com/v1"`, `DEFAULT_TEMPERATURE` to 1.9 and
+    `DEFAULT_MAX_RETRIES` to 99, and all 376 tests stayed green — including
+    `test_build_model_ignores_ambient_openai_env_vars`, which exists to prove an
+    ambient `OPENAI_BASE_URL` cannot redirect us and asserts against the
+    constant, so it passes when the constant *is* that URL. A pin is only a pin
+    when the expected value is written somewhere the mutation cannot reach.
+    """
+    assert HF_ROUTER_BASE_URL == "https://router.huggingface.co/v1"
+    assert DEFAULT_MODEL == "openai/gpt-oss-120b"
+    assert DEFAULT_TEMPERATURE == 0.0
+    assert DEFAULT_TIMEOUT_S == 120.0
+    assert DEFAULT_MAX_RETRIES == 2
+    assert USE_RESPONSES_API is False
+    assert frozenset({"low", "medium", "high"}) == REASONING_EFFORTS
+
+
+def test_the_router_base_url_is_not_a_url_any_other_provider_answers() -> None:
+    """The discriminator for the pin above, and the claim
+    `test_build_model_ignores_ambient_openai_env_vars` was trying to make: a
+    redirect is only detectable if the thing redirected *to* is known to be
+    somewhere else."""
+    assert "huggingface" in HF_ROUTER_BASE_URL
+    assert "openai.com" not in HF_ROUTER_BASE_URL

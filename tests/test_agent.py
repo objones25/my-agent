@@ -27,10 +27,11 @@ from langchain.agents.middleware import TodoListMiddleware
 from langchain.tools import ToolRuntime
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.language_models.fake_chat_models import ParrotFakeChatModel
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
+from langgraph.errors import GraphRecursionError
 from langgraph.graph.state import CompiledStateGraph
 from pydantic import SecretStr
 
@@ -38,11 +39,13 @@ from my_agent.agent import KNOWN_CREATE_DEEP_AGENT_PARAMS, AgentConfig, _agent_k
 from my_agent.capabilities import (
     COMPACTION_TRIGGER_TOKENS,
     DEFAULT_FILESYSTEM_TOOLS,
-    LIBRARY_SUBAGENT_STEP_LIMIT,
+    LIBRARY_STEP_LIMIT,
+    PARENT_STEP_LIMIT,
     SHELL_TOOL_NAME,
     SUBAGENT_STEP_LIMIT,
     SUBAGENT_TASK_TOOL_NAME,
     TASK_DISPATCH_LIMIT,
+    bound_step_limit,
     call_limits,
     compiled_tool_names,
     compiled_tools,
@@ -453,15 +456,47 @@ def test_build_agent_fails_when_a_subagent_re_grants_the_shell_tool(
         build_agent(build_model(ModelConfig(api_key=valid_secret)), AgentConfig(subagents=[owned]))
 
 
-def test_build_agent_fails_when_the_subagent_reader_finds_nothing(
+def test_build_agent_fails_when_there_is_no_subagent_to_bind_a_limit_onto(
     valid_secret: SecretStr, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """An empty mapping from the reader means the `task` tool vanished. That is
-    a structural change worth failing on, not a licence to skip the check."""
+    a structural change worth failing on, not a licence to skip the check.
+
+    `match="subagent"` used to be the whole assertion, and it matched *two*
+    different failures: this one, and the vacuity guard in
+    `_require_shell_withheld`. Traced 2026-09-21 — the raise that actually fires
+    on this path is `_bounded_general_purpose_subagent`'s, because it runs
+    first. The vacuity guard has its own test below, which has to arrange for
+    this one to be skipped before it can reach it.
+    """
     monkeypatch.setattr("my_agent.agent.subagent_graphs", lambda _agent: {})
 
-    with pytest.raises(CheckFailed, match="subagent"):
+    with pytest.raises(CheckFailed, match="bind a step limit onto"):
         build_agent(build_model(ModelConfig(api_key=valid_secret)))
+
+
+def test_build_agent_refuses_a_vacuous_subagent_allowlist_check(
+    valid_secret: SecretStr, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The guard the test above was credited with and never reached.
+
+    `_require_shell_withheld` reads every subagent graph back and asserts
+    `execute` is absent from each. An empty mapping satisfies "absent from each"
+    without inspecting anything, so the guard refuses it — and reaching that
+    guard needs the earlier raise skipped, which a caller-supplied
+    `general-purpose` spec does.
+    """
+    spec: Any = {
+        "name": "general-purpose",
+        "description": "mine",
+        "tools": [],
+        "middleware": [least_privilege_filesystem(None)],
+    }
+    config = AgentConfig(subagents=[spec])
+    monkeypatch.setattr("my_agent.agent.subagent_graphs", lambda _agent: {})
+
+    with pytest.raises(CheckFailed, match="vacuous"):
+        build_agent(build_model(ModelConfig(api_key=valid_secret)), config)
 
 
 def _tool_runtime() -> ToolRuntime[None, Any]:
@@ -593,14 +628,24 @@ def test_build_agent_refuses_a_middleware_permission_combination_that_drops_rule
 
 def test_agent_config_fields_are_all_real_create_deep_agent_parameters() -> None:
     accepted = set(inspect.signature(create_deep_agent).parameters)
+    kwargs = AgentConfig().as_kwargs()
 
-    assert set(AgentConfig().as_kwargs()) <= accepted
+    # A subset assertion is vacuously true of an empty dict: with `as_kwargs`
+    # stubbed to `return {}` this passed (measured 2026-09-21), reporting a
+    # contract held over no fields at all.
+    assert set(kwargs) == {f.name for f in dataclasses.fields(AgentConfig)}
+    assert set(kwargs) <= accepted
 
 
 def test_agent_config_does_not_carry_the_factory_injected_parameter() -> None:
     """`model` is supplied by build_agent. A field of that name would collide on
     splat."""
-    assert "model" not in AgentConfig().as_kwargs()
+    kwargs = AgentConfig().as_kwargs()
+
+    # Absence proves nothing about an empty mapping — the same vacuity
+    # `require_withheld` refuses in `src/`.
+    assert kwargs
+    assert "model" not in kwargs
 
 
 def test_adding_a_setting_needs_no_factory_change() -> None:
@@ -609,6 +654,7 @@ def test_adding_a_setting_needs_no_factory_change() -> None:
     extended = AgentConfig(name="extended")
     kwargs = {**extended.as_kwargs(), "skills": ["./skills/"], "memory": ["./AGENTS.md"]}
 
+    assert {"skills", "memory", "name"} <= set(kwargs)
     assert set(kwargs) <= set(inspect.signature(create_deep_agent).parameters)
 
 
@@ -668,8 +714,8 @@ def test_a_bare_deep_agent_leaves_its_subagent_at_the_library_default() -> None:
 
     graph = subagent_graphs(bare)["general-purpose"]
 
-    assert (graph.config or {}).get("recursion_limit") == LIBRARY_SUBAGENT_STEP_LIMIT
-    assert LIBRARY_SUBAGENT_STEP_LIMIT > SUBAGENT_STEP_LIMIT
+    assert (graph.config or {}).get("recursion_limit") == LIBRARY_STEP_LIMIT
+    assert LIBRARY_STEP_LIMIT > SUBAGENT_STEP_LIMIT
 
 
 def test_the_bounded_subagent_is_still_on_the_parents_filesystem() -> None:
@@ -719,7 +765,7 @@ def test_a_caller_supplied_subagent_keeps_its_own_step_limit() -> None:
 
     graph = subagent_graphs(agent)["general-purpose"]
 
-    assert (graph.config or {}).get("recursion_limit") == LIBRARY_SUBAGENT_STEP_LIMIT
+    assert (graph.config or {}).get("recursion_limit") == LIBRARY_STEP_LIMIT
 
 
 def test_a_caller_supplied_subagent_cannot_re_grant_the_shell_tool() -> None:
@@ -813,3 +859,88 @@ def test_a_bare_deep_agent_has_no_call_limits() -> None:
     nodes = set(create_deep_agent(model=ParrotFakeChatModel()).nodes)
 
     assert not any("ToolCallLimit" in n for n in nodes)
+
+
+# --------------------------------------------------------------------------
+# The parent's own step limit (F39)
+# --------------------------------------------------------------------------
+
+
+def test_the_parent_graph_carries_our_step_limit_not_the_librarys() -> None:
+    """The half of F24 that was never recorded.
+
+    `create_agent` binds `recursion_limit: 9999` on *every* graph it compiles,
+    the parent included — so a caller who invokes the compiled agent directly,
+    without going through `run_turn`, inherits 9999 rather than langchain-core's
+    25. Measured 2026-09-21 before the fix: a one-call-per-turn fake ran **3,325
+    model calls** on a bare `agent.invoke(...)` before langgraph stopped it.
+    """
+    agent = build_agent(ParrotFakeChatModel())
+
+    assert bound_step_limit(agent) == PARENT_STEP_LIMIT
+
+
+def test_a_bare_deep_agent_leaves_its_parent_at_the_library_default() -> None:
+    """The discriminator. Without it the test above keeps passing on the day
+    langchain picks a small number for its own reasons, and a limit we merely
+    agree with reads as a limit we set."""
+    bare = create_deep_agent(model=ParrotFakeChatModel())
+
+    assert bound_step_limit(bare) == LIBRARY_STEP_LIMIT
+    assert LIBRARY_STEP_LIMIT > PARENT_STEP_LIMIT
+
+
+class NeverStopsCallingATool(BaseChatModel):
+    """Asks for one `ls` every turn and never answers.
+
+    Deliberately *not* `AlwaysDispatchesSubagents`: a `task` dispatch hits
+    `SUBAGENT_STEP_LIMIT` and raises through the tool call, aborting the parent
+    long before the parent's own limit is reached — so a test built on it passes
+    whatever the parent is bound to. An ordinary tool has no such escape. The
+    call limits do not end the loop either: both run `exit_behavior="continue"`,
+    so past `TOOL_CALL_LIMIT` the call is blocked, the model is handed an error
+    and asks again. Nothing but the step limit stops this.
+    """
+
+    calls: int = 0
+
+    @property
+    def _llm_type(self) -> str:
+        return "never-stops"
+
+    def bind_tools(self, tools: Any, **kwargs: Any) -> BaseChatModel:
+        return self
+
+    def _generate(self, messages: Any, stop: Any = None, run_manager: Any = None, **kw: Any) -> Any:
+        self.calls += 1
+        call = {"name": "ls", "args": {}, "id": f"l{self.calls}"}
+        return ChatResult(generations=[ChatGeneration(message=AIMessage("", tool_calls=[call]))])
+
+
+def test_a_bare_invoke_of_our_agent_is_bounded_without_run_turn() -> None:
+    """Reading the config back is not the claim; stopping is.
+
+    `run_turn` is the sanctioned path and sends the limit itself, so this covers
+    the caller who does not take it. Measured 2026-09-21 before the bind: this
+    same loop ran **3,325** model calls before langgraph stopped it.
+    """
+    model = NeverStopsCallingATool()
+    agent = build_agent(model)
+
+    with pytest.raises(GraphRecursionError):
+        agent.invoke({"messages": [HumanMessage("loop")]})
+
+    assert model.calls <= PARENT_STEP_LIMIT
+
+
+def test_run_turn_still_overrides_the_parents_bound_limit() -> None:
+    """The discriminator for the bind: a compile-time floor must not become a
+    ceiling. langgraph lets a top-level invoke config beat the graph's own bound
+    config, which is the whole reason `RunBounds.step_limit` still means
+    something — so a caller asking for fewer steps must still get fewer."""
+    model = NeverStopsCallingATool()
+
+    with pytest.raises(StepLimitExceeded):
+        run_turn(build_agent(model), "loop", bounds=RunBounds(step_limit=4))
+
+    assert model.calls < PARENT_STEP_LIMIT

@@ -160,10 +160,21 @@ def test_record_order_is_event_order(mirror: JsonlMirror, stream: io.StringIO) -
 def test_long_values_are_truncated_and_marked(
     mirror: JsonlMirror, stream: io.StringIO
 ) -> None:
-    mirror.on_tool_end("x" * (MAX_FIELD_CHARS * 2), run_id=RUN_ID)
+    """Literals, not a fixture sized from the constant under test.
+
+    `"x" * (MAX_FIELD_CHARS * 2)` with `len(...) == MAX_FIELD_CHARS` moves both
+    goalposts together, so no value of `MAX_FIELD_CHARS` could turn this red —
+    measured 2026-09-21 at 200 instead of 4000, a 20x loss of log fidelity, with
+    all 51 mirror tests still green. The guard is what keeps the literal honest
+    if the bound is ever deliberately raised past it.
+    """
+    assert MAX_FIELD_CHARS == 4000, "the literals below are sized for this bound"
+
+    mirror.on_tool_end("x" * 9000, run_id=RUN_ID)
+
     written = records(stream)[0]
     assert written["truncated"] is True
-    assert len(written["output"]) == MAX_FIELD_CHARS
+    assert len(written["output"]) == 4000
 
 
 def test_short_values_are_not_marked_truncated(
@@ -243,6 +254,13 @@ def test_the_serialized_blob_is_never_written(
         [[HumanMessage("ping")]],
         run_id=RUN_ID,
     )
+    # The absence is only evidence if a record was written at all: with
+    # `on_chat_model_start` stubbed out entirely this assertion passed on an
+    # empty stream (measured 2026-09-21), reporting a credential kept out of a
+    # log nothing had written to.
+    written = records(stream)
+    assert len(written) == 1
+    assert written[0]["event"] == "chat_model_start"
     assert "hf_super_secret" not in stream.getvalue()
 
 

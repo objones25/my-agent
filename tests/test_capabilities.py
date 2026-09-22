@@ -23,11 +23,13 @@ from deepagents import (
 )
 from deepagents.backends import FilesystemBackend, StateBackend
 from deepagents.backends.protocol import SandboxBackendProtocol
+from deepagents.middleware import _prompt_caching
 from deepagents.middleware.summarization import (
     compute_summarization_defaults,
     create_summarization_middleware,
 )
 from deepagents.profiles import _builtin_profiles
+from langchain.agents.middleware import ToolCallLimitMiddleware
 from langchain_core.language_models import BaseChatModel
 from langchain_core.language_models.fake_chat_models import ParrotFakeChatModel
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
@@ -41,12 +43,16 @@ from my_agent.capabilities import (
     COMPACTION_KEEP_MESSAGES,
     COMPACTION_TRIGGER_TOKENS,
     CONTEXT_WINDOW_TOKENS,
+    DEEPAGENTS_CACHING_PROBE_MODULES,
     DEEPAGENTS_PLUGIN_GROUPS,
     DEFAULT_FILESYSTEM_TOOLS,
     GREP_MATCH_LIMIT,
     HUMAN_MESSAGE_TOKEN_LIMIT,
     LIBRARY_COMPACTION_TRIGGER_TOKENS,
+    LIBRARY_STEP_LIMIT,
+    PARENT_STEP_LIMIT,
     SHELL_TOOL_NAME,
+    SUBAGENT_STEP_LIMIT,
     SUBAGENT_TASK_TOOL_NAME,
     TASK_DISPATCH_LIMIT,
     TOOL_CALL_LIMIT,
@@ -54,6 +60,7 @@ from my_agent.capabilities import (
     bounded_compaction,
     call_limits,
     compiled_tool_names,
+    installed_caching_probes,
     least_privilege_filesystem,
     require_granted,
     require_withheld,
@@ -400,10 +407,18 @@ def test_the_task_limit_is_tighter_than_the_overall_tool_limit() -> None:
 
 def test_call_limits_are_per_run_not_per_thread() -> None:
     """A thread limit needs a checkpointer to mean anything, and the graph
-    carries none by default — it would be a bound that never counts."""
-    for middleware in call_limits():
-        assert middleware.thread_limit is None
-        assert middleware.run_limit is not None
+    carries none by default — it would be a bound that never counts.
+
+    Only `run_limit` is asserted here. `thread_limit is None` used to be the
+    other half, but `call_limits()` never passes `thread_limit`, so that was an
+    assertion about langchain's default rather than about any code in this repo;
+    that it is *not passed* is recorded where it can fail, on the call itself
+    (`test_the_call_limits_state_their_exit_behavior_rather_than_inheriting_it`).
+    """
+    limits = call_limits()
+
+    assert len(limits) == 2
+    assert [m.run_limit for m in limits] == [TOOL_CALL_LIMIT, TASK_DISPATCH_LIMIT]
 
 
 def test_call_limits_block_rather_than_abort() -> None:
@@ -813,3 +828,105 @@ def test_a_huge_human_message_that_is_not_last_is_never_evicted() -> None:
     ]
     assert evicted == []
     assert any(len(m.text) == len(huge) for m in out["messages"] if isinstance(m, HumanMessage))
+
+
+# --------------------------------------------------------------------------
+# The caching-middleware door (F41)
+# --------------------------------------------------------------------------
+
+
+def test_no_provider_caching_package_is_installed() -> None:
+    """The second door the entry-point pin cannot cover.
+
+    `DEEPAGENTS_PLUGIN_GROUPS` catches a package that *registers* itself.
+    deepagents' `append_prompt_caching_middleware` registers nothing: it
+    `import_module`s `langchain_aws` and `langchain_fireworks` by name and
+    appends their caching middleware to the parent, to every subagent spec and
+    to `general-purpose` when the import succeeds. Installing either as anyone's
+    transitive dependency adds middleware to every graph, through no entry point
+    and no parameter.
+    """
+    assert installed_caching_probes() == ()
+
+
+def test_the_probe_modules_are_the_names_deepagents_actually_imports() -> None:
+    """A pin on the wrong module name is a pin on nothing."""
+    source = inspect.getsource(_prompt_caching)
+
+    for module in DEEPAGENTS_CACHING_PROBE_MODULES:
+        assert f'"{module}' in source
+
+
+def test_deepagents_appends_anthropic_caching_middleware_unconditionally() -> None:
+    """The part of this door that cannot be pinned shut, recorded instead.
+
+    `AnthropicPromptCachingMiddleware` is appended whatever the model is — there
+    is no probe to fail and no package to leave uninstalled. It is harmless
+    today only because deepagents constructs it with
+    `unsupported_model_behavior="ignore"`, and that argument is load-bearing:
+    `"warn"` plus this repo's `filterwarnings = ["error"]` would turn every
+    model call into a failed test.
+    """
+    appended: list[Any] = []
+    _prompt_caching.append_prompt_caching_middleware(appended)
+
+    assert [type(m).__name__ for m in appended] == ["AnthropicPromptCachingMiddleware"]
+    assert appended[0].unsupported_model_behavior == "ignore"
+
+
+# --------------------------------------------------------------------------
+# The decisions themselves (F42)
+# --------------------------------------------------------------------------
+
+
+def test_the_call_limits_state_their_exit_behavior_rather_than_inheriting_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same discrimination `least_privilege_filesystem` already gets.
+
+    `ToolCallLimitMiddleware.__init__` defaults `exit_behavior` to `"continue"`,
+    so reading it back off the built middleware cannot tell "we chose it" from
+    "we inherited it": deleting the argument from both constructor calls left
+    all 376 tests green (measured 2026-09-21). The call is where the difference
+    shows. `thread_limit` is asserted as *not passed* for the same reason — the
+    old test asserted `thread_limit is None`, which is a claim about the
+    library's default, not about code that exists here.
+    """
+    calls: list[dict[str, Any]] = []
+
+    def recording(**kwargs: Any) -> ToolCallLimitMiddleware:
+        calls.append(kwargs)
+        return ToolCallLimitMiddleware(**kwargs)
+
+    monkeypatch.setattr("my_agent.capabilities.ToolCallLimitMiddleware", recording)
+
+    call_limits()
+
+    assert [c.get("exit_behavior") for c in calls] == ["continue", "continue"]
+    assert [c.get("run_limit") for c in calls] == [TOOL_CALL_LIMIT, TASK_DISPATCH_LIMIT]
+    assert [c.get("tool_name") for c in calls] == [None, SUBAGENT_TASK_TOOL_NAME]
+    assert not any("thread_limit" in c for c in calls)
+
+
+def test_the_capability_bounds_are_the_numbers_that_were_chosen() -> None:
+    """Literals, because every other test compares a constant to itself.
+
+    Measured 2026-09-21: five constants across `model.py` and `run.py` were
+    changed at once — including the router base URL to `api.openai.com` — and
+    the whole suite stayed green, because each test read the value back from the
+    same symbol it came from. A pin is only a pin when the expected value is
+    written down somewhere the mutation cannot reach. Changing any number below
+    must make this test red and force the change to be deliberate.
+    """
+    assert PARENT_STEP_LIMIT == 25
+    assert SUBAGENT_STEP_LIMIT == 25
+    assert LIBRARY_STEP_LIMIT == 9999
+    assert TOOL_CALL_LIMIT == 24
+    assert TASK_DISPATCH_LIMIT == 3
+    assert GREP_MATCH_LIMIT == 1000
+    assert TOOL_RESULT_TOKEN_LIMIT == 20000
+    assert HUMAN_MESSAGE_TOKEN_LIMIT == 50000
+    assert CONTEXT_WINDOW_TOKENS == 128_000
+    assert COMPACTION_TRIGGER_TOKENS == 96_000
+    assert COMPACTION_KEEP_MESSAGES == 6
+    assert COMPACTION_ARG_TRUNCATION_MESSAGES == 20

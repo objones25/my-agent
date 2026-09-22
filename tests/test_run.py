@@ -38,6 +38,7 @@ from my_agent.mirror import JsonlMirror
 from my_agent.model import ModelConfig, build_model
 from my_agent.negative_space import CheckFailed
 from my_agent.run import (
+    DEFAULT_RUN_BOUNDS,
     RECURSION_LIMIT,
     RESUME_LIMIT,
     RUN_DEADLINE_S,
@@ -1386,3 +1387,62 @@ def test_duplicate_tool_call_ids_let_one_result_answer_two_calls() -> None:
     result = run_turn(agent, "next", history=history)
 
     assert result[-1].text == "done"
+
+
+# --------------------------------------------------------------------------
+# What the agent actually wrote (F40)
+# --------------------------------------------------------------------------
+
+
+def test_a_turn_surfaces_the_files_the_agent_wrote() -> None:
+    """The read-back the harness already had and threw away.
+
+    deepagents' `StateBackend` puts the agent's filesystem in graph state, so
+    every `invoke` returns `files` alongside `messages`. `_invoke` took the
+    messages and dropped the rest, `TurnResult` had nowhere to put it and the
+    mirror records the state's *key names* only — so the one deterministic
+    artifact a turn produces, the object the agent claims to have created, was
+    visible nowhere.
+    """
+    model = FanningOutModel(width=2, turns_before_answering=1)
+
+    result = run_turn(build_agent(model), "write two files")
+
+    assert sorted(result.files) == ["/f1-0.txt", "/f1-1.txt"]
+    assert result.files["/f1-0.txt"]["content"] == "x"
+
+
+def test_a_turn_that_wrote_nothing_reports_no_files() -> None:
+    """The discriminator. Without it the assertion above is satisfied by any
+    non-empty mapping, and a `files` that simply echoed state would read as
+    proof the agent did something."""
+    result = run_turn(FakeGraph(), "say hello")
+
+    assert result.files == {}
+
+
+def test_the_run_bounds_are_the_values_that_were_chosen() -> None:
+    """Literals, for the reason `test_model.py` now pins the router defaults.
+
+    Measured 2026-09-21: `RUN_DEADLINE_S` 600.0 -> 6000.0 and `TOKEN_LIMIT`
+    500_000 -> 5_000_000 left all 376 tests green, because every test that reads
+    a bound compares it to the same module constant it came from — including the
+    two that pass the constant in as the budget, so the goalposts move together.
+    `RECURSION_LIMIT` was the one already pinned, incidentally, by the
+    `match="25 steps"` literal further up this file.
+    """
+    assert RECURSION_LIMIT == 25
+    assert RUN_DEADLINE_S == 600.0
+    assert TOKEN_LIMIT == 500_000
+    assert RESUME_LIMIT == 3
+
+
+def test_the_default_bounds_object_carries_those_same_values() -> None:
+    """The pin above is on the constants; this is on the object every turn
+    actually runs under. A `RunBounds` field that stopped defaulting to its
+    constant would leave the first test green and every run unbounded by the
+    number it names."""
+    assert DEFAULT_RUN_BOUNDS.step_limit == 25
+    assert DEFAULT_RUN_BOUNDS.deadline_s == 600.0
+    assert DEFAULT_RUN_BOUNDS.token_limit == 500_000
+    assert DEFAULT_RUN_BOUNDS.resume_limit == 3

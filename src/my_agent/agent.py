@@ -51,6 +51,7 @@ from langgraph.graph.state import CompiledStateGraph
 
 from my_agent.capabilities import (
     GENERAL_PURPOSE_SUBAGENT_NAME,
+    PARENT_STEP_LIMIT,
     SHELL_TOOL_NAME,
     SUBAGENT_STEP_LIMIT,
     bound_step_limit,
@@ -488,4 +489,20 @@ def build_agent(
     # there is no allowlist of ours left to assert.
     if not _replaces_filesystem_middleware(agent_config):
         _require_shell_withheld(agent)
-    return agent
+
+    # The floor under `RunBounds.step_limit`, and the other half of F24.
+    # `create_agent` binds `recursion_limit: 9999` onto every graph it compiles,
+    # the parent included — so a caller who invokes this graph without going
+    # through `run_turn` inherited 9999, not langchain-core's 25. `run_turn`
+    # itself is unaffected either way: it sends the limit on the invocation, and
+    # a top-level invoke config beats the graph's own bound config. This binds
+    # the fallback for the caller who does not take that path.
+    bounded_agent = agent.with_config({"recursion_limit": PARENT_STEP_LIMIT})
+    # Postcondition: `with_config` returns a copy, so asserting on `agent` would
+    # pass while the object actually handed back kept the library's limit.
+    require(
+        bound_step_limit(bounded_agent) == PARENT_STEP_LIMIT,
+        f"binding the parent step limit did not take: wanted {PARENT_STEP_LIMIT}, "
+        f"graph carries {bound_step_limit(bounded_agent)}",
+    )
+    return bounded_agent

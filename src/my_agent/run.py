@@ -294,6 +294,27 @@ class TurnResult:
     make this number grow while they think.
     """
 
+    files: Mapping[str, Any] = field(default_factory=dict)
+    """The agent's filesystem as it stood when the turn returned.
+
+    **The read-back this harness already had.** deepagents' `StateBackend` keeps
+    the filesystem in graph state, so every `invoke` returns `files` beside
+    `messages`; `_invoke` took the messages and dropped the rest, and the mirror
+    records the state's key *names* only. So the one deterministic artifact a
+    turn produces — the object the agent claims to have created — was visible
+    nowhere, while `CLAUDE.md` argued the verification ladder was blocked on a
+    domain it does not need (F40).
+
+    A fact about the run, like `failed_tool_calls`, not a judgement: nothing here
+    compares it against what the model *said* it wrote, because what the agent
+    should have produced is the domain's question. What it did produce is this.
+
+    Empty means the graph reported no filesystem — a turn that wrote nothing, or
+    a graph with no `StateBackend` at all. Those are not distinguished, so an
+    emptiness assertion on its own proves nothing; pair it with a turn that does
+    write, the way `require_withheld` refuses a vacuous absence.
+    """
+
     resumes: int = 0
     """How many times this turn has already been resumed.
 
@@ -675,6 +696,11 @@ def _invoke(  # noqa: PLR0913 — one parameter per thing an invocation carries:
     require(isinstance(result, dict), f"agent returned a {type(result).__name__}, not a mapping")
     require("messages" in result, f"agent returned no messages key: {sorted(result)}")
     messages: list[BaseMessage] = result["messages"]
+    # Not a `require`: a fake graph in a test carries no filesystem, and a
+    # `StateBackend` that has never been written to reports none either. Absence
+    # is a legitimate state, so it is defaulted rather than refused.
+    raw_files = result.get("files", {})
+    files: Mapping[str, Any] = raw_files if isinstance(raw_files, Mapping) else {}
 
     raw = result.get("__interrupt__", ())
     interrupts = tuple(i for i in raw if isinstance(i, Interrupt))
@@ -706,6 +732,11 @@ def _invoke(  # noqa: PLR0913 — one parameter per thing an invocation carries:
         thread_id=thread_id,
         elapsed_s=(spent.elapsed_s if spent is not None else 0.0) + deadline.elapsed_s,
         tokens=(spent.tokens if spent is not None else 0) + budget.tokens,
+        # Not accumulated across a pause the way the budgets are: the filesystem
+        # is state, so what the graph reports on the resume is already the whole
+        # of it, and adding the earlier half back would double-count a file the
+        # agent edited twice.
+        files=files,
         resumes=spent.resumes + 1 if spent is not None else 0,
     )
 
