@@ -37,6 +37,7 @@ from my_agent.model import (
     USE_RESPONSES_API,
     ModelConfig,
     build_model,
+    require_env_fields_cover_the_config,
 )
 from my_agent.negative_space import CheckFailed
 
@@ -451,3 +452,50 @@ def test_build_model_refuses_a_setting_the_client_overrode(
 
     with pytest.raises(CheckFailed, match=expected):
         build_model(ModelConfig(api_key=valid_secret))
+
+
+# --------------------------------------------------------------------------
+# The env-coverage contract
+#
+# Expressed as a function rather than three checks at module level, because
+# both sides are defined in `model.py` itself: no patch a test could apply
+# reaches them, and reloading the module to force one false would rebind
+# `ModelConfig` and break `isinstance` across the suite (F44).
+# --------------------------------------------------------------------------
+
+
+def test_env_coverage_refuses_a_config_field_no_variable_reaches() -> None:
+    """The check that caught the original defect: `_ENV_FIELDS` covered three of
+    seven fields, so `base_url` was unreachable from the environment while this
+    module's docstring promised a dedicated endpoint needed no code change."""
+    with pytest.raises(CheckFailed, match="unreachable from the environment"):
+        require_env_fields_cover_the_config({"api_key", "base_url"}, ())
+
+
+def test_env_coverage_refuses_a_row_that_is_not_a_config_field() -> None:
+    """The other direction: a row naming a field that no longer exists would set
+    an attribute nothing reads, silently."""
+    with pytest.raises(CheckFailed, match="not ModelConfig fields"):
+        require_env_fields_cover_the_config(set(), _ENV_FIELDS[:1])
+
+
+def test_env_coverage_refuses_two_rows_sharing_a_variable() -> None:
+    """One would shadow the other, so a documented variable would stop working
+    with nothing to say so."""
+    first = _ENV_FIELDS[0]
+    twin = dataclasses.replace(first, name="other")
+
+    with pytest.raises(CheckFailed, match="share an environment variable"):
+        require_env_fields_cover_the_config({first.name, "other"}, (first, twin))
+
+
+def test_the_shipped_env_fields_cover_every_config_field(
+    assert_does_not_raise: Callable[[Callable[[], object]], None],
+) -> None:
+    """The discriminator. Each test above proves the guard can fail; this proves
+    the pair it actually guards passes it."""
+    assert_does_not_raise(
+        lambda: require_env_fields_cover_the_config(
+            {f.name for f in dataclasses.fields(ModelConfig)}, _ENV_FIELDS
+        )
+    )

@@ -63,7 +63,7 @@ from my_agent.capabilities import (
     require_withheld,
     subagent_graphs,
 )
-from my_agent.contracts import check_config_contract
+from my_agent.contracts import check_config_contract, check_known_parameters
 from my_agent.negative_space import CheckFailed, require
 
 __all__ = [
@@ -123,19 +123,13 @@ parameter fails this import, by name, instead of changing behaviour quietly.
 Adding the name here is the deliberate acceptance.
 """
 
-_NEW_PARAMS = _CREATE_DEEP_AGENT_PARAMS - KNOWN_CREATE_DEEP_AGENT_PARAMS
-require(
-    not _NEW_PARAMS,
-    f"create_deep_agent gained parameters {sorted(_NEW_PARAMS)}. Review each for what it "
-    f"enables by default before adding it to KNOWN_CREATE_DEEP_AGENT_PARAMS — this is the "
-    f"same door the shell `execute` tool came through (F4).",
-)
-
-_REMOVED_PARAMS = KNOWN_CREATE_DEEP_AGENT_PARAMS - _CREATE_DEEP_AGENT_PARAMS
-require(
-    not _REMOVED_PARAMS,
-    f"create_deep_agent no longer accepts {sorted(_REMOVED_PARAMS)}; "
-    f"AgentConfig and this pin must change together",
+check_known_parameters(
+    _CREATE_DEEP_AGENT_PARAMS,
+    KNOWN_CREATE_DEEP_AGENT_PARAMS,
+    "create_deep_agent",
+    "Review each for what it enables by default before adding it to "
+    "KNOWN_CREATE_DEEP_AGENT_PARAMS — this is the same door the shell `execute` tool "
+    "came through (F4).",
 )
 
 KNOWN_OUTPUT_STATE_KEYS = frozenset({"files", "messages", "structured_response"})

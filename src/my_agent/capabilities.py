@@ -56,6 +56,7 @@ __all__ = [
     "compiled_tools",
     "installed_caching_probes",
     "least_privilege_filesystem",
+    "require_compaction_fits_the_window",
     "require_granted",
     "require_withheld",
     "subagent_graphs",
@@ -380,15 +381,28 @@ require(
     f"passing through create_deep_agent. Review what it grants, then allow it here.",
 )
 
+def require_compaction_fits_the_window(trigger: int, window: int) -> None:
+    """Fail unless compaction can fire before the provider refuses the request.
+
+    A function rather than a bare check at module level, for the reason
+    `contracts.check_config_contract` is one: both numbers are hand-edited
+    constants *in this file*, so no patch a test can apply reaches them and the
+    check would be the one kind that can never be driven. Called below with the
+    real pair, so the load-time guarantee is unchanged.
+    """
+    require(trigger > 0, f"the compaction trigger must be positive, got {trigger}")
+    require(
+        trigger < window,
+        f"the compaction trigger ({trigger}) must leave room below the context window we "
+        f"assume ({window}); at or above it, compaction can only fire after a provider has "
+        f"already refused the request",
+    )
+
+
 # A trigger at or above the window can only fire once the request has already
 # been rejected, which is the state this constant exists to leave. Checked here
 # rather than trusted, because both numbers are edited by hand.
-require(
-    0 < COMPACTION_TRIGGER_TOKENS < CONTEXT_WINDOW_TOKENS,
-    f"the compaction trigger ({COMPACTION_TRIGGER_TOKENS}) must leave room below the "
-    f"context window we assume ({CONTEXT_WINDOW_TOKENS}); at or above it, compaction can "
-    f"only fire after a provider has already refused the request",
-)
+require_compaction_fits_the_window(COMPACTION_TRIGGER_TOKENS, CONTEXT_WINDOW_TOKENS)
 
 # Every threshold `bounded_compaction` sets has to still be a parameter. These
 # are not defaults we agree with — they are values we override — so unlike

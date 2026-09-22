@@ -1116,3 +1116,8 @@ def test_build_agent_rejects_a_config_that_is_not_an_agent_config() -> None:
     `AgentConfig.__post_init__` performs."""
     with pytest.raises(CheckFailed, match="expected an AgentConfig"):
         build_agent(ParrotFakeChatModel(), cast(Any, {"name": "mine"}))
+
+
+# --------------------------------------------------------------------------
+# The load-time pins, driven
+# --------------------------------------------------------------------------

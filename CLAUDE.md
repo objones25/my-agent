@@ -1,7 +1,7 @@
 # CLAUDE.md
 
 Guidance for Claude Code in this repository. `README.md` says what the project is; this is the
-contributor's contract, and **`docs/findings.md` (F1–F42) is the evidence behind it** — read it
+contributor's contract, and **`docs/findings.md` (F1–F44) is the evidence behind it** — read it
 before debugging anything that looks like a library bug, and add to it when you verify something
 new.
 
@@ -264,7 +264,7 @@ Bugs live in the states the code was never written to handle. Write those down a
 
 ## Testing and evals
 
-Keep them apart. 437 offline tests and 2 live as of 2026-09-22.
+Keep them apart. 462 offline tests and 2 live as of 2026-09-22.
 
 - **Unit tests** (`tests/`, default selection) are deterministic and offline. One test file per
   source module; a new module gets a new file, not an extra section in an existing one. They test
@@ -282,10 +282,22 @@ Keep them apart. 437 offline tests and 2 live as of 2026-09-22.
 
   Nothing else in `src/` has an untripped check. **Keep it that way**: a new `require()` lands with
   the test that trips it, or the count above stops being true and nobody notices, which is the
-  failure this project spent a branch measuring. Two techniques cover almost everything — a bad
-  argument for a precondition, and `monkeypatch` on the name the module actually calls for a
-  read-back postcondition, building the real library object and then dropping one setting
-  (`_forgetful_filesystem` in `tests/test_capabilities.py` is the pattern).
+  failure this project spent a branch measuring. Three techniques cover all of it — a bad
+  argument for a precondition; `monkeypatch` on the name the module actually calls for a read-back
+  postcondition, building the real library object and then dropping one setting
+  (`_forgetful_filesystem` in `tests/test_capabilities.py` is the pattern); and, for a check that
+  runs at *import*, the `tripping_an_import_time_check` fixture, which patches the library and
+  re-imports.
+
+- **A load-time check belongs in a function, not at module level.** Module-level is only drivable by
+  `importlib.reload`, and a reload **rebinds every class the module defines** — so
+  `isinstance(cfg, AgentConfig)` inside the reloaded module fails against an instance any other test
+  module is holding, and reads `expected an AgentConfig, got AgentConfig`. Measured: 15 unrelated
+  tests went red that way, **none of them when run alone** (F44). The fixture now refuses to reload
+  a module that defines classes, and `contracts.check_known_parameters` /
+  `check_required_parameters` / `capabilities.require_compaction_fits_the_window` /
+  `model.require_env_fields_cover_the_config` are the shape to copy: called at import, so the
+  guarantee is unchanged, and callable by a test with bad arguments.
 
   Two traps met while doing it. **A `require()` message is evaluated whether or not the check
   fails** — `require(cond, f"...{read_back(x)}")` calls `read_back` every time, which is why
@@ -462,7 +474,7 @@ Everything in this table lives in `src/my_agent/`.
 `tests/` mirrors that one file per module, offline by default, plus `conftest.py` for shared
 fixtures and the socket guard. The only `-m live` tests are one each at the end of `test_tracing.py`
 (calls the real `weave.init()` and hits the router) and `test_run.py` (proves multi-turn history
-against a real graph, which a fake cannot show). `evals/` is empty. `docs/findings.md` holds F1–F38
+against a real graph, which a fake cannot show). `evals/` is empty. `docs/findings.md` holds F1–F44
 plus the repo-gates, deepagents-surface, test-infrastructure and observability appendices;
 `scripts/audit_negative_space.py` is **vendored** from the negative-space-programming skill — do not
 hand-edit it, refresh by re-copying (it is excluded from ruff and mypy).

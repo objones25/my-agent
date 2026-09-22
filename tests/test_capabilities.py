@@ -7,13 +7,17 @@ not control, so both are stated here as well as at import time.
 
 from __future__ import annotations
 
+import importlib.metadata
+import importlib.util
 import inspect
 from collections.abc import Callable
 from importlib.metadata import entry_points
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast, get_args
+from typing import Any, Literal, cast, get_args
 
+import deepagents
+import deepagents.middleware
 import pytest
 from deepagents import (
     FilesystemMiddleware,
@@ -37,6 +41,7 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 from langgraph.graph.state import CompiledStateGraph
 from pydantic import Field, SecretStr
 
+import my_agent.capabilities
 from my_agent.agent import AgentConfig, build_agent
 from my_agent.capabilities import (
     COMPACTION_ARG_TRUNCATION_MESSAGES,
@@ -64,6 +69,7 @@ from my_agent.capabilities import (
     compiled_tool_names,
     installed_caching_probes,
     least_privilege_filesystem,
+    require_compaction_fits_the_window,
     require_granted,
     require_withheld,
     subagent_graphs,
@@ -1120,3 +1126,202 @@ def test_the_output_key_reader_refuses_a_schema_declaring_nothing() -> None:
 
     with pytest.raises(CheckFailed, match="declares no keys"):
         compiled_output_keys(graph)
+
+
+# --------------------------------------------------------------------------
+# The load-time pins, driven
+#
+# These run when the package is imported, so no ordinary test can make one
+# false. `tripping_an_import_time_check` patches the library and re-imports,
+# which is the only way to see them fail — and the only way to know they are
+# checking what they claim rather than passing because the wheel happens to
+# agree.
+# --------------------------------------------------------------------------
+
+
+def test_the_allowlist_refuses_a_deepagents_that_dropped_the_shell_tool(
+    tripping_an_import_time_check: Callable[..., None],
+) -> None:
+    """`DEFAULT_FILESYSTEM_TOOLS` is defined by *subtracting* `execute`. If
+    deepagents stopped offering it, the subtraction would quietly become a
+    no-op and the allowlist would read as least-privilege while withholding
+    nothing."""
+    without_execute = Literal[
+        "ls", "read_file", "write_file", "edit_file", "delete", "glob", "grep"
+    ]
+
+    with pytest.raises(CheckFailed, match="no longer an fs tool"):
+        tripping_an_import_time_check(
+            my_agent.capabilities, deepagents, "FsToolName", without_execute
+        )
+
+
+def test_the_allowlist_refuses_a_filesystem_tool_it_has_never_seen(
+    tripping_an_import_time_check: Callable[..., None],
+) -> None:
+    """The check that made this project's whole thesis: a new upstream tool must
+    fail the import rather than be granted silently, because that is exactly how
+    `execute` arrived switched on (F4)."""
+    with_a_new_tool = Literal[
+        "ls", "read_file", "write_file", "edit_file", "delete", "glob", "grep", "execute", "sudo"
+    ]
+
+    with pytest.raises(CheckFailed, match="changed its filesystem tool set"):
+        tripping_an_import_time_check(
+            my_agent.capabilities, deepagents, "FsToolName", with_a_new_tool
+        )
+
+
+def test_the_pins_refuse_a_middleware_that_dropped_a_bound(
+    tripping_an_import_time_check: Callable[..., None],
+) -> None:
+    """A pinned bound that is no longer a parameter would be passed as a keyword
+    and raise a `TypeError` from inside deepagents, naming nothing useful."""
+
+    class WithoutGrepBound:
+        def __init__(
+            self,
+            *,
+            backend: Any = None,
+            tool_token_limit_before_evict: int = 20000,
+            human_message_token_limit_before_evict: int = 50000,
+            tools: Any = None,
+            _permissions: Any = None,
+        ) -> None: ...
+
+    with pytest.raises(CheckFailed, match="no longer accepts grep_max_count"):
+        tripping_an_import_time_check(
+            my_agent.capabilities, deepagents, "FilesystemMiddleware", WithoutGrepBound
+        )
+
+
+def test_the_pins_refuse_a_bound_whose_upstream_default_moved(
+    tripping_an_import_time_check: Callable[..., None],
+) -> None:
+    """Agreement with the library default is what makes these safe to state. If
+    upstream moves, a human decides whether ours moves with it — rather than
+    finding out from a context window that behaves differently."""
+
+    class WithADifferentDefault:
+        def __init__(
+            self,
+            *,
+            backend: Any = None,
+            tool_token_limit_before_evict: int = 20000,
+            human_message_token_limit_before_evict: int = 50000,
+            grep_max_count: int = 99,
+            tools: Any = None,
+            _permissions: Any = None,
+        ) -> None: ...
+
+    with pytest.raises(CheckFailed, match="changed its default for grep_max_count"):
+        tripping_an_import_time_check(
+            my_agent.capabilities, deepagents, "FilesystemMiddleware", WithADifferentDefault
+        )
+
+
+def test_the_pins_refuse_a_middleware_with_no_permission_channel(
+    tripping_an_import_time_check: Callable[..., None],
+) -> None:
+    """`_permissions` is private API and is the only route a `FilesystemPermission`
+    takes to the tool layer. Losing it silently drops every rule (F5)."""
+
+    class WithoutPermissions:
+        def __init__(
+            self,
+            *,
+            backend: Any = None,
+            tool_token_limit_before_evict: int = 20000,
+            human_message_token_limit_before_evict: int = 50000,
+            grep_max_count: int = 1000,
+            tools: Any = None,
+        ) -> None: ...
+
+    with pytest.raises(CheckFailed, match="no longer accepts tools/_permissions"):
+        tripping_an_import_time_check(
+            my_agent.capabilities, deepagents, "FilesystemMiddleware", WithoutPermissions
+        )
+
+
+def test_the_pins_refuse_a_compaction_middleware_that_cannot_be_bounded(
+    tripping_an_import_time_check: Callable[..., None],
+) -> None:
+    """Without these parameters the compaction thresholds cannot be set at all,
+    and the agent would run at deepagents' own — 33% above the context window we
+    assume (F31)."""
+
+    class Unbounded:
+        def __init__(self, model: Any, *, backend: Any = None) -> None: ...
+
+    with pytest.raises(CheckFailed, match="no longer accepts"):
+        tripping_an_import_time_check(
+            my_agent.capabilities,
+            deepagents.middleware,
+            "SummarizationMiddleware",
+            Unbounded,
+        )
+
+
+def test_the_plugin_pin_refuses_a_registered_profile(
+    tripping_an_import_time_check: Callable[..., None],
+) -> None:
+    """The door that is not a parameter (F28). A harness profile runs at import
+    and can add middleware, drop tools or rewrite the system prompt."""
+
+    def one_plugin(*, group: str) -> list[Any]:
+        return [SimpleNamespace(name="evil-profile")] if "profiles" in group else []
+
+    with pytest.raises(CheckFailed, match="registering deepagents profile plugins"):
+        tripping_an_import_time_check(
+            my_agent.capabilities, importlib.metadata, "entry_points", one_plugin
+        )
+
+
+def test_the_caching_pin_refuses_an_installed_caching_package(
+    tripping_an_import_time_check: Callable[..., None],
+) -> None:
+    """The door that is not even an entry point (F41): deepagents probes for
+    these by name and appends their middleware to every graph it compiles."""
+    real = importlib.util.find_spec
+
+    def pretends_aws_is_installed(name: str, package: Any = None) -> Any:
+        return SimpleNamespace(name=name) if name == "langchain_aws" else real(name, package)
+
+    with pytest.raises(CheckFailed, match="caching package is installed"):
+        tripping_an_import_time_check(
+            my_agent.capabilities, importlib.util, "find_spec", pretends_aws_is_installed
+        )
+
+
+@pytest.mark.parametrize(
+    ("trigger", "window", "expected"),
+    [
+        (0, 128_000, "must be positive"),
+        (-1, 128_000, "must be positive"),
+        (128_000, 128_000, "must leave room below"),
+        (200_000, 128_000, "must leave room below"),
+    ],
+)
+def test_the_compaction_trigger_must_leave_room_below_the_window(
+    trigger: int, window: int, expected: str
+) -> None:
+    """The bound that used to be unreachable by any test, because both numbers
+    are hand-edited constants in the module that checks them.
+
+    At or above the window, compaction can only fire after the provider has
+    already refused the request — which is the state deepagents' profile-less
+    default left the agent in, 33% above the window we assume (F31)."""
+    with pytest.raises(CheckFailed, match=expected):
+        require_compaction_fits_the_window(trigger, window)
+
+
+def test_the_real_compaction_trigger_leaves_room_below_the_real_window(
+    assert_does_not_raise: Callable[[Callable[[], object]], None],
+) -> None:
+    """The discriminator: the checks above would all pass on a pair of numbers
+    that happened to be backwards, so the shipped pair is asserted too."""
+    assert_does_not_raise(
+        lambda: require_compaction_fits_the_window(
+            COMPACTION_TRIGGER_TOKENS, CONTEXT_WINDOW_TOKENS
+        )
+    )

@@ -1646,6 +1646,61 @@ YAGNI this repo spends a section refusing. Recorded so the choice is made rather
 
 ---
 
+## F44 — reloading a module to test its load-time checks rebinds every class it defines
+
+**Severity: important, and the reason two pins moved file.** Fifteen check sites in `src/` run at
+*import*: that `execute` is still a filesystem tool, that `create_deep_agent` grew no parameter,
+that `ChatOpenAI` still accepts every alias `ModelConfig` splats. They execute once, when the test
+session imports the package, and no ordinary test can make one false — by the time it runs the
+import has long since succeeded.
+
+`importlib.reload` with the library patched is the only route, and it has a trap that the first
+eight tests did not hit and the next three did.
+
+**A reload rebinds every class the module defines.** `importlib.reload` re-executes the module body,
+so `class AgentConfig` produces a *new* class object while every other test module still holds the
+one imported at collection time. `build_agent`'s own `require(isinstance(agent_config, AgentConfig))`
+then compares an instance of the old class against the new one:
+
+```
+CheckFailed: expected an AgentConfig, got AgentConfig
+```
+
+Measured 2026-09-22: reloading `my_agent.agent` and `my_agent.model` failed **15 unrelated tests**
+across `test_capabilities.py`, `test_main.py` and `test_run.py` — the grep bound, the compaction
+behaviour, the eviction tests and every HITL test. **None of them fails when run alone**, which is
+the worst property a test failure can have. `my_agent.capabilities` reloads safely for one reason
+only: it defines no classes, just constants and functions.
+
+*What we do:* two things.
+
+**The fixture refuses the unsafe case.** `tripping_an_import_time_check` in `tests/conftest.py`
+asserts the target module defines no classes of its own before reloading it, naming them and saying
+what to do instead. A rule that is checked beats a rule that is written down.
+
+**The checks in class-defining modules moved into functions.** `agent.py`'s two
+`KNOWN_CREATE_DEEP_AGENT_PARAMS` checks became `contracts.check_known_parameters`, and `model.py`'s
+alias pin became `contracts.check_required_parameters`; both are still called at import, so the
+load-time guarantee is unchanged, and both are now ordinary functions a test drives with bad
+arguments. `contracts.check_config_contract` was already exactly this shape, which is what made it
+the obvious precedent rather than an invention.
+
+Two more moved for a related reason: `capabilities.require_compaction_fits_the_window` and
+`model.require_env_fields_cover_the_config` compare constants defined *in the file that checks
+them*, so no patch a test can apply reaches either. A reload could not drive them and neither could
+anything else; as functions they take the numbers as arguments.
+
+**The result, measured rather than counted** (by wrapping `require()` and `CheckFailed` in pytest
+plugins that log their call site, then diffing against an AST walk): **110 `require()` sites, 100
+tripped; 13 `raise CheckFailed` sites outside the helpers, 12 tripped.** Every remaining untripped
+site is in `main.py`. No import-time check is untripped any more.
+
+*Worth knowing for the next one:* a module-level check is a check that can only be driven by
+reloading, and reloading is only safe in a module with no classes. **Prefer a function called at
+import.** It costs one line and keeps the check testable.
+
+---
+
 ## Observability API reference
 
 Not findings — API surfaces recorded so the next piece of work does not have to re-derive them.
@@ -1782,7 +1837,7 @@ main checkout run a `scripts/check.sh` that may not exist on the branch checked 
 
 **Three scans run on this repo and only two are files here.** `ci.yml` runs the gate on every push
 and pull request. `.github/workflows/live.yml` runs `-m live` weekly (Mondays 06:00 UTC) and on
-demand, because this file is forty-two verified behaviours and nothing else re-checks any of
+demand, because this file is forty-four verified behaviours and nothing else re-checks any of
 them; it skips rather than fails when `HF_TOKEN` is absent, so an unconfigured clone does not
 produce a weekly red X that means nothing, and it never gates a commit. **CodeQL is the third and it
 is not a file here** — it uses GitHub's default setup, so the workflow is generated and managed by
