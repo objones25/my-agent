@@ -5,8 +5,9 @@ contracts, tests and observability rather than by feature count.
 
 **The agent's domain is deliberately undecided.** What is being built here is the harness: the
 capability allowlist, the model wiring, the run bounds, the observability seams, and the tests that
-keep all of it honest. One placeholder tool is enough to exercise it. When a real domain is chosen,
-it should slot in behind the existing protocols without any existing file changing.
+keep all of it honest. No domain tool is bound today: the agent runs on deepagents' own filesystem
+tools plus `task`, which is enough to exercise every seam. When a real domain is chosen, it should
+slot in behind the existing protocols without any existing file changing.
 
 ## What is actually interesting here
 
@@ -16,10 +17,10 @@ it should slot in behind the existing protocols without any existing file changi
   filesystem middleware, so the parent's allowlist is not the whole story.
 - **Bounds that belong to the thing they bound.** One turn goes through `run_turn`, which always
   sends a step limit and attaches a wall-clock deadline, so no caller can forget either.
-- **Library behaviour recorded rather than assumed.** `docs/findings.md` holds twenty-three
+- **Library behaviour recorded rather than assumed.** `docs/findings.md` holds forty-two
   verified findings, each with how it was checked and what the code does about it.
 - **Tests that are checked for being able to fail.** Changes here are verified by reverting the fix
-  and watching a test go red.
+  and watching a test go red — and when one survives its mutant, that is recorded too (F39, F42).
 
 ## Requirements
 
@@ -63,7 +64,7 @@ see Setup) and `.github/workflows/ci.yml` both call it and re-list nothing.
 | Path | What it holds |
 |---|---|
 | `CLAUDE.md` | The contributor's contract: architecture, non-negotiables, verified API facts |
-| `docs/findings.md` | F1-F23: verified library behaviour and what the code does about each |
+| `docs/findings.md` | F1-F42: verified library behaviour and what the code does about each |
 | `docs/superpowers/specs/` | Design documents |
 | `src/my_agent/capabilities.py` | The allowlist and the proof it held |
 | `src/my_agent/run.py` | One bounded turn |
