@@ -426,15 +426,28 @@ and returns a `CompiledStateGraph`. That list, `BackendProtocol` and `SubAgent` 
 ### Hugging Face router via `langchain-openai`
 
 Base URL `https://router.huggingface.co/v1`, auth via `HF_TOKEN`. Model ids are `org/model`,
-optionally suffixed to steer routing (`:provider`, `:fastest`, `:cheapest`).
+suffixed to steer routing: `:provider`, or the policies `:fastest`, `:cheapest`, `:preferred`.
 
-**Pin a provider when an eval must be reproducible — and when the context window has to be a number
-rather than a range.** gpt-oss-120b natively supports 128k, but the router's live providers do not
-agree: eight advertise 131072, baseten advertises 128072, and two advertise nothing at all (F25).
-Unpinned routing also means the weights answering are whatever that provider is serving, and these
-are open weights that OpenAI's own worst-case evaluation showed can be fine-tuned into a
-non-refusing model. Pinning is a trust decision as much as a reproducibility one. Default `openai/gpt-oss-120b` (11 live providers: smaller, faster, a
-harder test of the harness); alternate `deepseek-ai/DeepSeek-V4-Flash` (3). Note that
+**The default is pinned: `openai/gpt-oss-120b:groq`. Omitting the suffix is not "no routing
+decision" — the router reads it as `:fastest`.** That ranks the eleven live providers by first-token
+latency, so every caller on the default lands on the same one or two, which is where the queues
+fill. Measured 2026-09-23: **3 of 127 calls returned `429 queue_exceeded` unpinned, 0 of 130
+pinned**, and the router sets `x-should-retry: false` so the openai client will not retry them —
+`max_retries` is irrelevant to that failure (F46). `main.ROUTING_POLICY_SUFFIXES` is the list the
+F25 check treats as "not a pinned provider"; a named provider narrows that check to that provider,
+and an unserved pin is refused rather than narrowed to an empty set.
+
+Pinning was already wanted for two other reasons, and one literal buys all three. gpt-oss-120b
+natively supports 128k, but the live providers do not agree: most advertise 131072, baseten
+advertises 128072, and two advertise nothing at all (F25) — so **the context window is a number
+rather than a range** only when pinned. And unpinned routing means the weights answering are
+whatever that provider is serving, which for open weights OpenAI's own worst-case evaluation showed
+can be fine-tuned into a non-refusing model: **a trust decision as much as a reproducibility one.**
+
+`groq` on the catalogue read that day: second-highest throughput of the eleven, a stated 131,072
+window comfortably above `CONTEXT_WINDOW_TOKENS`, tools *and* structured output, and deliberately
+**not** the latency leader — `cerebras` is, and was identified as one of the two backends serving
+the unpinned runs. Alternate model `deepseek-ai/DeepSeek-V4-Flash` (3 providers). Note that
 `api.endpoints.huggingface.cloud` is the *control plane*, not an inference base URL (F7).
 
 **Pin `use_responses_api=False` explicitly; do not leave it unset.** The default `None` does *not*

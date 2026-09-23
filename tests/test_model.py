@@ -388,7 +388,7 @@ def test_the_router_defaults_are_the_values_that_were_chosen() -> None:
     when the expected value is written somewhere the mutation cannot reach.
     """
     assert HF_ROUTER_BASE_URL == "https://router.huggingface.co/v1"
-    assert DEFAULT_MODEL == "openai/gpt-oss-120b"
+    assert DEFAULT_MODEL == "openai/gpt-oss-120b:groq"
     assert DEFAULT_TEMPERATURE == 0.0
     assert DEFAULT_TIMEOUT_S == 120.0
     assert DEFAULT_MAX_RETRIES == 2
@@ -499,3 +499,13 @@ def test_the_shipped_env_fields_cover_every_config_field(
             {f.name for f in dataclasses.fields(ModelConfig)}, _ENV_FIELDS
         )
     )
+
+
+def test_the_default_model_pins_a_provider_rather_than_a_routing_policy() -> None:
+    """An unsuffixed id is not "no routing decision" — the router reads it as
+    `:fastest`, which concentrates every caller on the lowest-latency providers
+    and is where the 429s came from (F46). Inherited defaults are the thing this
+    repo refuses, and this one had a measured cost."""
+    repo, _, provider = DEFAULT_MODEL.partition(":")
+    assert repo == "openai/gpt-oss-120b"
+    assert provider not in ("", "fastest", "cheapest", "preferred")

@@ -62,9 +62,33 @@ deployments. A dedicated endpoint serves inference at its own
 `ModelConfig.base_url` there to use one; no code change is needed.
 """
 
-DEFAULT_MODEL = "openai/gpt-oss-120b"
-"""`org/model`, optionally suffixed to steer routing: `:provider`, `:fastest`,
-`:cheapest`."""
+DEFAULT_MODEL = "openai/gpt-oss-120b:groq"
+"""`org/model`, suffixed to pin the provider.
+
+**The suffix is the routing decision, and omitting it is not "no decision".**
+An unsuffixed id is read by the router as `:fastest`, which ranks the eleven
+providers serving this model by first-token latency — so every caller on the
+default lands on the same one or two, which is where the queues fill. Measured
+2026-09-23: 3 of 127 calls returned `429 queue_exceeded` unpinned, 0 of 130
+pinned, and the router sets `x-should-retry: false` so the client will not
+retry them (F46).
+
+`groq` rather than the alternatives, on the catalogue read the same day:
+second-highest throughput of the eleven, a stated 131,072-token context window
+comfortably above `CONTEXT_WINDOW_TOKENS` (`baseten` clears it by 72 tokens),
+tools *and* structured output supported, and **not** the latency leader — which
+is the point, because the latency leader is where `:fastest` sends everyone.
+`cerebras` is faster and was identified as one of the two backends serving the
+unpinned runs. `deepinfra` and `novita` are cheaper and do not support
+structured output.
+
+Pinning also buys what F25 wanted for other reasons: the context window becomes
+a number rather than a range, the weights answering are a known provider's, and
+a run is reproducible. Three motivations, one literal.
+
+Other suffixes the router accepts are `:fastest`, `:cheapest` and `:preferred`;
+`ROUTING_POLICY_SUFFIXES` in `main.py` is the list that the F25 check treats as
+"not a pinned provider"."""
 
 DEFAULT_TEMPERATURE = 0.0
 DEFAULT_TIMEOUT_S = 120.0

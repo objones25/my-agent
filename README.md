@@ -73,7 +73,7 @@ Both spend real tokens. Each check runs `LIVE_CHECK_REPEATS` times (5 by default
 environment variable to override). The run prints a header, then one block per check, then a tally:
 
 ```text
-model:  openai/gpt-oss-120b
+model:  openai/gpt-oss-120b:groq
 tracing: langsmith, weave
 log:    logs/<timestamp>-<id>.jsonl
 tools:  ['delete', 'edit_file', 'glob', 'grep', 'ls', 'read_file', 'write_file'] (+ task)
