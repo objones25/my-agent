@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Any, cast
 from uuid import UUID, uuid4
 
+import httpx2
+import openai
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, LLMResult
@@ -21,6 +23,7 @@ from my_agent.mirror import (
     DEFAULT_LOG_DIR,
     MAX_FIELD_CHARS,
     JsonlMirror,
+    _retry_advice,
     mirror_to_file,
     run_log_path,
 )
@@ -676,3 +679,60 @@ def test_run_log_path_rejects_an_empty_run_id() -> None:
     would interleave in one file and neither could be read back."""
     with pytest.raises(CheckFailed, match="run_id must not be empty"):
         run_log_path(run_id="")
+
+
+# --------------------------------------------------------------------------
+# Why a 429 was not retried (F46)
+# --------------------------------------------------------------------------
+
+
+def _rate_limit_error(headers: dict[str, str]) -> Exception:
+    """A real `openai.RateLimitError`, so the shape under test is the shape the
+    router actually produces rather than a stub that agrees with us."""
+    request = httpx2.Request("POST", "https://router.huggingface.co/v1/chat/completions")
+    response = httpx2.Response(429, headers=headers, request=request, json={"message": "busy"})
+    return openai.RateLimitError("429", response=response, body=None)
+
+
+def test_retry_advice_records_the_two_headers_that_veto_a_retry() -> None:
+    """The openai client checks `x-should-retry` and `Retry-After` *before* the
+    status code and refuses to retry on either (measured offline, F46). Without
+    them in the record there is no way to tell a vetoed 429 from an exhausted
+    one after the fact."""
+    advice = _retry_advice(_rate_limit_error({"x-should-retry": "false", "retry-after": "300"}))
+
+    assert advice == {"status_code": 429, "x-should-retry": "false", "retry-after": "300"}
+
+
+def test_retry_advice_reports_a_response_that_carried_no_advice() -> None:
+    """The discriminator. An empty mapping is not the same as "no response":
+    a 429 with neither header means the retry was exhausted, which is a
+    different diagnosis and a different fix."""
+    assert _retry_advice(_rate_limit_error({})) == {"status_code": 429}
+
+
+def test_an_error_with_no_response_has_no_retry_advice() -> None:
+    """A timeout or a connection failure never reached a server."""
+    assert _retry_advice(TimeoutError("no route")) is None
+
+
+def test_a_failed_model_call_records_the_retry_advice(tmp_path: Path) -> None:
+    """The whole point: the next real 429 explains itself in the run log."""
+    path = tmp_path / "run.jsonl"
+    with mirror_to_file(path) as mirror:
+        mirror.on_llm_error(
+            _rate_limit_error({"x-should-retry": "false"}), run_id=uuid4(), parent_run_id=None
+        )
+
+    record = json.loads(path.read_text().strip())
+    assert record["event"] == "llm_error"
+    assert record["retry_advice"]["x-should-retry"] == "false"
+
+
+def test_an_ordinary_model_error_does_not_grow_a_retry_advice_field(tmp_path: Path) -> None:
+    """A record that carries the key on every error teaches a reader nothing."""
+    path = tmp_path / "run.jsonl"
+    with mirror_to_file(path) as mirror:
+        mirror.on_llm_error(TimeoutError("no route"), run_id=uuid4(), parent_run_id=None)
+
+    assert "retry_advice" not in json.loads(path.read_text().strip())

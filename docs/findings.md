@@ -762,7 +762,7 @@ against 131072 is a prompt that fails intermittently.
 
 *What we do:* `main.check_every_provider_serves_the_context_we_assume` reads the catalogue (one
 HTTP GET, no inference) and fails if any provider that *states* a length is below
-`ASSUMED_CONTEXT_TOKENS` (128000), reporting the ones that state nothing. Asserting on the unstated
+`capabilities.CONTEXT_WINDOW_TOKENS` (128,000), reporting the ones that state nothing. Asserting on the unstated
 ones would be a check that can never go green; the mitigation for those is pinning `:provider`,
 which is a decision, not an assertion. A `require()` guards against the catalogue publishing no
 lengths at all, which would otherwise make the check pass by measuring nothing.
@@ -1371,7 +1371,8 @@ that *does* get evicted when it is last (the adjacent eviction test) is untouche
 position.
 
 **`TOOL_RESULT_TOKEN_LIMIT` truncates at 80,000 characters (`NUM_CHARS_PER_TOKEN * 20,000`), but
-`read_file`'s 100-line default (`DEFAULT_READ_LIMIT`) cuts most long files first.** Measured
+`read_file`'s 100-line default (deepagents' `DEFAULT_READ_LIMIT`,
+`deepagents/middleware/filesystem.py:973`) cuts most long files first.** Measured
 (`test_the_line_limit_cuts_a_long_file_before_the_character_bound_can`): a 4,000-line, 134,890-
 character file — over 1.6 times the character bound — came back as ~3,000 characters with no
 truncation marker, because line 100 arrived long before byte 80,000. The character bound is only
@@ -1701,6 +1702,311 @@ import.** It costs one line and keeps the check testable.
 
 ---
 
+## F45 — eight checks at one attempt each cannot tell a flake from a regression
+
+**Severity: important.** The only end-to-end measurement this repo has was
+unscheduled and ran once per check.
+
+Two separate gaps, found together on 2026-09-23 while auditing the docs:
+
+**The checks were never scheduled.** `live.yml`'s cron runs `pytest -m live` —
+**two tests**. `uv run my-agent` runs the eight checks, and nothing invoked it;
+they ran only when a human typed the command. Last recorded green was
+2026-09-18, five days and fourteen commits earlier. The 2026-09-21 evaluation
+says they run "on a weekly cron", which was wrong.
+
+**One attempt each cannot separate the two failures that matter.** Three of the
+eight depend on the model *choosing* to call a tool:
+
+| check | shape | failure mode at n=1 |
+|---|---|---|
+| `filesystem_tools_still_work` | positive: `write_file` must be called and succeed | flakes **red** — model declines, reads as a regression |
+| `permissions_are_enforced` | positive: a denial must appear in a tool message | flakes **red** — same |
+| `shell_tool_withheld` | negative: `execute` must be absent | passes **vacuously** — a model that called nothing satisfies it |
+
+The first two turn a non-deterministic model into a red build with no error
+bars. The third is the opposite and worse: it is this repo's own
+*assert-the-claim-and-its-discriminator* rule unapplied on the live path. The
+graph-level `require_withheld` proves the binding; the live half's only job is
+"no run can call it", and a turn that did nothing is not evidence for that.
+
+### What we do
+
+`CheckOutcome` aggregates k attempts of one check. **The exit code reads pass^k**
+— these are invariants, and a check that held four times in five did not hold.
+pass@k is printed alongside it, because it is the entire difference between
+"this is broken" and "this is non-deterministic", and that difference does not
+exist at one attempt.
+
+`LIVE_CHECK_REPEATS` is 5, uniform across all eight. Uniform is deliberate and
+temporary: **which checks can actually vary has not been measured**, and
+declaring five of them deterministic would be the same untested assumption the
+repeats exist to remove. `check_every_provider_serves_the_context_we_assume` is
+a catalogue `GET` with no inference and almost certainly cannot vary — that is a
+prediction, and the first run is what settles it. Pin per-check counts once
+there is a number.
+
+`_shell_withheld(called, answered)` is the discriminator, extracted as a pure
+function so it is testable offline; the check bodies build their own model and
+agent, so nothing else in them is.
+
+`live.yml` gained a second step running `uv run my-agent` with
+`LIVE_CHECK_REPEATS: "5"` stated rather than inherited. Its `timeout-minutes`
+went 20 → 45, and **that number is an estimate, not a measurement** — 40 live
+turns of unrecorded duration plus a second hardcoded 300s weave flush (F23,
+which this workflow now pays twice because it runs two processes). The 20 was
+measured; replace the 45 with the observed figure after the first real run.
+
+### First live run, 2026-09-23 — and it was not the predicted flake
+
+**7/8 pass^5.** `filesystem_tools_still_work` came back **3/5**, and both lost
+attempts were the same thing:
+
+```
+attempt 4: OpenAIRateLimitError: Error code: 429 - {'message': "We're experiencing
+  high traffic right now! Please try again soon.", 'type': 'too_many_requests_error',
+  'param': 'queue', 'code': 'queue_exceeded'}
+attempt 5: (identical)
+```
+
+Three things this run settles, none of them the thing it was built to measure:
+
+1. **The predicted flake did not happen.** The prediction was that the model
+   would sometimes decline to call `write_file`. It called it every time it got
+   a response. The observed variance is entirely provider-side.
+2. ~~**The repeats caused the failure they detected.**~~ **Withdrawn
+   2026-09-23.** A second run measured 1 request in the prior second before its
+   429, and cumulative counts of 25/27 versus 65 — no burst and no quota. The
+   429 is provider-side queue pressure on an unpinned `:fastest` route, not our
+   load. What survives is that the repeats *surfaced* it: n=1 structurally could
+   not. See `docs/2026-09-23-provider-429-investigation.md`.
+3. **`shell_tool_withheld` passed 5/5 with `answered=True; tools called: none`** —
+   exactly the shape the new discriminator exists to distinguish from a vacuous
+   pass. Before this change that line would have read as a pass either way.
+
+`check_every_provider_serves_the_context_we_assume` emitted one weave trace for
+five attempts, confirming it makes no inference call and cannot vary. That was a
+prediction above; it is now measured.
+
+### Open
+
+- **Retry and backoff on a 429 is unhandled** — `ModelConfig.max_retries` is 2
+  and the router still surfaced the error. Whether that is exhausted retries,
+  a status code the client does not retry, or backoff too short for a
+  `queue_exceeded` queue is not yet established. This is the live gap this run
+  found.
+- Whether 5 is the right k. It is the smallest count that distinguishes 4/5 from
+  5/5 at a cost worth paying weekly, not a figure derived from an observed
+  failure rate.
+- Whether the remaining six checks vary at all. Five of five on one run is not
+  evidence that they cannot.
+
+---
+
+## F46 — the 429 was never retried, and `max_retries` was never the problem
+
+**Severity: important.** The router vetoes the retry and the openai client
+obeys, by design. Raising `max_retries` would change nothing.
+
+F45's first live run lost two attempts to
+`429 ... 'code': 'queue_exceeded'`. `ModelConfig.max_retries` is 2 and reaches
+the client — `build_model(...).root_client.max_retries == 2`, verified — and
+`BaseClient._should_retry` retries 429 by default. So the retries should have
+absorbed it.
+
+**The mirror says they never happened.** From
+`logs/20260923T161354Z-81b4f402.jsonl`, `chat_model_start` → `llm_error`:
+
+| | start | error | elapsed |
+|---|---|---|---|
+| first 429 | 16:14:38.073 | 16:14:38.254 | **181 ms** |
+| second 429 | 16:14:39.546 | 16:14:39.709 | **163 ms** |
+
+`INITIAL_RETRY_DELAY` is 0.5s, so two retries cannot cost less than ~1.5s of
+sleeping. 180 ms is one request.
+
+### Why, measured offline against a local 429 server
+
+No router involved, no tokens spent — a `BaseHTTPRequestHandler` returning 429
+with chosen headers, and our own `build_model` pointed at it:
+
+| response | requests made | elapsed |
+|---|---|---|
+| plain 429 | **3** | 1.49 s |
+| 429 + `x-should-retry: false` | **1** | 0.00 s |
+| 429 + `Retry-After: 300` | **1** | 0.00 s |
+| 429 + `Retry-After: 2` | **3** | 4.01 s |
+
+Three requests over 1.49 s is `max_retries=2` with 0.5 s + 1.0 s backoff,
+exactly as configured. **Our retry setup is correct and working.** The live
+shape — one request, ~180 ms — is the vetoed shape.
+
+`BaseClient._should_retry` reads two things *before* the status code, and
+returns `False` on either: `x-should-retry: false`, or a `Retry-After` above
+`MAX_RETRY_AFTER_DELAY` (120 s). The router sends one of them.
+
+### What we do
+
+`mirror._retry_advice` records `x-should-retry`, `retry-after`,
+`retry-after-ms` and the status code off the exception's `.response`, on
+`llm_error` only. `openai.APIStatusError` carries the whole `httpx2.Response`,
+so this needs no HTTP hook and no extra request — **the next real 429 explains
+itself in the run log.** The field is absent on errors that never reached a
+server, so its presence is itself the signal: absent means no server answered,
+present-but-empty means the server answered and gave no advice, which is an
+*exhausted* retry rather than a vetoed one — a different diagnosis and a
+different fix.
+
+### What we deliberately did not do
+
+- **Not a custom `http_client`.** It is the only option that would force the
+  retry, by discarding the header the SDK honours. The server said do not
+  retry; overriding that on a shared inference router turns queue pressure into
+  worse queue pressure. (It also has to be passed at construction —
+  `model_copy(update={"http_client": ...})` is silently ignored, F30.)
+- **Not `max_retries`.** Proven above to be irrelevant to this failure.
+- **Not a rate limiter or `ModelRetryMiddleware` yet.** Both are real levers and
+  both would need a constant — `requests_per_second`, or a backoff — that
+  nothing here has measured. Two 429s from one run is n=1 on the failure
+  itself. Pinning an unmeasured number is what F42 exists to stop.
+
+### The two levers, for when there is a number
+
+**A rate limiter belongs on the model, not in middleware.** `ChatOpenAI` takes
+`rate_limiter=`, and deepagents builds a subagent with
+`resolve_model(spec["model"])` — *the same object* — so a limiter on the model
+reaches every graph. `AgentConfig.middleware` reaches the parent only (F30), so
+`ModelRetryMiddleware` cannot be a global ceiling; it is a second layer, not the
+answer. This is the same trap as `step_limit` before F24 and F39: the graph you
+configure is not the only graph that runs.
+
+`ModelRetryMiddleware` does retry *above* the client, so the router's veto does
+not bind it, and `OpenAIRateLimitError.is_retryable is True` means
+`default_retry_on` already covers the case.
+
+**Both sleep, and `RunDeadline` counts wall clock.** A limiter slow enough to
+prevent 429s can convert them into `DeadlineExceeded`. That is trading one
+failure for another, and it is why the number has to be measured rather than
+chosen.
+
+### Open
+
+- ~~Which veto it is.~~ **Answered on the next run, 2026-09-23**, by the
+  capture above: `{"status_code": 429, "x-should-retry": "false"}`. The router
+  sets the header explicitly.
+- ~~Whether the 429 reproduces, and whether our own burst caused it.~~
+  **Answered: it reproduces, and we did not cause it.** 3 of 127 calls across
+  two runs, at 1–2 requests per second. The cause is the `:fastest` routing
+  policy an unsuffixed model id selects by default, which concentrates every
+  caller on the lowest-latency providers. **The lever is provider pinning, not
+  retry and not pacing** — a rate limiter cannot pace its way out of another
+  tenant's queue. Full write-up, including why a scoring change was rejected and
+  why `.with_fallbacks()` is unusable here:
+  `docs/2026-09-23-provider-429-investigation.md`.
+- ~~Whether pinning removes the 429s.~~ **Two runs say yes**: pinned to
+  `:groq`, **0 of 130 calls rate-limited**, against 3 of 127 unpinned, and the
+  second run was 8/8 pass^5 with exit 0. P(0 in 130 | 2.36%) = 4.5%, so about
+  1 in 22 by chance — supporting, not proof, and not controlled for the router
+  being quieter three hours later. The mechanism agrees, and the fingerprint
+  decode identified `cerebras`
+  (`fp_752b9cb17e04d95d05c3`, the lowest-latency provider of the eleven) as one
+  of the two backends serving the unpinned runs.
+- **`DEFAULT_MODEL` is still the bare id**, so the harness still defaults to
+  `:fastest`. Making the pin the default is a one-literal change and a decision
+  nobody has taken yet.
+- What the router's actual per-provider limit is. Not published as far as this
+  has looked, and not measured.
+
+---
+
+## F47 — harness profiles are a second door, and the entry-point pin cannot see it
+
+**Severity: important.** `DEEPAGENTS_PLUGIN_GROUPS` covers third-party plugins.
+deepagents registers its own profiles a different way.
+
+From `deepagents/profiles/_builtin_profiles.py`, the library's own docstring:
+
+> "Built-in provider and harness profiles are registered via explicit module
+> imports — **not entry points** — so a malformed or missing `dist-info` in the
+> environment cannot silently disable the SDK's own defaults."
+
+Two registries, and only one of them can reach us:
+
+| | `ProviderProfile` | `HarnessProfile` |
+|---|---|---|
+| payload | `init_kwargs` → `init_chat_model` | prompt, tools, middleware, subagent |
+| applies to a model **string** | yes | yes |
+| applies to a pre-built **instance** | **no** | **yes** |
+
+Provider profiles are inert here, which is F28: their payload only fires when
+deepagents *constructs* the model, and `build_agent` refuses strings.
+
+**Harness profiles are not.** `_harness_profile_for_model(model, spec=None)` has
+an explicit branch for pre-built instances: it derives provider and identifier
+from the object and tries `provider:identifier`, then the identifier, then
+**a bare provider key**. Measured:
+
+```
+identifier: openai/gpt-oss-120b     provider: openai
+resolved  : HarnessProfile()        # empty, today
+```
+
+0.7.15 registers 14 keys, all exact `provider:model`, three of them under
+`openai:` (`gpt-5.1-codex`, `gpt-5.2-codex`, `gpt-5.3-codex`). No bare `openai`
+— so nothing matches, and **that was a comment in `capabilities.py` rather than
+a check.** A release adding provider-wide `openai` defaults would apply to us
+with no call site to read it at. A matching profile may replace the system
+prompt, override tool descriptions, exclude tools, strip middleware, append
+middleware and reconfigure `general-purpose`. `_require_shell_withheld` catches
+the tool half; **nothing reads a prompt or middleware change back off a compiled
+graph** (F41).
+
+### What we do
+
+`capabilities.require_no_harness_profile(model)`, called by `build_agent`
+*before* the build. It resolves through deepagents' own
+`_harness_profile_for_model`, so a change to key semantics keeps it correct
+rather than quietly ceasing to match, and the error names the fields the profile
+would change.
+
+`HARNESS_PROFILE_FIELDS` pins the seven field names as literals, checked at
+import by `require_known_harness_profile_fields`. Three reasons, not one: a new
+field upstream is a new reconfiguration knob and must be loud rather than
+missing from the diagnostic; a literal tuple does not depend on upstream
+remaining a dataclass; and `dataclasses.fields()` on `HarnessProfile` is a
+**checker disagreement** — pyright 1.1.414 accepts it, Pylance rejects
+`HarnessProfile` as not matching `DataclassInstance` although it *is* a
+dataclass at runtime. F16's rule, applied to a library type.
+
+### Also recorded here
+
+**`ModelFallbackMiddleware`'s string form is a silent redirect.**
+`init_chat_model("openai:openai/gpt-oss-120b")` raises
+`OpenAIError: Missing credentials ... set the OPENAI_API_KEY env var` — it is
+building a client against **api.openai.com**, not the router. It failed only
+because that variable is unset here. `build_model`'s postcondition guards this
+redirect; a fallback string never passes through `build_model`. Instances only.
+
+**`.with_fallbacks()` cannot be the model.** It returns `RunnableWithFallbacks`;
+`build_agent` refuses it and `create_deep_agent` dies with
+`AttributeError: 'ChatOpenAI' object has no attribute 'partition'`.
+
+**`Pregel` overrides `with_config` to return `Self`** via `.copy()` and
+`merge_configs`, so `build_agent`'s annotation is honest and the merge is why
+F24's route works at all.
+
+Full write-up: `docs/2026-09-23-deepagents-profiles.md`.
+
+### Open
+
+- Whether `excluded_middleware` in a matching profile could strip our
+  `FilesystemMiddleware`, and whether `_require_shell_withheld` catches it.
+  Untested: no profile matches to try it with.
+- `GeneralPurposeSubagentProfile`'s fields, unexamined. The supported hook for
+  what `agent.py` currently does by rebinding a `CompiledSubAgent` (F24).
+
+---
+
 ## Observability API reference
 
 Not findings — API surfaces recorded so the next piece of work does not have to re-derive them.
@@ -1837,7 +2143,7 @@ main checkout run a `scripts/check.sh` that may not exist on the branch checked 
 
 **Three scans run on this repo and only two are files here.** `ci.yml` runs the gate on every push
 and pull request. `.github/workflows/live.yml` runs `-m live` weekly (Mondays 06:00 UTC) and on
-demand, because this file is forty-four verified behaviours and nothing else re-checks any of
+demand, because this file is forty-seven verified behaviours and nothing else re-checks any of
 them; it skips rather than fails when `HF_TOKEN` is absent, so an unconfigured clone does not
 produce a weekly red X that means nothing, and it never gates a commit. **CodeQL is the third and it
 is not a file here** — it uses GitHub's default setup, so the workflow is generated and managed by
@@ -1870,8 +2176,10 @@ prompt to re-verify CLAUDE.md's version block — not a reason to skip that step
 
 ## Live verification
 
-`uv run my-agent` runs one check per finding against the real router and prints PASS/FAIL. 8/8
-pass as of 2026-09-18, exit 0, both tracers active:
+`uv run my-agent` runs eight checks against the real router and prints PASS/FAIL. Each is tied to
+a finding; seven findings are covered, not all forty-seven. Each runs `LIVE_CHECK_REPEATS` times
+and the run is scored pass^k (F45). The 8/8 below is from 2026-09-18, exit 0, both tracers
+active — **at one attempt each**, before the repeats existed:
 
 | Finding | Check | Evidence |
 |---|---|---|
@@ -1940,11 +2248,11 @@ Each of these is also noted at the finding it belongs to.
   graph at all (F41). The closure hunt that finds `subagent_graphs` finds no middleware list, so
   the caching door is pinned before the fact rather than asserted after it — the only door here
   with no read-back.
-- Whether the 15 import-time check sites can be tripped by a test. They need `importlib.reload`
-  against a monkeypatched library and no test here does that, so they are the last group with no
-  coverage outside `main.py` — 83 of 108 `require()` sites and 15 of 16 `raise CheckFailed` sites
-  are tripped as of 2026-09-22, measured by wrapping `require()` in a pytest plugin rather than by
-  reading coverage. The remaining 11 are in `main.py` and deliberately left.
+- ~~Whether the import-time check sites can be tripped by a test.~~ **Closed by F44.** Re-measured
+  2026-09-23 by wrapping `require()` and `CheckFailed` in pytest plugins that log a raising call
+  site, then diffing against an AST walk: **103 of 113 `require()` sites and 15 of 16
+  `raise CheckFailed` sites outside the helpers are tripped**, and all 11 untripped sites are in
+  `main.py`, deliberately left. No import-time check is untripped.
 
 - A **provider-pinned** model id (`org/model:groq`) on the token cap (F2), on `reasoning_effort`
   (F17, F26) and on the context window (F25). Only the router's own selection is covered, and F25 is

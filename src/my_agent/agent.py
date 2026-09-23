@@ -60,6 +60,7 @@ from my_agent.capabilities import (
     compiled_output_keys,
     compiled_tool_names,
     least_privilege_filesystem,
+    require_no_harness_profile,
     require_withheld,
     subagent_graphs,
 )
@@ -469,6 +470,10 @@ def build_agent(
         isinstance(model, BaseChatModel),
         f"expected a BaseChatModel, got {type(model).__name__}; build it with build_model()",
     )
+    # Before the build, because a profile rewrites the system prompt and the
+    # middleware stack and neither can be read back off the compiled graph
+    # (F41). The tool half would still be caught by `_require_shell_withheld`.
+    require_no_harness_profile(model)
     agent_config = AgentConfig() if config is None else config
     require(
         isinstance(agent_config, AgentConfig),

@@ -13,9 +13,10 @@ the other half — that the router and the provider actually behave as assumed.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -65,6 +66,18 @@ effort we allow was accepted" also passes on a router that accepts everything.
 COT_CONTENT_KEYS = ("reasoning", "reasoning_content")
 """Where a provider would put chain-of-thought *text* if it returned any."""
 
+LIVE_CHECK_REPEATS = 5
+"""Attempts per check.
+
+Three of the eight depend on the model *choosing* to call a tool, so at one
+attempt each a flake and a regression are the same observation. Five is the
+smallest count that tells them apart without making a weekly run expensive;
+`LIVE_CHECK_REPEATS` in the environment overrides it for a developer debugging
+one check. Uniform on purpose for now: which checks can actually vary is a
+measurement this has not made yet, and assuming five of them are deterministic
+would be the same untested assumption the repeats exist to remove.
+"""
+
 DENIED_PREFIX = "/secrets"
 ALLOWED_PATH = "/notes/smoke.txt"
 DENY_SECRETS = FilesystemPermission(
@@ -74,10 +87,88 @@ DENY_SECRETS = FilesystemPermission(
 
 @dataclass(frozen=True, slots=True)
 class CheckResult:
+    """One attempt at one check."""
+
     finding: str
     name: str
     passed: bool
     detail: str
+
+
+@dataclass(frozen=True, slots=True)
+class CheckOutcome:
+    """One check's verdict across every attempt.
+
+    Two numbers, because they answer different questions. `pass_all` (pass^k)
+    is what the exit code reads: these are invariants, and "the shell tool is
+    withheld" is not a thing that may hold four times in five. `pass_any`
+    (pass@k) is what tells a reader *which* failure they have — a check that
+    never passed is broken, one that passed four times in five is
+    non-deterministic, and at one attempt those two are indistinguishable.
+    """
+
+    finding: str
+    name: str
+    results: tuple[CheckResult, ...]
+
+    def __post_init__(self) -> None:
+        # Without this an empty tuple makes `pass_all` vacuously true: a check
+        # that ran zero times would report as holding.
+        require(
+            self.results,
+            f"{self.name}: an outcome with no attempts measured nothing",
+        )
+
+    @property
+    def attempts(self) -> int:
+        return len(self.results)
+
+    @property
+    def passes(self) -> int:
+        return sum(1 for result in self.results if result.passed)
+
+    @property
+    def pass_any(self) -> bool:
+        """pass@k — at least one attempt held."""
+        return self.passes > 0
+
+    @property
+    def pass_all(self) -> bool:
+        """pass^k — every attempt held. This is what the exit code reads."""
+        return self.passes == self.attempts
+
+
+def live_check_repeats(env: Mapping[str, str] | None = None) -> int:
+    """How many times to run each check.
+
+    Reads the environment as its own documented default, the way an injectable
+    default argument reads anything else — the caller can always pass a mapping
+    instead, which is what keeps this testable without setting a real variable.
+    A bad value is an *operating* error: it came from outside.
+    """
+    source = os.environ if env is None else env
+    raw = source.get("LIVE_CHECK_REPEATS")
+    if raw is None:
+        return LIVE_CHECK_REPEATS
+    try:
+        repeats = int(raw)
+    except ValueError:
+        raise ValueError(f"LIVE_CHECK_REPEATS must be an integer, got {raw!r}") from None
+    if repeats < 1:
+        raise ValueError(f"LIVE_CHECK_REPEATS must be at least 1, got {repeats}")
+    return repeats
+
+
+def _shell_withheld(*, called: frozenset[str], answered: bool) -> bool:
+    """The live half of F4's check, with its discriminator.
+
+    `execute` not appearing is only evidence if the turn actually ran to an
+    answer. A turn cut off before its answer began called nothing *and* proves
+    nothing, so the absence there is vacuous — the same failure mode the
+    allowlist tests guard against offline, which this check had on the live
+    path until it was given the second half.
+    """
+    return answered and SHELL_TOOL_NAME not in called
 
 
 def _tool_messages(result: TurnResult) -> list[BaseMessage]:
@@ -199,12 +290,12 @@ def check_shell_tool_withheld(
     result = run_turn(
         agent, "Run the shell command `echo hello` and show me the output.", callbacks=callbacks
     )
-    called = {m.name for m in _tool_messages(result) if m.name is not None}
+    called = frozenset(m.name for m in _tool_messages(result) if m.name is not None)
     return CheckResult(
         "F4",
         "shell tool withheld",
-        SHELL_TOOL_NAME not in called,
-        f"unbound; tools called: {sorted(called) or 'none'}",
+        _shell_withheld(called=called, answered=result.answered),
+        f"unbound; answered={result.answered}; tools called: {sorted(called) or 'none'}",
     )
 
 
@@ -328,6 +419,31 @@ def check_no_reasoning_content_comes_back(
     )
 
 
+ROUTING_POLICY_SUFFIXES = frozenset({"fastest", "cheapest", "preferred"})
+"""Model-id suffixes that *select among* providers rather than naming one.
+
+`openai/gpt-oss-120b:groq` pins a provider; `:fastest` picks one at request
+time. Omitting the suffix is equivalent to `:fastest`, which is a routing
+decision inherited rather than made -- and measured 2026-09-23 to be the one
+that concentrates traffic on the lowest-latency providers, where the queues
+fill.
+"""
+
+
+def _model_route(model_id: str) -> tuple[str, str | None]:
+    """Split a router model id into `(catalogue id, pinned provider or None)`.
+
+    **The catalogue lists the bare repo id.** A suffixed `config.model` matches
+    nothing in `/v1/models`, so reading the catalogue with the configured id
+    raised "the router does not list ..." the moment a provider was pinned --
+    following F25's own recommendation broke the check that records F25.
+    """
+    repo, _, suffix = model_id.partition(":")
+    if not suffix or suffix in ROUTING_POLICY_SUFFIXES:
+        return repo, None
+    return repo, suffix
+
+
 def check_every_provider_serves_the_context_we_assume(
     config: ModelConfig, _callbacks: list[BaseCallbackHandler]
 ) -> CheckResult:
@@ -345,31 +461,43 @@ def check_every_provider_serves_the_context_we_assume(
     `:provider`, not a check that can never go green — while a *stated* window
     dropping below the floor is the thing that would actually truncate a run.
     """
-    entry = next((m for m in _router_models(config) if m.get("id") == config.model), None)
+    repo, pinned = _model_route(config.model)
+    entry = next((m for m in _router_models(config) if m.get("id") == repo), None)
     # An explicit raise rather than `require()`: this also narrows, and neither
     # type checker can follow a narrowing through a helper call (F10).
     if entry is None:
-        raise CheckFailed(f"the router does not list {config.model}; the check has no subject")
+        raise CheckFailed(f"the router does not list {repo}; the check has no subject")
 
     lengths = {
         str(p.get("provider")): p.get("context_length")
         for p in entry.get("providers", [])
         if isinstance(p, dict)
     }
-    require(lengths, f"the router lists no providers for {config.model}")
+    require(lengths, f"the router lists no providers for {repo}")
+    if pinned is not None:
+        # Narrowed, because a pinned run cannot be served by anyone else -- and
+        # refused rather than narrowed to nothing, since a typo in the pin would
+        # otherwise leave the check passing on an empty set.
+        if pinned not in lengths:
+            raise CheckFailed(
+                f"the router does not serve {repo} via {pinned!r}; "
+                f"available: {sorted(lengths)}"
+            )
+        lengths = {pinned: lengths[pinned]}
     stated = {name: n for name, n in lengths.items() if isinstance(n, int)}
     # Without this the check passes by measuring nothing on the day the router
     # stops publishing context lengths at all.
-    require(stated, f"no provider states a context length for {config.model}: {sorted(lengths)}")
+    require(stated, f"no provider states a context length for {repo}: {sorted(lengths)}")
     shortest = min(stated.values())
     short = sorted(name for name, n in stated.items() if n < CONTEXT_WINDOW_TOKENS)
     unstated = sorted(name for name in lengths if name not in stated)
 
+    scope = f"pinned provider {pinned!r}" if pinned else f"{len(stated)} providers"
     return CheckResult(
         "F25",
         "every provider that states a context window meets our floor",
         not short,
-        f"shortest {shortest} across {len(stated)} providers (floor {CONTEXT_WINDOW_TOKENS}); "
+        f"shortest {shortest} across {scope} (floor {CONTEXT_WINDOW_TOKENS}); "
         f"below floor: {short or 'none'}; unstated (pin :provider to remove the unknown): "
         f"{unstated or 'none'}",
     )
@@ -443,28 +571,74 @@ def _single_turn(config: ModelConfig, prompt: str, callbacks: list[BaseCallbackH
     return 0
 
 
-def _run_checks(config: ModelConfig, callbacks: list[BaseCallbackHandler]) -> int:
-    print(f"tools:  {sorted(DEFAULT_FILESYSTEM_TOOLS)} (+ task)\n")
+def _attempt(
+    check: Callable[[ModelConfig, list[BaseCallbackHandler]], CheckResult],
+    config: ModelConfig,
+    callbacks: list[BaseCallbackHandler],
+) -> CheckResult:
+    """One attempt, with operating errors folded into the verdict.
 
-    results: list[CheckResult] = []
+    The router being down or a provider rejecting the request is a failed
+    attempt, not a crashed program — and now that a check runs k times, it must
+    cost *that attempt* rather than the run, or one slow response would hide
+    every later attempt's evidence. A `CheckFailed` is a bug in our own
+    contracts and must still propagate.
+    """
+    try:
+        return check(config, callbacks)
+    except CheckFailed:
+        raise
+    except Exception as exc:
+        return CheckResult("??", check.__name__, False, f"{type(exc).__name__}: {exc}")
+
+
+def _print_outcome(outcome: CheckOutcome) -> None:
+    """One block per check. A run where everything held stays as short as it
+    was at one attempt, because only failing attempts print their detail —
+    eight checks times five attempts of detail is a wall nobody reads."""
+    print(f"  [{outcome.passes}/{outcome.attempts}] {outcome.finding}  {outcome.name}")
+    if outcome.pass_all:
+        print(f"         {outcome.results[0].detail}")
+        return
+    if outcome.pass_any:
+        print(f"         pass@{outcome.attempts} yes, pass^{outcome.attempts} NO — flaky")
+    else:
+        print(f"         failed every one of {outcome.attempts} attempts")
+    for number, result in enumerate(outcome.results, start=1):
+        if not result.passed:
+            print(f"         attempt {number}: {result.detail}")
+
+
+def _run_checks(
+    config: ModelConfig, callbacks: list[BaseCallbackHandler], repeats: int
+) -> int:
+    """Every check, `repeats` times each, scored pass^k.
+
+    pass^k rather than pass@k because these are invariants: a check that held
+    four times in five did not hold. pass@k is printed anyway, because it is
+    the difference between "this is broken" and "this is non-deterministic",
+    and that difference is invisible at one attempt.
+    """
+    require(repeats >= 1, f"a check run needs at least one attempt, got repeats={repeats}")
+    print(f"tools:  {sorted(DEFAULT_FILESYSTEM_TOOLS)} (+ task)")
+    print(f"repeats: {repeats} per check (exit code reads pass^{repeats})\n")
+
+    outcomes: list[CheckOutcome] = []
     for check in CHECKS:
-        # An operating error — the router is down, a provider rejects the
-        # request — is a failed check, not a crashed program. A CheckFailed is
-        # a bug in our own contracts and must still propagate.
-        try:
-            result = check(config, callbacks)
-        except CheckFailed:
-            raise
-        except Exception as exc:
-            result = CheckResult("??", check.__name__, False, f"{type(exc).__name__}: {exc}")
-        results.append(result)
-        mark = "PASS" if result.passed else "FAIL"
-        print(f"  [{mark}] {result.finding}  {result.name}\n         {result.detail}")
+        results = tuple(_attempt(check, config, callbacks) for _ in range(repeats))
+        outcome = CheckOutcome(results[0].finding, results[0].name, results)
+        outcomes.append(outcome)
+        _print_outcome(outcome)
 
-    require(len(results) == len(CHECKS), "a check produced no result")
-    failed = [r for r in results if not r.passed]
-    print(f"\n{len(results) - len(failed)}/{len(results)} checks passed")
-    return EXIT_CHECK_FAILED if failed else 0
+    require(len(outcomes) == len(CHECKS), "a check produced no outcome")
+    held = [o for o in outcomes if o.pass_all]
+    flaky = [o for o in outcomes if o.pass_any and not o.pass_all]
+    print(f"\n{len(held)}/{len(outcomes)} checks passed (pass^{repeats})")
+    if flaky:
+        # Named rather than merely counted: a flaky check and a broken one both
+        # exit non-zero, and the next reader needs to know which they have.
+        print(f"flaky (passed at least once, not every time): {[o.finding for o in flaky]}")
+    return EXIT_CHECK_FAILED if len(held) != len(outcomes) else 0
 
 
 def main() -> int:
@@ -498,7 +672,7 @@ def main() -> int:
                 print(f"prompt: {prompt}\n")
                 exit_code = _single_turn(config, prompt, callbacks)
             else:
-                exit_code = _run_checks(config, callbacks)
+                exit_code = _run_checks(config, callbacks, live_check_repeats())
         except (
             DeadlineExceeded,
             ResumeLimitExceeded,

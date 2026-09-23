@@ -1,6 +1,6 @@
 # The suite ci.yml deliberately excludes, run on a schedule instead.
 #
-# Why this exists: docs/findings.md is forty-four entries of verified library
+# Why this exists: docs/findings.md is forty-seven entries of verified library
 # and provider behaviour, and CLAUDE.md requires re-verifying it after anything
 # moves. The `-m live` suite is the only thing that exercises the Hugging Face
 # router, LangSmith and Weave, so without a scheduled run nothing re-checks any
@@ -26,12 +26,17 @@ concurrency:
 jobs:
   live:
     runs-on: ubuntu-latest
-    # Generous on purpose, and measured rather than guessed: the suite itself
-    # takes about four seconds, but weave's atexit handler waits on a hardcoded
-    # 300s flush that cannot be bounded from code (docs/findings.md F23). The
-    # first real run of this workflow took 5m51s. A 10-minute ceiling would
-    # leave no headroom and a 5-minute one would have killed a passing run.
-    timeout-minutes: 20
+    # Generous on purpose. The `-m live` suite itself takes about four seconds,
+    # but weave's atexit handler waits on a hardcoded 300s flush that cannot be
+    # bounded from code (docs/findings.md F23), and this workflow now pays that
+    # twice -- once per process. The first real run took 5m51s with one process
+    # and no repeats.
+    #
+    # The 45 is an ESTIMATE, not a measurement: 8 checks x 5 attempts is ~40
+    # live turns whose duration has never been recorded, plus the second 300s
+    # flush. Replace it with the observed number after the first real run --
+    # the 20 above was measured, and this is not yet.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
 
@@ -84,3 +89,30 @@ jobs:
             exit 1
           }
           tail -5 live.log
+
+      # The eight checks in main.py, which nothing scheduled until now: they
+      # are the only end-to-end measurement of the findings against a real
+      # provider, and they ran solely when a human typed the command. Separate
+      # from the step above because it is a separate program -- `-m live` is
+      # two pytest tests and does not touch these.
+      - name: Live checks (pass^k)
+        if: steps.secrets.outputs.ready == 'true'
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          LANGSMITH_API_KEY: ${{ secrets.LANGSMITH_API_KEY }}
+          LANGSMITH_TRACING: "true"
+          LANGSMITH_PROJECT: my-agent
+          WANDB_API_KEY: ${{ secrets.WANDB_API_KEY }}
+          WEAVE_PROJECT: my-agent
+          # Stated rather than inherited, so the schedule's k is visible here
+          # and not only in main.py's default.
+          LIVE_CHECK_REPEATS: "5"
+        # Same redirect-never-pipe rule as above, same reason (F23): weave's
+        # teardown runs after the program reports, so `| tail` would yield
+        # tail's exit status and discard the tally.
+        run: |
+          uv run my-agent > checks.log 2>&1 || {
+            tail -60 checks.log
+            exit 1
+          }
+          tail -20 checks.log

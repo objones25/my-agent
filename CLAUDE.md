@@ -1,7 +1,7 @@
 # CLAUDE.md
 
 Guidance for Claude Code in this repository. `README.md` says what the project is; this is the
-contributor's contract, and **`docs/findings.md` (F1–F44) is the evidence behind it** — read it
+contributor's contract, and **`docs/findings.md` (F1–F47) is the evidence behind it** — read it
 before debugging anything that looks like a library bug, and add to it when you verify something
 new.
 
@@ -23,7 +23,8 @@ uv run pytest -m live > live.log 2>&1     # real HF router / LangSmith / W&B. Re
                                           # pipe (`| tail; echo $?` yields tail's status), and
                                           # expect ~5 min to exit after a ~4s suite (F23).
 uv run pytest -m eval                     # the eval suite
-uv run my-agent                           # live checks: one per finding in docs/findings.md
+uv run my-agent                           # the eight live checks (docs/findings.md, "Live
+                                          # verification") x LIVE_CHECK_REPEATS, scored pass^k
 uv run my-agent "your prompt here"        # one ordinary turn instead
 uv run ruff check . --fix                 # lint
 uv run mypy                               # type check (strict; src + tests)
@@ -264,21 +265,21 @@ Bugs live in the states the code was never written to handle. Write those down a
 
 ## Testing and evals
 
-Keep them apart. 462 offline tests and 2 live as of 2026-09-22.
+Keep them apart. 502 offline tests and 2 live as of 2026-09-23; `evals/` is still empty.
 
 - **Unit tests** (`tests/`, default selection) are deterministic and offline. One test file per
   source module; a new module gets a new file, not an extra section in an existing one. They test
   the harness: protocol conformance, wiring, bounds, error paths. For each `require()`, a test that
-  trips it — that is what turns a contract into a tested contract. **Outside two named
-  exclusions, that is now the state rather than the goal.** Measured 2026-09-22 by wrapping
-  `require()` in a pytest plugin that logs its call site whenever it raises, then diffing against
-  an AST walk — not by reading coverage, and not by counting by hand: **108 `require()` sites, 83
-  tripped; 16 `raise CheckFailed` sites, 15 tripped.** The 26 that remain are exactly two groups:
+  trips it — that is what turns a contract into a tested contract. **Outside one named exclusion,
+  that is now the state rather than the goal.** Measured 2026-09-23 by wrapping `require()` and
+  `CheckFailed` in pytest plugins that log their call site whenever one raises, then diffing against
+  an AST walk — not by reading coverage, and not by counting by hand: **113 `require()` sites, 103
+  tripped; 16 `raise CheckFailed` sites outside the helpers, 15 tripped.**
 
-    - **15 import-time**, which no test can trip without `importlib.reload` against a patched
-      library. Reachable in principle; nothing here does it yet.
-    - **11 in `main.py`**, left alone deliberately — it is scaffolding, and a check there is worth
-      a findings entry rather than a fix round.
+  **All 11 that remain are in `main.py`**, left alone deliberately — it is scaffolding, and a check
+  there is worth a findings entry rather than a fix round. **No import-time check is untripped any
+  more**: the ones a reload can reach are driven by the `tripping_an_import_time_check` fixture, and
+  the ones it could not reach moved into functions (F44, and the bullet below).
 
   Nothing else in `src/` has an untripped check. **Keep it that way**: a new `require()` lands with
   the test that trips it, or the count above stops being true and nobody notices, which is the
@@ -312,7 +313,13 @@ Keep them apart. 462 offline tests and 2 live as of 2026-09-22.
   raise lives in `negative_space.py` and the call site reads as covered whether or not the predicate
   ever went false.
 - **Evals** (`evals/`, `-m eval`) measure model-dependent behaviour and are allowed to be
-  non-deterministic and slow. A failing eval is a signal, not a broken build. Empty today.
+  non-deterministic and slow. A failing eval is a signal, not a broken build. Empty today — the
+  eight live checks in `main.py` are the closest thing, and they are *not* evals: they assert
+  harness invariants, so they are scored **pass^k** and a single failed attempt fails the run.
+  **A non-deterministic check needs more than one attempt or it measures nothing you can act on.**
+  `LIVE_CHECK_REPEATS` (5) is uniform across all eight on purpose: which of them can actually vary
+  has not been measured, and calling five of them deterministic would be the untested assumption
+  the repeats exist to remove. Pin per-check counts once there is a number (F45).
 - `-m live` marks anything touching the HF router, LangSmith or W&B. `addopts` carries `-m "not live
   and not eval"`, so both are deselected by default; a command-line `-m live` overrides it.
   Registering a marker does *not* deselect it — a real gap here until it was measured.
@@ -463,18 +470,18 @@ Everything in this table lives in `src/my_agent/`.
 |---|---|
 | `model.py` | `ModelConfig`, `build_model`, router defaults, `USE_RESPONSES_API`. Reads `os.environ` via `from_env`; the only module that knows the router exists. |
 | `agent.py` | `AgentConfig`, `build_agent`. Takes a `BaseChatModel` and imports nothing from `model.py` — `main.py` is the only place the two meet. Compiles **twice**: the second build is what puts a step limit on the `task` subagent (F24). |
-| `capabilities.py` | The allowlist and the proof it held: `DEFAULT_FILESYSTEM_TOOLS`, `least_privilege_filesystem`, `compiled_tools`, `compiled_tool_names`, `subagent_graphs`, `bound_step_limit`, `require_withheld`/`require_granted`, `compiled_output_keys`, plus the bounds on granted capabilities (`PARENT_STEP_LIMIT`, `SUBAGENT_STEP_LIMIT`, `GREP_MATCH_LIMIT`, the eviction limits, `bounded_compaction` and `CONTEXT_WINDOW_TOKENS`) and the `DEEPAGENTS_PLUGIN_GROUPS` / `DEEPAGENTS_CACHING_PROBE_MODULES` pins. |
+| `capabilities.py` | The allowlist and the proof it held: `DEFAULT_FILESYSTEM_TOOLS`, `least_privilege_filesystem`, `compiled_tools`, `compiled_tool_names`, `subagent_graphs`, `bound_step_limit`, `require_withheld`/`require_granted`, `compiled_output_keys`, plus the bounds on granted capabilities (`PARENT_STEP_LIMIT`, `SUBAGENT_STEP_LIMIT`, `GREP_MATCH_LIMIT`, the eviction limits, `bounded_compaction` and `CONTEXT_WINDOW_TOKENS`) and the `DEEPAGENTS_PLUGIN_GROUPS` / `DEEPAGENTS_CACHING_PROBE_MODULES` / `HARNESS_PROFILE_FIELDS` pins plus `require_no_harness_profile` (F47). |
 | `contracts.py` | `check_config_contract`, `pydantic_param_names` — the import-time check that makes `as_kwargs()` splatting safe. |
 | `run.py` | `Invokable`, `RunBounds`, `RunDeadline`, `RunTokenBudget`, `TurnResult`, `run_turn`, `resume_turn` — one bounded turn, with three outcomes: finished, failed (`DeadlineExceeded`, `StepLimitExceeded`, `TokenLimitExceeded`, `ResumeLimitExceeded`) or paused for approval, `failed_tool_calls` for a turn that finished without doing what it says, `answered` for a turn cut off before its answer began, and `state` — every key the graph returned bar `messages`/`__interrupt__`, with `files` and `structured_response` as properties over it. `_invoke` used to read `messages` and drop the rest (F40, F43). Owns the step limit, the wall clock and token budget across a pause, the resume count, the thread and multi-turn history. Imports no deepagents and builds no model. |
-| `main.py` | `uv run my-agent` — the composition root, and the live checks (one per finding). |
+| `main.py` | `uv run my-agent` — the composition root, and the eight live checks (`CheckOutcome`, `live_check_repeats`, pass^k). |
 | `negative_space.py` | `require`/`unreachable`/`bounded`, and the only doctests in `src/`. |
 | `tracing.py` | `TracingBackend`, `LangSmithTracing`, `WeaveTracing`, `available_backends`, `langchain_tracer_names`. |
-| `mirror.py` | `JsonlMirror`, `run_log_path`, `mirror_to_file` — the always-on local JSONL mirror of every agent event, including the per-call request size and a per-run per-tool byte breakdown (F30). |
+| `mirror.py` | `JsonlMirror`, `run_log_path`, `mirror_to_file` — the always-on local JSONL mirror of every agent event, including the per-call request size, a per-run per-tool byte breakdown (F30) and the server's retry advice on a failed model call (F46). |
 
 `tests/` mirrors that one file per module, offline by default, plus `conftest.py` for shared
 fixtures and the socket guard. The only `-m live` tests are one each at the end of `test_tracing.py`
 (calls the real `weave.init()` and hits the router) and `test_run.py` (proves multi-turn history
-against a real graph, which a fake cannot show). `evals/` is empty. `docs/findings.md` holds F1–F44
+against a real graph, which a fake cannot show). `evals/` is empty. `docs/findings.md` holds F1–F47
 plus the repo-gates, deepagents-surface, test-infrastructure and observability appendices;
 `scripts/audit_negative_space.py` is **vendored** from the negative-space-programming skill — do not
 hand-edit it, refresh by re-copying (it is excluded from ruff and mypy).
