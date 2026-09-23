@@ -18,7 +18,7 @@ from importlib import util
 from importlib.metadata import entry_points
 from typing import Any, get_args, get_type_hints
 
-from deepagents import FilesystemMiddleware, FilesystemPermission, FsToolName
+from deepagents import FilesystemMiddleware, FilesystemPermission, FsToolName, HarnessProfile
 from deepagents.backends import StateBackend
 from deepagents.backends.protocol import BackendProtocol
 from deepagents.middleware import SummarizationMiddleware
@@ -294,6 +294,111 @@ for _name, _pinned in _PINNED_FS_BOUNDS.items():
         f"deepagents changed its default for {_name}: ours is {_pinned}, theirs is now "
         f"{_FS_SIGNATURE[_name].default}. Review the bound deliberately before updating.",
     )
+
+HARNESS_PROFILE_FIELDS = (
+    "base_system_prompt",
+    "system_prompt_suffix",
+    "tool_description_overrides",
+    "excluded_tools",
+    "excluded_middleware",
+    "extra_middleware",
+    "general_purpose_subagent",
+)
+"""Every knob a matching `HarnessProfile` could turn, pinned as literals.
+
+Written down rather than introspected for two reasons. A new field upstream is a
+new way to reconfigure the agent, and a hardcoded read of
+`dataclasses.fields()` would quietly leave it out of the diagnostic instead of
+failing; `require_known_harness_profile_fields` makes that an import failure.
+
+And `dataclasses.fields()` on a third-party class is a typing disagreement:
+pyright 1.1.414 (standard) accepts it, Pylance's bundled build rejects
+`HarnessProfile` as not matching `DataclassInstance`, though it *is* a dataclass
+at runtime. A literal tuple is a fact both checkers agree on and does not depend
+on upstream staying a dataclass at all (F16's rule, applied to a library type).
+"""
+
+
+def require_known_harness_profile_fields(
+    actual: tuple[str, ...], expected: tuple[str, ...] = HARNESS_PROFILE_FIELDS
+) -> None:
+    """Fail when the installed `HarnessProfile` gained or lost a field.
+
+    Called at import with the real class, and callable by a test with bad
+    arguments -- the shape `contracts.check_known_parameters` established, for
+    the reason F44 records: a module-level check is only drivable by reloading,
+    and reloading a module that defines classes rebinds them.
+    """
+    if tuple(actual) != tuple(expected):
+        raise CheckFailed(
+            f"the installed HarnessProfile fields are {tuple(actual)}, pinned as "
+            f"{tuple(expected)}; a field here is another way a profile reconfigures "
+            f"the agent, so update the pin deliberately"
+        )
+
+
+def require_no_harness_profile(model: BaseChatModel) -> None:
+    """Fail if deepagents resolves a `HarnessProfile` for this model.
+
+    **The second door, and `DEEPAGENTS_PLUGIN_GROUPS` cannot see it.** That pin
+    asserts the two *entry-point* groups are empty. deepagents registers its own
+    builtin profiles by explicit module import instead -- its bootstrap says so
+    outright, so "a malformed or missing dist-info cannot silently disable the
+    SDK's own defaults" -- and those never appear as entry points.
+
+    Resolution reaches a pre-built model instance, which is the part that makes
+    this matter here. `_harness_profile_for_model(model, spec=None)` derives a
+    provider and identifier from the object and tries `provider:identifier`,
+    then the identifier, then **a bare provider key**. Our model reports
+    provider `openai` and identifier `openai/gpt-oss-120b`; 0.7.15 registers
+    three exact `openai:gpt-5.x-codex` keys and no bare `openai`, so nothing
+    matches. One upstream release adding provider-wide `openai` defaults changes
+    that with no call site to read it at.
+
+    A matching profile may replace the base system prompt, append a suffix,
+    override tool descriptions, exclude tools, strip middleware, append
+    middleware, and reconfigure the general-purpose subagent. `require_withheld`
+    would still catch a tool change; nothing here can see a prompt or middleware
+    change after the fact (F41), so this is asserted before the build.
+
+    Reaching into `_harness_profile_for_model` is deliberate: it is deepagents'
+    own resolution order, so a change to key semantics keeps this correct where
+    a hand-rolled registry scan would quietly stop matching.
+    """
+    from deepagents.profiles.harness.harness_profiles import (  # noqa: PLC0415
+        HarnessProfile,
+        _harness_profile_for_model,
+    )
+
+    require(
+        isinstance(model, BaseChatModel),
+        f"expected a BaseChatModel to resolve a harness profile for, "
+        f"got {type(model).__name__}",
+    )
+    profile = _harness_profile_for_model(model, None)
+    empty = HarnessProfile()
+    if profile == empty:
+        return
+    changed = [
+        name
+        for name in HARNESS_PROFILE_FIELDS
+        if getattr(profile, name) != getattr(empty, name)
+    ]
+    raise CheckFailed(
+        f"deepagents resolved a harness profile for {type(model).__name__}, which would "
+        f"change {changed} with no call site to read it at; "
+        f"DEEPAGENTS_PLUGIN_GROUPS cannot see this door because builtin profiles are "
+        f"registered by module import, not entry point"
+    )
+
+
+# `getattr` rather than `dataclasses.fields()`: see HARNESS_PROFILE_FIELDS for
+# why that call is a checker disagreement. If upstream ever stops being a
+# dataclass this yields `()` and the pin fails loudly, which is the right end.
+require_known_harness_profile_fields(
+    tuple(getattr(HarnessProfile, "__dataclass_fields__", {}))
+)
+
 
 DEEPAGENTS_PLUGIN_GROUPS = (
     "deepagents.harness_profiles",

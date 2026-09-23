@@ -419,6 +419,31 @@ def check_no_reasoning_content_comes_back(
     )
 
 
+ROUTING_POLICY_SUFFIXES = frozenset({"fastest", "cheapest", "preferred"})
+"""Model-id suffixes that *select among* providers rather than naming one.
+
+`openai/gpt-oss-120b:groq` pins a provider; `:fastest` picks one at request
+time. Omitting the suffix is equivalent to `:fastest`, which is a routing
+decision inherited rather than made -- and measured 2026-09-23 to be the one
+that concentrates traffic on the lowest-latency providers, where the queues
+fill.
+"""
+
+
+def _model_route(model_id: str) -> tuple[str, str | None]:
+    """Split a router model id into `(catalogue id, pinned provider or None)`.
+
+    **The catalogue lists the bare repo id.** A suffixed `config.model` matches
+    nothing in `/v1/models`, so reading the catalogue with the configured id
+    raised "the router does not list ..." the moment a provider was pinned --
+    following F25's own recommendation broke the check that records F25.
+    """
+    repo, _, suffix = model_id.partition(":")
+    if not suffix or suffix in ROUTING_POLICY_SUFFIXES:
+        return repo, None
+    return repo, suffix
+
+
 def check_every_provider_serves_the_context_we_assume(
     config: ModelConfig, _callbacks: list[BaseCallbackHandler]
 ) -> CheckResult:
@@ -436,31 +461,43 @@ def check_every_provider_serves_the_context_we_assume(
     `:provider`, not a check that can never go green — while a *stated* window
     dropping below the floor is the thing that would actually truncate a run.
     """
-    entry = next((m for m in _router_models(config) if m.get("id") == config.model), None)
+    repo, pinned = _model_route(config.model)
+    entry = next((m for m in _router_models(config) if m.get("id") == repo), None)
     # An explicit raise rather than `require()`: this also narrows, and neither
     # type checker can follow a narrowing through a helper call (F10).
     if entry is None:
-        raise CheckFailed(f"the router does not list {config.model}; the check has no subject")
+        raise CheckFailed(f"the router does not list {repo}; the check has no subject")
 
     lengths = {
         str(p.get("provider")): p.get("context_length")
         for p in entry.get("providers", [])
         if isinstance(p, dict)
     }
-    require(lengths, f"the router lists no providers for {config.model}")
+    require(lengths, f"the router lists no providers for {repo}")
+    if pinned is not None:
+        # Narrowed, because a pinned run cannot be served by anyone else -- and
+        # refused rather than narrowed to nothing, since a typo in the pin would
+        # otherwise leave the check passing on an empty set.
+        if pinned not in lengths:
+            raise CheckFailed(
+                f"the router does not serve {repo} via {pinned!r}; "
+                f"available: {sorted(lengths)}"
+            )
+        lengths = {pinned: lengths[pinned]}
     stated = {name: n for name, n in lengths.items() if isinstance(n, int)}
     # Without this the check passes by measuring nothing on the day the router
     # stops publishing context lengths at all.
-    require(stated, f"no provider states a context length for {config.model}: {sorted(lengths)}")
+    require(stated, f"no provider states a context length for {repo}: {sorted(lengths)}")
     shortest = min(stated.values())
     short = sorted(name for name, n in stated.items() if n < CONTEXT_WINDOW_TOKENS)
     unstated = sorted(name for name in lengths if name not in stated)
 
+    scope = f"pinned provider {pinned!r}" if pinned else f"{len(stated)} providers"
     return CheckResult(
         "F25",
         "every provider that states a context window meets our floor",
         not short,
-        f"shortest {shortest} across {len(stated)} providers (floor {CONTEXT_WINDOW_TOKENS}); "
+        f"shortest {shortest} across {scope} (floor {CONTEXT_WINDOW_TOKENS}); "
         f"below floor: {short or 'none'}; unstated (pin :provider to remove the unknown): "
         f"{unstated or 'none'}",
     )

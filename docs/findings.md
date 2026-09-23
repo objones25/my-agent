@@ -1774,11 +1774,12 @@ Three things this run settles, none of them the thing it was built to measure:
 1. **The predicted flake did not happen.** The prediction was that the model
    would sometimes decline to call `write_file`. It called it every time it got
    a response. The observed variance is entirely provider-side.
-2. **The repeats caused the failure they detected.** Both 429s were on
-   attempts 4 and 5 of the *fourth* check — the deepest point of the run's
-   request burst. At one attempt per check this never appeared. That is not an
-   argument against repeats; it is the first real evidence about what this
-   harness does under its own load, which n=1 structurally could not produce.
+2. ~~**The repeats caused the failure they detected.**~~ **Withdrawn
+   2026-09-23.** A second run measured 1 request in the prior second before its
+   429, and cumulative counts of 25/27 versus 65 — no burst and no quota. The
+   429 is provider-side queue pressure on an unpinned `:fastest` route, not our
+   load. What survives is that the repeats *surfaced* it: n=1 structurally could
+   not. See `docs/2026-09-23-provider-429-investigation.md`.
 3. **`shell_tool_withheld` passed 5/5 with `answered=True; tools called: none`** —
    exactly the shape the new discriminator exists to distinguish from a vacuous
    pass. Before this change that line would have read as a pass either way.
@@ -1890,14 +1891,119 @@ chosen.
 
 ### Open
 
-- **Which veto it is.** `x-should-retry: false` or an over-cap `Retry-After`.
-  The capture above answers it on the next 429; until then both are consistent
-  with the evidence and both imply the same thing.
-- Whether the 429 reproduces at all. It appeared on attempts 4 and 5 of the
-  fourth check, the deepest point of a ~40-turn burst that `_run_checks` fires
-  with no pacing — self-inflicted, and not yet shown to be repeatable.
-- What the router's actual rate limit is. Not published as far as this has
-  looked, and not measured.
+- ~~Which veto it is.~~ **Answered on the next run, 2026-09-23**, by the
+  capture above: `{"status_code": 429, "x-should-retry": "false"}`. The router
+  sets the header explicitly.
+- ~~Whether the 429 reproduces, and whether our own burst caused it.~~
+  **Answered: it reproduces, and we did not cause it.** 3 of 127 calls across
+  two runs, at 1–2 requests per second. The cause is the `:fastest` routing
+  policy an unsuffixed model id selects by default, which concentrates every
+  caller on the lowest-latency providers. **The lever is provider pinning, not
+  retry and not pacing** — a rate limiter cannot pace its way out of another
+  tenant's queue. Full write-up, including why a scoring change was rejected and
+  why `.with_fallbacks()` is unusable here:
+  `docs/2026-09-23-provider-429-investigation.md`.
+- ~~Whether pinning removes the 429s.~~ **Two runs say yes**: pinned to
+  `:groq`, **0 of 130 calls rate-limited**, against 3 of 127 unpinned, and the
+  second run was 8/8 pass^5 with exit 0. P(0 in 130 | 2.36%) = 4.5%, so about
+  1 in 22 by chance — supporting, not proof, and not controlled for the router
+  being quieter three hours later. The mechanism agrees, and the fingerprint
+  decode identified `cerebras`
+  (`fp_752b9cb17e04d95d05c3`, the lowest-latency provider of the eleven) as one
+  of the two backends serving the unpinned runs.
+- **`DEFAULT_MODEL` is still the bare id**, so the harness still defaults to
+  `:fastest`. Making the pin the default is a one-literal change and a decision
+  nobody has taken yet.
+- What the router's actual per-provider limit is. Not published as far as this
+  has looked, and not measured.
+
+---
+
+## F47 — harness profiles are a second door, and the entry-point pin cannot see it
+
+**Severity: important.** `DEEPAGENTS_PLUGIN_GROUPS` covers third-party plugins.
+deepagents registers its own profiles a different way.
+
+From `deepagents/profiles/_builtin_profiles.py`, the library's own docstring:
+
+> "Built-in provider and harness profiles are registered via explicit module
+> imports — **not entry points** — so a malformed or missing `dist-info` in the
+> environment cannot silently disable the SDK's own defaults."
+
+Two registries, and only one of them can reach us:
+
+| | `ProviderProfile` | `HarnessProfile` |
+|---|---|---|
+| payload | `init_kwargs` → `init_chat_model` | prompt, tools, middleware, subagent |
+| applies to a model **string** | yes | yes |
+| applies to a pre-built **instance** | **no** | **yes** |
+
+Provider profiles are inert here, which is F28: their payload only fires when
+deepagents *constructs* the model, and `build_agent` refuses strings.
+
+**Harness profiles are not.** `_harness_profile_for_model(model, spec=None)` has
+an explicit branch for pre-built instances: it derives provider and identifier
+from the object and tries `provider:identifier`, then the identifier, then
+**a bare provider key**. Measured:
+
+```
+identifier: openai/gpt-oss-120b     provider: openai
+resolved  : HarnessProfile()        # empty, today
+```
+
+0.7.15 registers 14 keys, all exact `provider:model`, three of them under
+`openai:` (`gpt-5.1-codex`, `gpt-5.2-codex`, `gpt-5.3-codex`). No bare `openai`
+— so nothing matches, and **that was a comment in `capabilities.py` rather than
+a check.** A release adding provider-wide `openai` defaults would apply to us
+with no call site to read it at. A matching profile may replace the system
+prompt, override tool descriptions, exclude tools, strip middleware, append
+middleware and reconfigure `general-purpose`. `_require_shell_withheld` catches
+the tool half; **nothing reads a prompt or middleware change back off a compiled
+graph** (F41).
+
+### What we do
+
+`capabilities.require_no_harness_profile(model)`, called by `build_agent`
+*before* the build. It resolves through deepagents' own
+`_harness_profile_for_model`, so a change to key semantics keeps it correct
+rather than quietly ceasing to match, and the error names the fields the profile
+would change.
+
+`HARNESS_PROFILE_FIELDS` pins the seven field names as literals, checked at
+import by `require_known_harness_profile_fields`. Three reasons, not one: a new
+field upstream is a new reconfiguration knob and must be loud rather than
+missing from the diagnostic; a literal tuple does not depend on upstream
+remaining a dataclass; and `dataclasses.fields()` on `HarnessProfile` is a
+**checker disagreement** — pyright 1.1.414 accepts it, Pylance rejects
+`HarnessProfile` as not matching `DataclassInstance` although it *is* a
+dataclass at runtime. F16's rule, applied to a library type.
+
+### Also recorded here
+
+**`ModelFallbackMiddleware`'s string form is a silent redirect.**
+`init_chat_model("openai:openai/gpt-oss-120b")` raises
+`OpenAIError: Missing credentials ... set the OPENAI_API_KEY env var` — it is
+building a client against **api.openai.com**, not the router. It failed only
+because that variable is unset here. `build_model`'s postcondition guards this
+redirect; a fallback string never passes through `build_model`. Instances only.
+
+**`.with_fallbacks()` cannot be the model.** It returns `RunnableWithFallbacks`;
+`build_agent` refuses it and `create_deep_agent` dies with
+`AttributeError: 'ChatOpenAI' object has no attribute 'partition'`.
+
+**`Pregel` overrides `with_config` to return `Self`** via `.copy()` and
+`merge_configs`, so `build_agent`'s annotation is honest and the merge is why
+F24's route works at all.
+
+Full write-up: `docs/2026-09-23-deepagents-profiles.md`.
+
+### Open
+
+- Whether `excluded_middleware` in a matching profile could strip our
+  `FilesystemMiddleware`, and whether `_require_shell_withheld` catches it.
+  Untested: no profile matches to try it with.
+- `GeneralPurposeSubagentProfile`'s fields, unexamined. The supported hook for
+  what `agent.py` currently does by rebinding a `CompiledSubAgent` (F24).
 
 ---
 
@@ -2037,7 +2143,7 @@ main checkout run a `scripts/check.sh` that may not exist on the branch checked 
 
 **Three scans run on this repo and only two are files here.** `ci.yml` runs the gate on every push
 and pull request. `.github/workflows/live.yml` runs `-m live` weekly (Mondays 06:00 UTC) and on
-demand, because this file is forty-six verified behaviours and nothing else re-checks any of
+demand, because this file is forty-seven verified behaviours and nothing else re-checks any of
 them; it skips rather than fails when `HF_TOKEN` is absent, so an unconfigured clone does not
 produce a weekly red X that means nothing, and it never gates a commit. **CodeQL is the third and it
 is not a file here** — it uses GitHub's default setup, so the workflow is generated and managed by
@@ -2071,7 +2177,7 @@ prompt to re-verify CLAUDE.md's version block — not a reason to skip that step
 ## Live verification
 
 `uv run my-agent` runs eight checks against the real router and prints PASS/FAIL. Each is tied to
-a finding; seven findings are covered, not all forty-six. Each runs `LIVE_CHECK_REPEATS` times
+a finding; seven findings are covered, not all forty-seven. Each runs `LIVE_CHECK_REPEATS` times
 and the run is scored pass^k (F45). The 8/8 below is from 2026-09-18, exit 0, both tracers
 active — **at one attempt each**, before the repeats existed:
 
@@ -2144,7 +2250,7 @@ Each of these is also noted at the finding it belongs to.
   with no read-back.
 - ~~Whether the import-time check sites can be tripped by a test.~~ **Closed by F44.** Re-measured
   2026-09-23 by wrapping `require()` and `CheckFailed` in pytest plugins that log a raising call
-  site, then diffing against an AST walk: **102 of 112 `require()` sites and 12 of 13
+  site, then diffing against an AST walk: **103 of 113 `require()` sites and 15 of 16
   `raise CheckFailed` sites outside the helpers are tripped**, and all 11 untripped sites are in
   `main.py`, deliberately left. No import-time check is untripped.
 

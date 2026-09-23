@@ -30,7 +30,7 @@ seam. When a real domain is chosen, it should slot in behind the protocols liste
 - **A turn returns a record, not just a reply.** `TurnResult` carries the tool calls that failed,
   whether an answer was ever begun, and the agent's own filesystem as the graph returned it, so
   "did it do the thing" has something to read that is not the model's prose.
-- **Library behaviour recorded rather than assumed.** `docs/findings.md` holds forty-six
+- **Library behaviour recorded rather than assumed.** `docs/findings.md` holds forty-seven
   verified findings, each with how it was checked and what the code does about it. Eight of them
   are additionally re-checked against the live router by `uv run my-agent`.
 - **Tests that are checked for being able to fail.** Changes here are verified by breaking the
@@ -108,7 +108,7 @@ see Setup) and `.github/workflows/ci.yml` both call it and re-list nothing.
 | Path | What it holds |
 |---|---|
 | `CLAUDE.md` | The contributor's contract: architecture, non-negotiables, verified API facts |
-| `docs/findings.md` | F1-F46: verified library, provider and test-suite behaviour, and what the code does about each |
+| `docs/findings.md` | F1-F47: verified library, provider and test-suite behaviour, and what the code does about each |
 | `evals/` | Empty. Where a model-dependent eval suite would go once a domain exists |
 | `docs/superpowers/specs/` | Design documents |
 | `src/my_agent/capabilities.py` | The allowlist and the proof it held |

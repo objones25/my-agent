@@ -23,6 +23,7 @@ from deepagents import (
     FilesystemMiddleware,
     FilesystemPermission,
     FsToolName,
+    HarnessProfile,
     create_deep_agent,
 )
 from deepagents.backends import FilesystemBackend, StateBackend
@@ -33,6 +34,7 @@ from deepagents.middleware.summarization import (
     create_summarization_middleware,
 )
 from deepagents.profiles import _builtin_profiles
+from deepagents.profiles.harness import harness_profiles
 from langchain.agents.middleware import ToolCallLimitMiddleware
 from langchain_core.language_models import BaseChatModel
 from langchain_core.language_models.fake_chat_models import ParrotFakeChatModel
@@ -52,6 +54,7 @@ from my_agent.capabilities import (
     DEEPAGENTS_PLUGIN_GROUPS,
     DEFAULT_FILESYSTEM_TOOLS,
     GREP_MATCH_LIMIT,
+    HARNESS_PROFILE_FIELDS,
     HUMAN_MESSAGE_TOKEN_LIMIT,
     LIBRARY_COMPACTION_TRIGGER_TOKENS,
     LIBRARY_STEP_LIMIT,
@@ -71,6 +74,8 @@ from my_agent.capabilities import (
     least_privilege_filesystem,
     require_compaction_fits_the_window,
     require_granted,
+    require_known_harness_profile_fields,
+    require_no_harness_profile,
     require_withheld,
     subagent_graphs,
 )
@@ -1325,3 +1330,101 @@ def test_the_real_compaction_trigger_leaves_room_below_the_real_window(
             COMPACTION_TRIGGER_TOKENS, CONTEXT_WINDOW_TOKENS
         )
     )
+
+
+# --------------------------------------------------------------------------
+# The builtin harness-profile registry is a door the entry-point pin cannot see
+# --------------------------------------------------------------------------
+
+
+def test_no_harness_profile_matches_a_model_nothing_is_registered_for(
+    assert_does_not_raise: Callable[[Callable[[], object]], None],
+) -> None:
+    """The discriminator. Without it, a check that always passed would look
+    identical to one that verified something."""
+    assert_does_not_raise(lambda: require_no_harness_profile(ParrotFakeChatModel()))
+
+
+def test_a_harness_profile_registered_for_the_model_fails_the_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`DEEPAGENTS_PLUGIN_GROUPS` pins the *entry-point* door. deepagents
+    registers its own builtins by explicit module import instead, and resolution
+    falls back to a bare provider key — so a future `openai` profile would
+    rewrite our system prompt, tool descriptions and middleware with nothing
+    asserting otherwise."""
+    harness_profiles._ensure_harness_profiles_loaded()
+    monkeypatch.setitem(
+        harness_profiles._HARNESS_PROFILES,
+        "parrotfakechatmodel",
+        HarnessProfile(system_prompt_suffix="answer only in haiku"),
+    )
+
+    with pytest.raises(CheckFailed, match="harness profile"):
+        require_no_harness_profile(ParrotFakeChatModel())
+
+
+def test_the_harness_profile_check_names_what_the_profile_would_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tripped check that says only "a profile matched" sends the next reader
+    to the library source. The fields it would change are the whole point."""
+    harness_profiles._ensure_harness_profiles_loaded()
+    monkeypatch.setitem(
+        harness_profiles._HARNESS_PROFILES,
+        "parrotfakechatmodel",
+        HarnessProfile(excluded_tools=frozenset({"write_file"})),
+    )
+
+    with pytest.raises(CheckFailed, match="excluded_tools"):
+        require_no_harness_profile(ParrotFakeChatModel())
+
+
+def test_the_pinned_harness_profile_fields_match_the_installed_class() -> None:
+    """Pinned to literals, not read off the class: a tuple compared to
+    `dataclasses.fields()` of the same object is a tautology (F42). This is what
+    makes an upstream field addition a build failure instead of a field silently
+    missing from the diagnostic."""
+    assert HARNESS_PROFILE_FIELDS == (
+        "base_system_prompt",
+        "system_prompt_suffix",
+        "tool_description_overrides",
+        "excluded_tools",
+        "excluded_middleware",
+        "extra_middleware",
+        "general_purpose_subagent",
+    )
+
+
+def test_a_harness_profile_that_grew_a_field_fails_the_pin() -> None:
+    """The check that makes the pin above worth having."""
+    with pytest.raises(CheckFailed, match="HarnessProfile fields"):
+        require_known_harness_profile_fields(
+            (*HARNESS_PROFILE_FIELDS, "excluded_subagents"), HARNESS_PROFILE_FIELDS
+        )
+
+
+def test_a_harness_profile_that_lost_a_field_fails_the_pin() -> None:
+    with pytest.raises(CheckFailed, match="HarnessProfile fields"):
+        require_known_harness_profile_fields(
+            HARNESS_PROFILE_FIELDS[:-1], HARNESS_PROFILE_FIELDS
+        )
+
+
+def test_the_installed_harness_profile_still_matches_the_pin(
+    assert_does_not_raise: Callable[[Callable[[], object]], None],
+) -> None:
+    """The discriminator: the two tests above pass against a check that always
+    raises."""
+    actual = tuple(getattr(HarnessProfile, "__dataclass_fields__", {}))
+    assert_does_not_raise(
+        lambda: require_known_harness_profile_fields(actual, HARNESS_PROFILE_FIELDS)
+    )
+
+
+def test_resolving_a_harness_profile_for_a_non_model_is_a_programmer_error() -> None:
+    """`build_agent` checks this first, so the precondition is unreachable
+    through it — which is exactly why it needs its own test rather than being
+    assumed covered."""
+    with pytest.raises(CheckFailed, match="BaseChatModel to resolve a harness profile"):
+        require_no_harness_profile("openai/gpt-oss-120b")  # type: ignore[arg-type]

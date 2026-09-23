@@ -487,3 +487,85 @@ def test_a_turn_that_never_answered_is_not_evidence_that_execute_is_unreachable(
     it answered says nothing about whether `execute` could have been called —
     the same vacuity the allowlist tests guard against, on the live path."""
     assert main_module._shell_withheld(called=frozenset(), answered=False) is False
+
+
+# --------------------------------------------------------------------------
+# A pinned model id is a routing suffix, not a catalogue id (F25)
+# --------------------------------------------------------------------------
+
+
+def test_an_unsuffixed_model_id_pins_no_provider() -> None:
+    assert main_module._model_route("openai/gpt-oss-120b") == ("openai/gpt-oss-120b", None)
+
+
+def test_a_provider_suffix_is_split_off_and_reported() -> None:
+    """The bug this closes: the router's catalogue lists the bare repo id, so a
+    pinned `config.model` matched nothing and the check raised
+    "the router does not list ..." — following F25's own advice broke F25."""
+    assert main_module._model_route("openai/gpt-oss-120b:groq") == (
+        "openai/gpt-oss-120b",
+        "groq",
+    )
+
+
+@pytest.mark.parametrize("policy", ["fastest", "cheapest", "preferred"])
+def test_a_policy_suffix_is_not_a_pinned_provider(policy: str) -> None:
+    """`:fastest` selects among providers rather than naming one, so the check
+    must still assert across all of them."""
+    assert main_module._model_route(f"openai/gpt-oss-120b:{policy}") == (
+        "openai/gpt-oss-120b",
+        None,
+    )
+
+
+def _catalogue() -> list[dict[str, object]]:
+    return [
+        {
+            "id": "openai/gpt-oss-120b",
+            "providers": [
+                {"provider": "groq", "context_length": 131072},
+                {"provider": "baseten", "context_length": 100},
+                {"provider": "scaleway"},
+            ],
+        }
+    ]
+
+
+def test_a_pinned_provider_narrows_the_context_check_to_that_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pinned, the other providers cannot serve us, so their windows are not
+    our problem — baseten is below the floor and must not fail a groq run."""
+    monkeypatch.setattr(main_module, "_router_models", lambda _c: _catalogue())
+    config = ModelConfig(api_key=SecretStr("hf_token_value"), model="openai/gpt-oss-120b:groq")
+
+    result = main_module.check_every_provider_serves_the_context_we_assume(config, [])
+
+    assert result.passed
+    assert "groq" in result.detail
+
+
+def test_without_a_pin_every_stated_provider_still_has_to_meet_the_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The discriminator: narrowing must not leak into the unpinned case, where
+    any provider may answer and baseten's 100 is a real failure."""
+    monkeypatch.setattr(main_module, "_router_models", lambda _c: _catalogue())
+    config = ModelConfig(api_key=SecretStr("hf_token_value"), model="openai/gpt-oss-120b")
+
+    result = main_module.check_every_provider_serves_the_context_we_assume(config, [])
+
+    assert not result.passed
+    assert "baseten" in result.detail
+
+
+def test_pinning_a_provider_the_router_does_not_serve_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A typo in the pin would otherwise narrow to an empty set and pass by
+    measuring nothing."""
+    monkeypatch.setattr(main_module, "_router_models", lambda _c: _catalogue())
+    config = ModelConfig(api_key=SecretStr("hf_token_value"), model="openai/gpt-oss-120b:grok")
+
+    with pytest.raises(CheckFailed, match="does not serve"):
+        main_module.check_every_provider_serves_the_context_we_assume(config, [])
