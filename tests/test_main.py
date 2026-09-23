@@ -5,6 +5,7 @@ The live round trip is not tested here — that is what `uv run my-agent` is for
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 from uuid import uuid4
 
@@ -22,7 +23,7 @@ from my_agent.capabilities import (
     SHELL_TOOL_NAME,
     compiled_tool_names,
 )
-from my_agent.main import EXIT_CHECK_FAILED, EXIT_MISCONFIGURED, main
+from my_agent.main import EXIT_CHECK_FAILED, EXIT_MISCONFIGURED, CheckOutcome, CheckResult, main
 from my_agent.model import ModelConfig, build_model
 from my_agent.negative_space import CheckFailed
 from my_agent.run import DeadlineExceeded, TurnResult
@@ -298,3 +299,191 @@ def test_a_single_turn_notes_when_the_reply_was_cut_off_before_it_began(
     captured = capsys.readouterr()
     assert exit_code == 0
     assert "cut off before its answer began" in captured.err
+
+
+# --------------------------------------------------------------------------
+# Repeats: pass^k and pass@k over the live checks
+# --------------------------------------------------------------------------
+
+
+def _result(passed: bool, detail: str = "d") -> CheckResult:
+    return CheckResult("F0", "a check", passed, detail)
+
+
+def test_a_check_that_passed_every_attempt_reports_both_pass_at_k_and_pass_hat_k() -> None:
+    outcome = CheckOutcome("F0", "a check", tuple(_result(True) for _ in range(5)))
+
+    assert outcome.attempts == 5
+    assert outcome.passes == 5
+    assert outcome.pass_any is True
+    assert outcome.pass_all is True
+
+
+def test_a_check_that_failed_one_attempt_keeps_pass_at_k_but_loses_pass_hat_k() -> None:
+    """The distinction the whole change exists for: at n=1 this check and a
+    wholly broken one are the same observation."""
+    outcome = CheckOutcome(
+        "F0", "a check", (_result(True), _result(True), _result(False), _result(True))
+    )
+
+    assert outcome.passes == 3
+    assert outcome.pass_any is True
+    assert outcome.pass_all is False
+
+
+def test_a_check_that_failed_every_attempt_loses_both() -> None:
+    outcome = CheckOutcome("F0", "a check", (_result(False), _result(False)))
+
+    assert outcome.pass_any is False
+    assert outcome.pass_all is False
+
+
+def test_an_outcome_with_no_attempts_refuses_to_be_built() -> None:
+    """A bound that measured nothing must not report a verdict. Without this,
+    an empty results tuple makes `pass_all` vacuously true."""
+    with pytest.raises(CheckFailed, match="no attempts"):
+        CheckOutcome("F0", "a check", ())
+
+
+def test_the_repeat_count_is_five() -> None:
+    """Pinned to a literal, not to the symbol: a constant compared to itself is
+    not a pinned constant (F42)."""
+    assert main_module.LIVE_CHECK_REPEATS == 5
+
+
+def test_the_repeat_count_can_be_overridden_from_the_environment() -> None:
+    assert main_module.live_check_repeats({"LIVE_CHECK_REPEATS": "3"}) == 3
+
+
+def test_the_repeat_count_falls_back_to_the_constant() -> None:
+    assert main_module.live_check_repeats({}) == main_module.LIVE_CHECK_REPEATS
+
+
+def test_a_repeat_count_below_one_is_refused() -> None:
+    """Zero repeats is the vacuous run: every check passes having done nothing."""
+    with pytest.raises(ValueError, match="LIVE_CHECK_REPEATS"):
+        main_module.live_check_repeats({"LIVE_CHECK_REPEATS": "0"})
+
+
+def _counting_check(verdicts: list[bool]) -> Callable[..., CheckResult]:
+    """A check whose verdict is scripted per attempt, and which records how
+    many times it was called."""
+    calls = {"n": 0}
+
+    def check(_config: ModelConfig, _callbacks: list[BaseCallbackHandler]) -> CheckResult:
+        verdict = verdicts[calls["n"]]
+        calls["n"] += 1
+        return CheckResult("F0", "scripted", verdict, f"attempt {calls['n']}")
+
+    check.calls = calls  # type: ignore[attr-defined]
+    return check
+
+
+def test_every_check_runs_once_per_repeat(monkeypatch: pytest.MonkeyPatch) -> None:
+    check = _counting_check([True] * 4)
+    monkeypatch.setattr(main_module, "CHECKS", (check,))
+
+    main_module._run_checks(ModelConfig(api_key=SecretStr("hf_token_value")), [], repeats=4)
+
+    assert check.calls["n"] == 4  # type: ignore[attr-defined]
+
+
+def test_a_check_that_flakes_once_fails_the_run(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The exit code is pass^k. A check that passed four attempts in five is a
+    check that does not hold, and a green exit would hide exactly the flake
+    this change exists to surface."""
+    check = _counting_check([True, True, False, True, True])
+    monkeypatch.setattr(main_module, "CHECKS", (check,))
+
+    exit_code = main_module._run_checks(
+        ModelConfig(api_key=SecretStr("hf_token_value")), [], repeats=5
+    )
+
+    assert exit_code == EXIT_CHECK_FAILED
+    assert "4/5" in capsys.readouterr().out
+
+
+def test_a_check_that_holds_every_attempt_passes_the_run(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The discriminator for the test above: without this, a `_run_checks` that
+    always returned EXIT_CHECK_FAILED would still look correct."""
+    check = _counting_check([True] * 5)
+    monkeypatch.setattr(main_module, "CHECKS", (check,))
+
+    exit_code = main_module._run_checks(
+        ModelConfig(api_key=SecretStr("hf_token_value")), [], repeats=5
+    )
+
+    assert exit_code == 0
+    assert "5/5" in capsys.readouterr().out
+
+
+def test_only_the_failing_attempts_print_their_detail(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A green run must stay as short as it was at n=1, or nobody reads it."""
+    check = _counting_check([True, False, True])
+    monkeypatch.setattr(main_module, "CHECKS", (check,))
+
+    main_module._run_checks(ModelConfig(api_key=SecretStr("hf_token_value")), [], repeats=3)
+
+    out = capsys.readouterr().out
+    assert "attempt 2" in out
+    assert "attempt 1" not in out
+    assert "attempt 3" not in out
+
+
+def test_an_exception_on_one_attempt_is_a_failed_attempt_not_a_crash(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unchanged from n=1, but it now has to survive into the aggregate: an
+    operating error on attempt 2 must cost that attempt, not the whole run."""
+
+    def check(_config: ModelConfig, _callbacks: list[BaseCallbackHandler]) -> CheckResult:
+        raise TimeoutError("router slow")
+
+    monkeypatch.setattr(main_module, "CHECKS", (check,))
+
+    exit_code = main_module._run_checks(
+        ModelConfig(api_key=SecretStr("hf_token_value")), [], repeats=2
+    )
+
+    assert exit_code == EXIT_CHECK_FAILED
+
+
+def test_a_run_of_zero_repeats_is_a_programmer_error() -> None:
+    """`live_check_repeats` refuses this at the edge; this is the same refusal
+    for a caller that bypassed it."""
+    with pytest.raises(CheckFailed, match="at least one attempt"):
+        main_module._run_checks(ModelConfig(api_key=SecretStr("hf_token_value")), [], repeats=0)
+
+
+# --------------------------------------------------------------------------
+# The shell-withheld check needs a discriminator (F4)
+# --------------------------------------------------------------------------
+
+
+def test_the_shell_check_passes_when_the_model_answered_without_calling_execute() -> None:
+    """The claim: a run that asked for a shell command got an answer and no
+    `execute`."""
+    assert main_module._shell_withheld(called=frozenset({"ls"}), answered=True) is True
+
+
+def test_the_shell_check_passes_when_the_model_refused_in_prose() -> None:
+    """Calling no tool at all is the *expected* shape here — the model has no
+    shell tool to reach for, so it answers in prose."""
+    assert main_module._shell_withheld(called=frozenset(), answered=True) is True
+
+
+def test_the_shell_check_fails_when_execute_was_called() -> None:
+    assert main_module._shell_withheld(called=frozenset({"execute"}), answered=True) is False
+
+
+def test_a_turn_that_never_answered_is_not_evidence_that_execute_is_unreachable() -> None:
+    """The discriminator. Absence of `execute` in a turn that was cut off before
+    it answered says nothing about whether `execute` could have been called —
+    the same vacuity the allowlist tests guard against, on the live path."""
+    assert main_module._shell_withheld(called=frozenset(), answered=False) is False

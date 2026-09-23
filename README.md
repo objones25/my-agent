@@ -30,7 +30,7 @@ seam. When a real domain is chosen, it should slot in behind the protocols liste
 - **A turn returns a record, not just a reply.** `TurnResult` carries the tool calls that failed,
   whether an answer was ever begun, and the agent's own filesystem as the graph returned it, so
   "did it do the thing" has something to read that is not the model's prose.
-- **Library behaviour recorded rather than assumed.** `docs/findings.md` holds forty-four
+- **Library behaviour recorded rather than assumed.** `docs/findings.md` holds forty-five
   verified findings, each with how it was checked and what the code does about it. Eight of them
   are additionally re-checked against the live router by `uv run my-agent`.
 - **Tests that are checked for being able to fail.** Changes here are verified by breaking the
@@ -69,7 +69,8 @@ uv run my-agent                  # the eight live checks against the real router
 uv run my-agent "your prompt"    # one ordinary turn
 ```
 
-Both spend real tokens. The checks print a header, then one line per check, then a tally:
+Both spend real tokens. Each check runs `LIVE_CHECK_REPEATS` times (5 by default; set the
+environment variable to override). The run prints a header, then one block per check, then a tally:
 
 ```text
 model:  openai/gpt-oss-120b
@@ -77,15 +78,19 @@ tracing: langsmith, weave
 log:    logs/<timestamp>-<id>.jsonl
 tools:  ['delete', 'edit_file', 'glob', 'grep', 'ls', 'read_file', 'write_file'] (+ task)
 
-  [PASS] F1  chat-completions endpoint reachable
+repeats: 5 per check (exit code reads pass^5)
+
+  [5/5] F1  chat-completions endpoint reachable
          reply='pong'
   ...  (seven more, one per check)
 
-8/8 checks passed
+8/8 checks passed (pass^5)
 ```
 
-Exit status is 0 only if every check passed. The eight checks and their recorded evidence are
-tabulated in `docs/findings.md`, *Live verification*.
+**Exit status is 0 only if every check passed every attempt** — pass^k, not pass@k, because these
+are invariants rather than best-effort tasks. A check that passed four times in five is reported as
+flaky and still fails the run. The eight checks and their recorded evidence are tabulated in
+`docs/findings.md`, *Live verification*.
 
 ## Development
 
@@ -103,7 +108,7 @@ see Setup) and `.github/workflows/ci.yml` both call it and re-list nothing.
 | Path | What it holds |
 |---|---|
 | `CLAUDE.md` | The contributor's contract: architecture, non-negotiables, verified API facts |
-| `docs/findings.md` | F1-F44: verified library, provider and test-suite behaviour, and what the code does about each |
+| `docs/findings.md` | F1-F45: verified library, provider and test-suite behaviour, and what the code does about each |
 | `evals/` | Empty. Where a model-dependent eval suite would go once a domain exists |
 | `docs/superpowers/specs/` | Design documents |
 | `src/my_agent/capabilities.py` | The allowlist and the proof it held |
@@ -113,6 +118,6 @@ see Setup) and `.github/workflows/ci.yml` both call it and re-list nothing.
 
 Pre-domain. The harness works end to end against the Hugging Face router, with LangSmith and W&B
 Weave tracing verified to coexist over the same run. `evals/` is empty: the eight live checks are
-the only end-to-end measurement, and they run once each, so a flake and a regression look alike.
-Nothing grades the model's prose, which is a decision (see CLAUDE.md, *What is deliberately not
-verified*) rather than an omission.
+the only end-to-end measurement. They now run five times each and are scored pass^k, so a flake
+and a regression no longer look alike (F45) — but nothing grades the model's prose, which is a
+decision (see CLAUDE.md, *What is deliberately not verified*) rather than an omission.

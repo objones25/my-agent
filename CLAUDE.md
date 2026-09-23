@@ -1,7 +1,7 @@
 # CLAUDE.md
 
 Guidance for Claude Code in this repository. `README.md` says what the project is; this is the
-contributor's contract, and **`docs/findings.md` (F1–F44) is the evidence behind it** — read it
+contributor's contract, and **`docs/findings.md` (F1–F45) is the evidence behind it** — read it
 before debugging anything that looks like a library bug, and add to it when you verify something
 new.
 
@@ -24,7 +24,7 @@ uv run pytest -m live > live.log 2>&1     # real HF router / LangSmith / W&B. Re
                                           # expect ~5 min to exit after a ~4s suite (F23).
 uv run pytest -m eval                     # the eval suite
 uv run my-agent                           # the eight live checks (docs/findings.md, "Live
-                                          # verification"), against the real router
+                                          # verification") x LIVE_CHECK_REPEATS, scored pass^k
 uv run my-agent "your prompt here"        # one ordinary turn instead
 uv run ruff check . --fix                 # lint
 uv run mypy                               # type check (strict; src + tests)
@@ -265,7 +265,7 @@ Bugs live in the states the code was never written to handle. Write those down a
 
 ## Testing and evals
 
-Keep them apart. 462 offline tests and 2 live as of 2026-09-23; `evals/` is still empty.
+Keep them apart. 480 offline tests and 2 live as of 2026-09-23; `evals/` is still empty.
 
 - **Unit tests** (`tests/`, default selection) are deterministic and offline. One test file per
   source module; a new module gets a new file, not an extra section in an existing one. They test
@@ -273,7 +273,7 @@ Keep them apart. 462 offline tests and 2 live as of 2026-09-23; `evals/` is stil
   trips it — that is what turns a contract into a tested contract. **Outside one named exclusion,
   that is now the state rather than the goal.** Measured 2026-09-23 by wrapping `require()` and
   `CheckFailed` in pytest plugins that log their call site whenever one raises, then diffing against
-  an AST walk — not by reading coverage, and not by counting by hand: **110 `require()` sites, 100
+  an AST walk — not by reading coverage, and not by counting by hand: **112 `require()` sites, 102
   tripped; 13 `raise CheckFailed` sites outside the helpers, 12 tripped.**
 
   **All 11 that remain are in `main.py`**, left alone deliberately — it is scaffolding, and a check
@@ -473,7 +473,7 @@ Everything in this table lives in `src/my_agent/`.
 | `capabilities.py` | The allowlist and the proof it held: `DEFAULT_FILESYSTEM_TOOLS`, `least_privilege_filesystem`, `compiled_tools`, `compiled_tool_names`, `subagent_graphs`, `bound_step_limit`, `require_withheld`/`require_granted`, `compiled_output_keys`, plus the bounds on granted capabilities (`PARENT_STEP_LIMIT`, `SUBAGENT_STEP_LIMIT`, `GREP_MATCH_LIMIT`, the eviction limits, `bounded_compaction` and `CONTEXT_WINDOW_TOKENS`) and the `DEEPAGENTS_PLUGIN_GROUPS` / `DEEPAGENTS_CACHING_PROBE_MODULES` pins. |
 | `contracts.py` | `check_config_contract`, `pydantic_param_names` — the import-time check that makes `as_kwargs()` splatting safe. |
 | `run.py` | `Invokable`, `RunBounds`, `RunDeadline`, `RunTokenBudget`, `TurnResult`, `run_turn`, `resume_turn` — one bounded turn, with three outcomes: finished, failed (`DeadlineExceeded`, `StepLimitExceeded`, `TokenLimitExceeded`, `ResumeLimitExceeded`) or paused for approval, `failed_tool_calls` for a turn that finished without doing what it says, `answered` for a turn cut off before its answer began, and `state` — every key the graph returned bar `messages`/`__interrupt__`, with `files` and `structured_response` as properties over it. `_invoke` used to read `messages` and drop the rest (F40, F43). Owns the step limit, the wall clock and token budget across a pause, the resume count, the thread and multi-turn history. Imports no deepagents and builds no model. |
-| `main.py` | `uv run my-agent` — the composition root, and the eight live checks. |
+| `main.py` | `uv run my-agent` — the composition root, and the eight live checks (`CheckOutcome`, `live_check_repeats`, pass^k). |
 | `negative_space.py` | `require`/`unreachable`/`bounded`, and the only doctests in `src/`. |
 | `tracing.py` | `TracingBackend`, `LangSmithTracing`, `WeaveTracing`, `available_backends`, `langchain_tracer_names`. |
 | `mirror.py` | `JsonlMirror`, `run_log_path`, `mirror_to_file` — the always-on local JSONL mirror of every agent event, including the per-call request size and a per-run per-tool byte breakdown (F30). |
@@ -481,7 +481,7 @@ Everything in this table lives in `src/my_agent/`.
 `tests/` mirrors that one file per module, offline by default, plus `conftest.py` for shared
 fixtures and the socket guard. The only `-m live` tests are one each at the end of `test_tracing.py`
 (calls the real `weave.init()` and hits the router) and `test_run.py` (proves multi-turn history
-against a real graph, which a fake cannot show). `evals/` is empty. `docs/findings.md` holds F1–F44
+against a real graph, which a fake cannot show). `evals/` is empty. `docs/findings.md` holds F1–F45
 plus the repo-gates, deepagents-surface, test-infrastructure and observability appendices;
 `scripts/audit_negative_space.py` is **vendored** from the negative-space-programming skill — do not
 hand-edit it, refresh by re-copying (it is excluded from ruff and mypy).

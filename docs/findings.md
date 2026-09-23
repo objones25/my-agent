@@ -1702,6 +1702,106 @@ import.** It costs one line and keeps the check testable.
 
 ---
 
+## F45 — eight checks at one attempt each cannot tell a flake from a regression
+
+**Severity: important.** The only end-to-end measurement this repo has was
+unscheduled and ran once per check.
+
+Two separate gaps, found together on 2026-09-23 while auditing the docs:
+
+**The checks were never scheduled.** `live.yml`'s cron runs `pytest -m live` —
+**two tests**. `uv run my-agent` runs the eight checks, and nothing invoked it;
+they ran only when a human typed the command. Last recorded green was
+2026-09-18, five days and fourteen commits earlier. The 2026-09-21 evaluation
+says they run "on a weekly cron", which was wrong.
+
+**One attempt each cannot separate the two failures that matter.** Three of the
+eight depend on the model *choosing* to call a tool:
+
+| check | shape | failure mode at n=1 |
+|---|---|---|
+| `filesystem_tools_still_work` | positive: `write_file` must be called and succeed | flakes **red** — model declines, reads as a regression |
+| `permissions_are_enforced` | positive: a denial must appear in a tool message | flakes **red** — same |
+| `shell_tool_withheld` | negative: `execute` must be absent | passes **vacuously** — a model that called nothing satisfies it |
+
+The first two turn a non-deterministic model into a red build with no error
+bars. The third is the opposite and worse: it is this repo's own
+*assert-the-claim-and-its-discriminator* rule unapplied on the live path. The
+graph-level `require_withheld` proves the binding; the live half's only job is
+"no run can call it", and a turn that did nothing is not evidence for that.
+
+### What we do
+
+`CheckOutcome` aggregates k attempts of one check. **The exit code reads pass^k**
+— these are invariants, and a check that held four times in five did not hold.
+pass@k is printed alongside it, because it is the entire difference between
+"this is broken" and "this is non-deterministic", and that difference does not
+exist at one attempt.
+
+`LIVE_CHECK_REPEATS` is 5, uniform across all eight. Uniform is deliberate and
+temporary: **which checks can actually vary has not been measured**, and
+declaring five of them deterministic would be the same untested assumption the
+repeats exist to remove. `check_every_provider_serves_the_context_we_assume` is
+a catalogue `GET` with no inference and almost certainly cannot vary — that is a
+prediction, and the first run is what settles it. Pin per-check counts once
+there is a number.
+
+`_shell_withheld(called, answered)` is the discriminator, extracted as a pure
+function so it is testable offline; the check bodies build their own model and
+agent, so nothing else in them is.
+
+`live.yml` gained a second step running `uv run my-agent` with
+`LIVE_CHECK_REPEATS: "5"` stated rather than inherited. Its `timeout-minutes`
+went 20 → 45, and **that number is an estimate, not a measurement** — 40 live
+turns of unrecorded duration plus a second hardcoded 300s weave flush (F23,
+which this workflow now pays twice because it runs two processes). The 20 was
+measured; replace the 45 with the observed figure after the first real run.
+
+### First live run, 2026-09-23 — and it was not the predicted flake
+
+**7/8 pass^5.** `filesystem_tools_still_work` came back **3/5**, and both lost
+attempts were the same thing:
+
+```
+attempt 4: OpenAIRateLimitError: Error code: 429 - {'message': "We're experiencing
+  high traffic right now! Please try again soon.", 'type': 'too_many_requests_error',
+  'param': 'queue', 'code': 'queue_exceeded'}
+attempt 5: (identical)
+```
+
+Three things this run settles, none of them the thing it was built to measure:
+
+1. **The predicted flake did not happen.** The prediction was that the model
+   would sometimes decline to call `write_file`. It called it every time it got
+   a response. The observed variance is entirely provider-side.
+2. **The repeats caused the failure they detected.** Both 429s were on
+   attempts 4 and 5 of the *fourth* check — the deepest point of the run's
+   request burst. At one attempt per check this never appeared. That is not an
+   argument against repeats; it is the first real evidence about what this
+   harness does under its own load, which n=1 structurally could not produce.
+3. **`shell_tool_withheld` passed 5/5 with `answered=True; tools called: none`** —
+   exactly the shape the new discriminator exists to distinguish from a vacuous
+   pass. Before this change that line would have read as a pass either way.
+
+`check_every_provider_serves_the_context_we_assume` emitted one weave trace for
+five attempts, confirming it makes no inference call and cannot vary. That was a
+prediction above; it is now measured.
+
+### Open
+
+- **Retry and backoff on a 429 is unhandled** — `ModelConfig.max_retries` is 2
+  and the router still surfaced the error. Whether that is exhausted retries,
+  a status code the client does not retry, or backoff too short for a
+  `queue_exceeded` queue is not yet established. This is the live gap this run
+  found.
+- Whether 5 is the right k. It is the smallest count that distinguishes 4/5 from
+  5/5 at a cost worth paying weekly, not a figure derived from an observed
+  failure rate.
+- Whether the remaining six checks vary at all. Five of five on one run is not
+  evidence that they cannot.
+
+---
+
 ## Observability API reference
 
 Not findings — API surfaces recorded so the next piece of work does not have to re-derive them.
@@ -1838,7 +1938,7 @@ main checkout run a `scripts/check.sh` that may not exist on the branch checked 
 
 **Three scans run on this repo and only two are files here.** `ci.yml` runs the gate on every push
 and pull request. `.github/workflows/live.yml` runs `-m live` weekly (Mondays 06:00 UTC) and on
-demand, because this file is forty-four verified behaviours and nothing else re-checks any of
+demand, because this file is forty-five verified behaviours and nothing else re-checks any of
 them; it skips rather than fails when `HF_TOKEN` is absent, so an unconfigured clone does not
 produce a weekly red X that means nothing, and it never gates a commit. **CodeQL is the third and it
 is not a file here** — it uses GitHub's default setup, so the workflow is generated and managed by
@@ -1872,8 +1972,9 @@ prompt to re-verify CLAUDE.md's version block — not a reason to skip that step
 ## Live verification
 
 `uv run my-agent` runs eight checks against the real router and prints PASS/FAIL. Each is tied to
-a finding; seven findings are covered, not all forty-four. 8/8 pass as of 2026-09-18, exit 0, both
-tracers active:
+a finding; seven findings are covered, not all forty-five. Each runs `LIVE_CHECK_REPEATS` times
+and the run is scored pass^k (F45). The 8/8 below is from 2026-09-18, exit 0, both tracers
+active — **at one attempt each**, before the repeats existed:
 
 | Finding | Check | Evidence |
 |---|---|---|
@@ -1944,7 +2045,7 @@ Each of these is also noted at the finding it belongs to.
   with no read-back.
 - ~~Whether the import-time check sites can be tripped by a test.~~ **Closed by F44.** Re-measured
   2026-09-23 by wrapping `require()` and `CheckFailed` in pytest plugins that log a raising call
-  site, then diffing against an AST walk: **100 of 110 `require()` sites and 12 of 13
+  site, then diffing against an AST walk: **102 of 112 `require()` sites and 12 of 13
   `raise CheckFailed` sites outside the helpers are tripped**, and all 11 untripped sites are in
   `main.py`, deliberately left. No import-time check is untripped.
 
