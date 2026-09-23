@@ -12,6 +12,7 @@ All offline: `ChatOpenAI` builds lazily and makes no request.
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Callable
 from typing import Any
 
 import pytest
@@ -36,6 +37,7 @@ from my_agent.model import (
     USE_RESPONSES_API,
     ModelConfig,
     build_model,
+    require_env_fields_cover_the_config,
 )
 from my_agent.negative_space import CheckFailed
 
@@ -198,7 +200,13 @@ def test_model_config_fields_are_all_real_chatopenai_keywords(valid_secret: Secr
         f.alias for f in ChatOpenAI.model_fields.values() if f.alias is not None
     }
 
-    assert set(ModelConfig(api_key=valid_secret).as_kwargs()) <= accepted
+    kwargs = ModelConfig(api_key=valid_secret).as_kwargs()
+
+    # A subset assertion is vacuously true of an empty dict: with `as_kwargs`
+    # stubbed to `return {}` this test passed (measured 2026-09-21), reporting a
+    # contract held over no fields at all.
+    assert set(kwargs) == {f.name for f in dataclasses.fields(ModelConfig)}
+    assert set(kwargs) <= accepted
 
 
 def test_model_config_does_not_carry_the_factory_injected_parameter(
@@ -365,4 +373,129 @@ def test_from_env_still_falls_back_to_every_default(valid_key: str) -> None:
         DEFAULT_TIMEOUT_S,
         DEFAULT_MAX_RETRIES,
         None,
+    )
+
+
+def test_the_router_defaults_are_the_values_that_were_chosen() -> None:
+    """Literals, because every other test compares a constant to itself.
+
+    Measured 2026-09-21: `HF_ROUTER_BASE_URL` was changed to
+    `"https://api.openai.com/v1"`, `DEFAULT_TEMPERATURE` to 1.9 and
+    `DEFAULT_MAX_RETRIES` to 99, and all 376 tests stayed green — including
+    `test_build_model_ignores_ambient_openai_env_vars`, which exists to prove an
+    ambient `OPENAI_BASE_URL` cannot redirect us and asserts against the
+    constant, so it passes when the constant *is* that URL. A pin is only a pin
+    when the expected value is written somewhere the mutation cannot reach.
+    """
+    assert HF_ROUTER_BASE_URL == "https://router.huggingface.co/v1"
+    assert DEFAULT_MODEL == "openai/gpt-oss-120b"
+    assert DEFAULT_TEMPERATURE == 0.0
+    assert DEFAULT_TIMEOUT_S == 120.0
+    assert DEFAULT_MAX_RETRIES == 2
+    assert USE_RESPONSES_API is False
+    assert frozenset({"low", "medium", "high"}) == REASONING_EFFORTS
+
+
+def test_the_router_base_url_is_not_a_url_any_other_provider_answers() -> None:
+    """The discriminator for the pin above, and the claim
+    `test_build_model_ignores_ambient_openai_env_vars` was trying to make: a
+    redirect is only detectable if the thing redirected *to* is known to be
+    somewhere else."""
+    assert "huggingface" in HF_ROUTER_BASE_URL
+    assert "openai.com" not in HF_ROUTER_BASE_URL
+
+
+# --------------------------------------------------------------------------
+# build_model's read-back postconditions, driven
+#
+# ChatOpenAI falls back to OPENAI_API_BASE / OPENAI_BASE_URL and rewrites
+# `temperature` for some model families, so what was asked for is not
+# necessarily what came back. Each check below guards a silent redirect; none
+# had a test, because forcing one false needs a ChatOpenAI that accepts a
+# setting and reports a different one.
+# --------------------------------------------------------------------------
+
+
+def _overriding_chat_openai(attribute: str, value: Any) -> Callable[..., ChatOpenAI]:
+    """A `ChatOpenAI` factory that builds the real client, then reports one
+    setting differently — a library that took an argument and used another."""
+
+    def build(**kwargs: Any) -> ChatOpenAI:
+        model = ChatOpenAI(**kwargs)
+        object.__setattr__(model, attribute, value)
+        return model
+
+    return build
+
+
+@pytest.mark.parametrize(
+    ("attribute", "value", "expected"),
+    [
+        ("openai_api_base", "https://api.openai.com/v1", "base_url was overridden"),
+        ("model_name", "gpt-4o", "model was overridden"),
+        ("use_responses_api", True, "use_responses_api must stay False"),
+    ],
+)
+def test_build_model_refuses_a_setting_the_client_overrode(
+    monkeypatch: pytest.MonkeyPatch,
+    valid_secret: SecretStr,
+    attribute: str,
+    value: Any,
+    expected: str,
+) -> None:
+    """A silent redirect to `api.openai.com` would otherwise surface as a
+    confusing auth failure much later, and a `use_responses_api` that flipped
+    would route the request to an endpoint the router does not serve (F1)."""
+    monkeypatch.setattr(
+        "my_agent.model.ChatOpenAI", _overriding_chat_openai(attribute, value)
+    )
+
+    with pytest.raises(CheckFailed, match=expected):
+        build_model(ModelConfig(api_key=valid_secret))
+
+
+# --------------------------------------------------------------------------
+# The env-coverage contract
+#
+# Expressed as a function rather than three checks at module level, because
+# both sides are defined in `model.py` itself: no patch a test could apply
+# reaches them, and reloading the module to force one false would rebind
+# `ModelConfig` and break `isinstance` across the suite (F44).
+# --------------------------------------------------------------------------
+
+
+def test_env_coverage_refuses_a_config_field_no_variable_reaches() -> None:
+    """The check that caught the original defect: `_ENV_FIELDS` covered three of
+    seven fields, so `base_url` was unreachable from the environment while this
+    module's docstring promised a dedicated endpoint needed no code change."""
+    with pytest.raises(CheckFailed, match="unreachable from the environment"):
+        require_env_fields_cover_the_config({"api_key", "base_url"}, ())
+
+
+def test_env_coverage_refuses_a_row_that_is_not_a_config_field() -> None:
+    """The other direction: a row naming a field that no longer exists would set
+    an attribute nothing reads, silently."""
+    with pytest.raises(CheckFailed, match="not ModelConfig fields"):
+        require_env_fields_cover_the_config(set(), _ENV_FIELDS[:1])
+
+
+def test_env_coverage_refuses_two_rows_sharing_a_variable() -> None:
+    """One would shadow the other, so a documented variable would stop working
+    with nothing to say so."""
+    first = _ENV_FIELDS[0]
+    twin = dataclasses.replace(first, name="other")
+
+    with pytest.raises(CheckFailed, match="share an environment variable"):
+        require_env_fields_cover_the_config({first.name, "other"}, (first, twin))
+
+
+def test_the_shipped_env_fields_cover_every_config_field(
+    assert_does_not_raise: Callable[[Callable[[], object]], None],
+) -> None:
+    """The discriminator. Each test above proves the guard can fail; this proves
+    the pair it actually guards passes it."""
+    assert_does_not_raise(
+        lambda: require_env_fields_cover_the_config(
+            {f.name for f in dataclasses.fields(ModelConfig)}, _ENV_FIELDS
+        )
     )

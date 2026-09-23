@@ -14,8 +14,9 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Callable, Collection
+from importlib import util
 from importlib.metadata import entry_points
-from typing import Any, get_args
+from typing import Any, get_args, get_type_hints
 
 from deepagents import FilesystemMiddleware, FilesystemPermission, FsToolName
 from deepagents.backends import StateBackend
@@ -32,13 +33,15 @@ __all__ = [
     "COMPACTION_KEEP_MESSAGES",
     "COMPACTION_TRIGGER_TOKENS",
     "CONTEXT_WINDOW_TOKENS",
+    "DEEPAGENTS_CACHING_PROBE_MODULES",
     "DEEPAGENTS_PLUGIN_GROUPS",
     "DEFAULT_FILESYSTEM_TOOLS",
     "GENERAL_PURPOSE_SUBAGENT_NAME",
     "GREP_MATCH_LIMIT",
     "HUMAN_MESSAGE_TOKEN_LIMIT",
     "LIBRARY_COMPACTION_TRIGGER_TOKENS",
-    "LIBRARY_SUBAGENT_STEP_LIMIT",
+    "LIBRARY_STEP_LIMIT",
+    "PARENT_STEP_LIMIT",
     "SHELL_TOOL_NAME",
     "SUBAGENT_STEP_LIMIT",
     "SUBAGENT_TASK_TOOL_NAME",
@@ -48,9 +51,12 @@ __all__ = [
     "bound_step_limit",
     "bounded_compaction",
     "call_limits",
+    "compiled_output_keys",
     "compiled_tool_names",
     "compiled_tools",
+    "installed_caching_probes",
     "least_privilege_filesystem",
+    "require_compaction_fits_the_window",
     "require_granted",
     "require_withheld",
     "subagent_graphs",
@@ -157,12 +163,37 @@ needs a fourth subagent to answer one turn is a agent that has lost the thread,
 not one that needs a wider budget.
 """
 
-LIBRARY_SUBAGENT_STEP_LIMIT = 9999
-"""What a subagent runs to when nobody sets a limit.
+PARENT_STEP_LIMIT = 25
+"""Graph steps the *parent* runs to when a caller invokes it directly.
 
-Stated so the test that asserts ours is applied has a discriminator: without
-this, that test keeps passing if the library starts choosing a small number for
-its own reasons, and a bound we merely agree with reads as a bound we set.
+**The other half of F24.** `create_agent` binds `recursion_limit: 9999` on every
+graph it compiles — the parent included, not only the subagents — so the limit a
+bare `agent.invoke(...)` inherits is 9999, not langchain-core's 25. Measured
+2026-09-21: **3,325 model calls** before langgraph stopped a one-call-per-turn
+fake (F39).
+
+`run_turn` sends `RunBounds.step_limit` on every invocation and a top-level
+invoke config beats the graph's own bound config, so that path was never
+affected. This is the floor underneath it, for the caller who does not take it —
+the same argument `run.py` makes for owning the limit rather than inheriting one,
+applied to the one graph where it was still inherited.
+
+Equal to `run.RECURSION_LIMIT` today and deliberately not defined as it, for the
+reason `SUBAGENT_STEP_LIMIT` is not: these bound different layers — one is a
+per-invocation ceiling a caller chooses, this is a compile-time fallback nobody
+chooses — and the first caller who needs them to differ should not have to
+untangle a shared symbol first.
+"""
+
+LIBRARY_STEP_LIMIT = 9999
+"""What any graph `create_agent` compiles runs to when nobody sets a limit.
+
+Stated so the tests that assert ours is applied have a discriminator: without
+this, they keep passing if the library starts choosing a small number for its
+own reasons, and a bound we merely agree with reads as a bound we set. Named for
+the library rather than for the subagent because it is bound on every graph
+`create_agent` compiles, parent and subagent alike — which is exactly what F39
+records.
 """
 
 GREP_MATCH_LIMIT = 1000
@@ -287,6 +318,59 @@ it would stop being true, and this is what makes that an import failure rather
 than a quiet change of behaviour (F28).
 """
 
+DEEPAGENTS_CACHING_PROBE_MODULES = (
+    "langchain_aws",
+    "langchain_fireworks",
+)
+"""Distributions deepagents probes for, and installs middleware from if present.
+
+**The second door `KNOWN_CREATE_DEEP_AGENT_PARAMS` cannot see, and the one
+`DEEPAGENTS_PLUGIN_GROUPS` cannot either.** That pin catches a package that
+*registers* itself through an entry point. This registers nothing:
+`deepagents.middleware._prompt_caching.append_prompt_caching_middleware`
+`import_module`s each of these by name and appends that package's prompt-caching
+middleware when the import succeeds — onto the parent, onto every subagent spec
+and onto `general-purpose` (`graph.py` 0.7.15). Installing either as anyone's
+transitive dependency therefore adds middleware to every graph this harness
+compiles, through no parameter, no entry point and no call site.
+
+Neither is installed today (verified 2026-09-21), which is what makes this a pin
+rather than a claim. `AnthropicPromptCachingMiddleware` is appended
+*unconditionally* and cannot be pinned away at all; it is inert here only
+because deepagents constructs it with `unsupported_model_behavior="ignore"` and
+its own gate returns `False` for a non-`ChatAnthropic` model (F41).
+"""
+
+
+def installed_caching_probes() -> tuple[str, ...]:
+    """Which of `DEEPAGENTS_CACHING_PROBE_MODULES` are importable here.
+
+    A function rather than a module constant so a test can call it after
+    changing what is installed, and so the import-time check below and the test
+    that asserts the same thing cannot drift apart.
+    """
+    # Precondition, not decoration: an empty probe list makes the import-time
+    # check below pass by asking about nothing, which is the same vacuity
+    # `require_withheld` refuses. (The postcondition this replaced asserted
+    # `found <= DEEPAGENTS_CACHING_PROBE_MODULES`, which the comprehension makes
+    # true by construction — a check that could not fail.)
+    require(
+        len(DEEPAGENTS_CACHING_PROBE_MODULES) > 0,
+        "the caching probe list is empty, so the pin below would hold vacuously; "
+        "deepagents probes for langchain_aws and langchain_fireworks by name",
+    )
+    return tuple(m for m in DEEPAGENTS_CACHING_PROBE_MODULES if util.find_spec(m) is not None)
+
+
+_INSTALLED_CACHING = installed_caching_probes()
+require(
+    not _INSTALLED_CACHING,
+    f"a provider caching package is installed: {sorted(_INSTALLED_CACHING)}. deepagents "
+    f"imports it by name and appends its prompt-caching middleware to the parent and to "
+    f"every subagent, with no parameter and no entry point to review. Confirm what it "
+    f"rewrites, then allow it here.",
+)
+
 _INSTALLED_PLUGINS = {
     group: sorted(ep.name for ep in entry_points(group=group)) for group in DEEPAGENTS_PLUGIN_GROUPS
 }
@@ -297,15 +381,28 @@ require(
     f"passing through create_deep_agent. Review what it grants, then allow it here.",
 )
 
+def require_compaction_fits_the_window(trigger: int, window: int) -> None:
+    """Fail unless compaction can fire before the provider refuses the request.
+
+    A function rather than a bare check at module level, for the reason
+    `contracts.check_config_contract` is one: both numbers are hand-edited
+    constants *in this file*, so no patch a test can apply reaches them and the
+    check would be the one kind that can never be driven. Called below with the
+    real pair, so the load-time guarantee is unchanged.
+    """
+    require(trigger > 0, f"the compaction trigger must be positive, got {trigger}")
+    require(
+        trigger < window,
+        f"the compaction trigger ({trigger}) must leave room below the context window we "
+        f"assume ({window}); at or above it, compaction can only fire after a provider has "
+        f"already refused the request",
+    )
+
+
 # A trigger at or above the window can only fire once the request has already
 # been rejected, which is the state this constant exists to leave. Checked here
 # rather than trusted, because both numbers are edited by hand.
-require(
-    0 < COMPACTION_TRIGGER_TOKENS < CONTEXT_WINDOW_TOKENS,
-    f"the compaction trigger ({COMPACTION_TRIGGER_TOKENS}) must leave room below the "
-    f"context window we assume ({CONTEXT_WINDOW_TOKENS}); at or above it, compaction can "
-    f"only fire after a provider has already refused the request",
-)
+require_compaction_fits_the_window(COMPACTION_TRIGGER_TOKENS, CONTEXT_WINDOW_TOKENS)
 
 # Every threshold `bounded_compaction` sets has to still be a parameter. These
 # are not defaults we agree with — they are values we override — so unlike
@@ -471,6 +568,33 @@ def bounded_compaction(model: BaseChatModel, backend: BackendProtocol) -> Summar
         "would land where the filesystem tools cannot read them",
     )
     return middleware
+
+
+def compiled_output_keys(agent: CompiledStateGraph[Any, Any, Any, Any]) -> frozenset[str]:
+    """State keys a compiled agent declares it may return.
+
+    Read off the compiled graph rather than off `OutputAgentState`, because the
+    declared class names `messages` and `structured_response` only — `files` is
+    contributed by `FilesystemMiddleware` and appears in neither, which is
+    exactly how a returned key stays invisible (F43).
+
+    Reaches through langgraph internals, so the structure is pinned: a reader
+    that returned nothing when the shape moved would make every "is this key
+    known?" check pass by finding no keys at all.
+    """
+    schema = getattr(agent, "output_schema", None)
+    if schema is None:
+        raise CheckFailed("compiled agent exposes no output schema; graph structure changed")
+    try:
+        hints = get_type_hints(schema)
+    except Exception as exc:
+        raise CheckFailed(
+            f"the compiled agent's output schema cannot be introspected ({type(exc).__name__}); "
+            f"graph structure changed"
+        ) from exc
+    if not hints:
+        raise CheckFailed("the compiled agent's output schema declares no keys at all")
+    return frozenset(hints)
 
 
 def compiled_tools(agent: CompiledStateGraph[Any, Any, Any, Any]) -> dict[str, Any]:

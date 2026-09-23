@@ -12,6 +12,7 @@ in `addopts`, and stepped over here.
 
 from __future__ import annotations
 
+import importlib
 import socket
 from collections.abc import Callable
 from typing import Any, NoReturn
@@ -87,3 +88,60 @@ def _forbid_network(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(socket, "gethostbyname", deny)
     monkeypatch.setattr(socket.socket, "sendto", deny)
     monkeypatch.setattr(socket.socket, "sendmsg", deny)
+
+
+@pytest.fixture
+def tripping_an_import_time_check() -> Callable[..., None]:
+    """Re-import a module with a library patched, so its load-time checks run again.
+
+    **The one group of checks a test cannot otherwise reach.** `capabilities.py`,
+    `agent.py` and `model.py` assert things about the installed wheels *at
+    import* — that `execute` is still a filesystem tool, that
+    `create_deep_agent` grew no parameter, that `ChatOpenAI` still accepts every
+    `ModelConfig` field. Those run once, when the test session imports the
+    package, and a normal test has no way to make one false: by the time it runs
+    the import has long since succeeded.
+
+    `importlib.reload` is the way, and the restore is the delicate half. A
+    reload executes the module body in the *existing* module's namespace, so a
+    reload that raises part way leaves the module half re-executed and every
+    later test importing wreckage. The `finally` therefore does two things in
+    order: put the library back, then reload again so the module is left in the
+    state the rest of the session expects.
+
+    Patches are applied to the *library* module rather than to the module under
+    test, because the checks read what `from deepagents import ...` brings in —
+    patching the copy would leave the import re-reading the real one.
+    """
+
+    def trip(module: Any, target: Any, attribute: str, value: Any) -> None:
+        # **A module that defines a class must never be reloaded here.** Reload
+        # rebinds the class to a *new* object, while every other test module
+        # still holds the old one — so `isinstance(cfg, AgentConfig)` inside the
+        # reloaded module fails against an instance built anywhere else, and the
+        # error reads `expected an AgentConfig, got AgentConfig`. Measured: 15
+        # unrelated tests failed this way, none of them when run alone (F44).
+        # A load-time check in a module that defines classes belongs in a
+        # function instead, the way `contracts.check_known_parameters` is.
+        defined_here = sorted(
+            name
+            for name, value_ in vars(module).items()
+            if isinstance(value_, type) and value_.__module__ == module.__name__
+        )
+        assert not defined_here, (
+            f"{module.__name__} defines {defined_here}; reloading it would rebind "
+            f"those classes and break isinstance across the suite. Express the "
+            f"load-time check as a function and test it directly."
+        )
+        original = getattr(target, attribute)
+        setattr(target, attribute, value)
+        try:
+            importlib.reload(module)
+        finally:
+            setattr(target, attribute, original)
+            # Not inside a `try`: if *this* reload fails the session is already
+            # unrecoverable and a swallowed error would present as a confusing
+            # failure in some unrelated test much later.
+            importlib.reload(module)
+
+    return trip

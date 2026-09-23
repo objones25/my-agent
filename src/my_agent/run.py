@@ -294,6 +294,26 @@ class TurnResult:
     make this number grow while they think.
     """
 
+    state: Mapping[str, Any] = field(default_factory=dict)
+    """Everything else the graph returned, minus what already has a field here.
+
+    **`_invoke` used to read `messages` and drop the rest.** A compiled deep
+    agent declares `['files', 'messages', 'structured_response']` as its output
+    and middleware may add more, so reading one key destroyed information at the
+    only point it was available — including `files`, the read-back that answers
+    "did the work happen" without parsing a word of prose (F40, F43).
+
+    Carried whole rather than as one field per key, because the keys are not
+    ours: a middleware a domain adds tomorrow lands here without `run.py`
+    changing. `agent.py` pins the *declared* output keys, so a new one is a
+    failed build rather than a silent arrival — this holds the runtime value,
+    that holds the contract.
+
+    `messages` and `__interrupt__` are excluded: both already have fields, and
+    the messages are the bulk of a turn's memory, so repeating them would double
+    what a `TurnResult` holds and leave two copies to disagree.
+    """
+
     resumes: int = 0
     """How many times this turn has already been resumed.
 
@@ -351,6 +371,41 @@ class TurnResult:
         if last.response_metadata.get("finish_reason") != "length":
             return True
         return bool(last.text) or bool(last.tool_calls)
+
+    @property
+    def files(self) -> Mapping[str, Any]:
+        """The agent's filesystem as it stood when the turn returned.
+
+        deepagents' `StateBackend` is a dict in graph state, so this is the whole
+        filesystem, not a diff — and it does not survive the turn: `run_turn`
+        sends only `messages`, and without a checkpointer langgraph retains
+        nothing, so the next turn starts empty (F43). That makes this exactly
+        "what this turn wrote", which is what a verification read-back wants.
+
+        A fact about the run, like `failed_tool_calls`, not a judgement: nothing
+        here compares it against what the model *said* it wrote, because what
+        the agent should have produced is the domain's question.
+
+        Empty means the graph reported no filesystem — a turn that wrote
+        nothing, or a graph with no `StateBackend` at all. Those are not
+        distinguished, so an emptiness assertion on its own proves nothing; pair
+        it with a turn that does write, the way `require_withheld` refuses a
+        vacuous absence.
+        """
+        found = self.state.get("files", {})
+        return found if isinstance(found, Mapping) else {}
+
+    @property
+    def structured_response(self) -> Any:
+        """What the graph parsed out when `response_format` was configured.
+
+        `None` today on every path, because `AgentConfig` has no
+        `response_format` field — but it is a *declared* output key, and adding
+        that field is the one-line change `AgentConfig`'s docstring promises. A
+        caller who made it and then found `run_turn` had silently dropped the
+        structured output would have lost the only thing they added it for.
+        """
+        return self.state.get("structured_response")
 
     @property
     def action_requests(self) -> tuple[Mapping[str, Any], ...]:
@@ -442,7 +497,17 @@ class RunDeadline(BaseCallbackHandler):
         """Wall clock since construction. What `TurnResult.elapsed_s` accumulates,
         and therefore what the next resume has subtracted from its budget."""
         elapsed = self._clock() - self._started
-        require(elapsed >= 0.0, f"clock ran backwards: {elapsed}s elapsed since the run started")
+        # Distinct wording from `_require_time_left`'s identical check on
+        # purpose: the two messages used to be byte-identical, so a test
+        # matching on the text could not say which site it had tripped — and
+        # only one of them had a test. This one feeds `TurnResult.elapsed_s`,
+        # so a negative value here hands the next resume a budget *larger* than
+        # the turn had left.
+        require(
+            elapsed >= 0.0,
+            f"clock ran backwards while accounting for the turn: {elapsed}s elapsed since the "
+            f"run started, which would give a resume more budget than the turn has left",
+        )
         return elapsed
 
     def _require_time_left(self) -> None:
@@ -580,6 +645,13 @@ class RunTokenBudget(BaseCallbackHandler):
             self._unmeasured_calls += 1
 
 
+_STATE_KEYS_WITH_A_FIELD = frozenset({"messages", "__interrupt__"})
+"""State keys `TurnResult` holds in a field of their own, so `state` omits them.
+
+Not a pin on what the graph may return — `agent.py` owns that — but on what
+would be stored twice if it were not named here.
+"""
+
 _UNKNOWN = object()
 """Sentinel for "this object has no `checkpointer` attribute at all".
 
@@ -675,6 +747,13 @@ def _invoke(  # noqa: PLR0913 — one parameter per thing an invocation carries:
     require(isinstance(result, dict), f"agent returned a {type(result).__name__}, not a mapping")
     require("messages" in result, f"agent returned no messages key: {sorted(result)}")
     messages: list[BaseMessage] = result["messages"]
+    # Everything else the graph reported, kept rather than dropped. Not a
+    # `require` on any particular key: a fake graph in a test carries no
+    # filesystem, and a `StateBackend` never written to reports none either, so
+    # absence is a legitimate state rather than something to refuse.
+    state: Mapping[str, Any] = {
+        key: value for key, value in result.items() if key not in _STATE_KEYS_WITH_A_FIELD
+    }
 
     raw = result.get("__interrupt__", ())
     interrupts = tuple(i for i in raw if isinstance(i, Interrupt))
@@ -706,6 +785,11 @@ def _invoke(  # noqa: PLR0913 — one parameter per thing an invocation carries:
         thread_id=thread_id,
         elapsed_s=(spent.elapsed_s if spent is not None else 0.0) + deadline.elapsed_s,
         tokens=(spent.tokens if spent is not None else 0) + budget.tokens,
+        # Not accumulated across a pause the way the budgets are: this is
+        # state, so what the graph reports on the resume is already the whole of
+        # it, and merging the earlier half back would double-count a file the
+        # agent edited twice.
+        state=state,
         resumes=spent.resumes + 1 if spent is not None else 0,
     )
 

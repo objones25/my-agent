@@ -1,7 +1,7 @@
 # CLAUDE.md
 
 Guidance for Claude Code in this repository. `README.md` says what the project is; this is the
-contributor's contract, and **`docs/findings.md` (F1–F38) is the evidence behind it** — read it
+contributor's contract, and **`docs/findings.md` (F1–F44) is the evidence behind it** — read it
 before debugging anything that looks like a library bug, and add to it when you verify something
 new.
 
@@ -76,7 +76,16 @@ a shell `execute` tool with no opt-in (F4); `capabilities.py` withholds it.
   or `deepagents.provider_profiles` entry point. Such a profile adds middleware, drops tools,
   rewrites tool descriptions and rewrites the system prompt — none of it through
   `create_deep_agent`. `capabilities.DEEPAGENTS_PLUGIN_GROUPS` asserts both groups are empty at
-  import. Relatedly, deepagents' builtin `openai` *provider* profile sets `use_responses_api=True`,
+  import. **And an entry point is not the only door that is not a parameter.** deepagents also
+  `import_module`-probes `langchain_aws` and `langchain_fireworks` and appends their prompt-caching
+  middleware to the parent, to every subagent spec and to `general-purpose` when the import
+  succeeds. `DEEPAGENTS_CACHING_PROBE_MODULES` pins that neither is installed.
+  `AnthropicPromptCachingMiddleware` is appended unconditionally and cannot be pinned away; it is
+  inert only because deepagents passes `unsupported_model_behavior="ignore"`, which is load-bearing
+  against `filterwarnings = ["error"]`. **So `AgentConfig.middleware` is not the middleware stack,
+  and neither is the list `_agent_kwargs` assembles** — and unlike the tool allowlist there is no
+  route to read the installed stack back off a compiled graph, so this one can only be pinned
+  before the fact (F41). Relatedly, deepagents' builtin `openai` *provider* profile sets `use_responses_api=True`,
   which is F1's pin reversed; it never reaches us only because those kwargs apply to a model
   **string** and `build_agent` refuses strings. That refusal is load-bearing (F28).
 - **`AgentConfig.subagents` is a second door onto the allowlist.** A spec that does not carry our
@@ -166,7 +175,8 @@ site changes. `contracts.check_config_contract` makes the splat safe by verifyin
 against the callee's real parameters **at import time**, so a typo or an upstream rename fails on
 import by name instead of becoming a `TypeError` from inside the library. Two pins cover what it
 cannot see: `KNOWN_CREATE_DEEP_AGENT_PARAMS` (a *new* upstream parameter appearing — exactly how
-`execute` arrived switched on) and `ModelConfig._ENV_FIELDS` checked against `dataclasses.fields()`
+`execute` arrived switched on), `KNOWN_OUTPUT_STATE_KEYS` (a new *output* key appearing — exactly
+how `files` came back on every turn and was read by nothing, F43) and `ModelConfig._ENV_FIELDS` checked against `dataclasses.fields()`
 (a field becoming unreachable from the environment). Full reasoning in F19.
 
 **Composition root.** Concrete classes are chosen in exactly one place — `main.py`. Nothing below it
@@ -214,7 +224,11 @@ Bugs live in the states the code was never written to handle. Write those down a
   graph's own bound config, which wins. Measured: `step_limit=25` allowed 12 parent model calls
   alone and **5002** once each step dispatched a `task` subagent. `capabilities.SUBAGENT_STEP_LIMIT`
   is the second bound, applied by compiling the agent, reading deepagents' own subagent back out and
-  handing it back rebound — and asserted by reading it off the graph afterwards (F24).
+  handing it back rebound — and asserted by reading it off the graph afterwards (F24). **"Every
+  graph" includes the parent.** It carried 9999 too, so anything not going through `run_turn` ran
+  3,325 model calls before langgraph stopped it. `capabilities.PARENT_STEP_LIMIT` is bound onto the
+  returned graph; `run_turn`'s per-invocation limit still wins, because at the top level an explicit
+  invoke config beats the graph's own bound config — the opposite of the subagent case (F39).
 - All four bounds fail the same way at the edge, as operating errors `main` reports rather than
   crashes: `DeadlineExceeded`, `StepLimitExceeded` (which translates langgraph's
   `GraphRecursionError` — before it existed the wall clock was a handled ceiling and the step count
@@ -250,15 +264,51 @@ Bugs live in the states the code was never written to handle. Write those down a
 
 ## Testing and evals
 
-Keep them apart. 376 offline tests and 2 live as of 2026-09-19.
+Keep them apart. 462 offline tests and 2 live as of 2026-09-22.
 
 - **Unit tests** (`tests/`, default selection) are deterministic and offline. One test file per
   source module; a new module gets a new file, not an extra section in an existing one. They test
   the harness: protocol conformance, wiring, bounds, error paths. For each `require()`, a test that
-  trips it — that is what turns a contract into a tested contract. **This is the goal, not the
-  current state: ~105 `require()` sites, and `run.py` alone has seven with no test that trips them**
-  (the `__interrupt__` shape check, both `bounds must be RunBounds` sites, the non-mapping result,
-  and `resume_turn`'s preconditions). Line coverage hides it — `require()` is a function, so the
+  trips it — that is what turns a contract into a tested contract. **Outside two named
+  exclusions, that is now the state rather than the goal.** Measured 2026-09-22 by wrapping
+  `require()` in a pytest plugin that logs its call site whenever it raises, then diffing against
+  an AST walk — not by reading coverage, and not by counting by hand: **108 `require()` sites, 83
+  tripped; 16 `raise CheckFailed` sites, 15 tripped.** The 26 that remain are exactly two groups:
+
+    - **15 import-time**, which no test can trip without `importlib.reload` against a patched
+      library. Reachable in principle; nothing here does it yet.
+    - **11 in `main.py`**, left alone deliberately — it is scaffolding, and a check there is worth
+      a findings entry rather than a fix round.
+
+  Nothing else in `src/` has an untripped check. **Keep it that way**: a new `require()` lands with
+  the test that trips it, or the count above stops being true and nobody notices, which is the
+  failure this project spent a branch measuring. Three techniques cover all of it — a bad
+  argument for a precondition; `monkeypatch` on the name the module actually calls for a read-back
+  postcondition, building the real library object and then dropping one setting
+  (`_forgetful_filesystem` in `tests/test_capabilities.py` is the pattern); and, for a check that
+  runs at *import*, the `tripping_an_import_time_check` fixture, which patches the library and
+  re-imports.
+
+- **A load-time check belongs in a function, not at module level.** Module-level is only drivable by
+  `importlib.reload`, and a reload **rebinds every class the module defines** — so
+  `isinstance(cfg, AgentConfig)` inside the reloaded module fails against an instance any other test
+  module is holding, and reads `expected an AgentConfig, got AgentConfig`. Measured: 15 unrelated
+  tests went red that way, **none of them when run alone** (F44). The fixture now refuses to reload
+  a module that defines classes, and `contracts.check_known_parameters` /
+  `check_required_parameters` / `capabilities.require_compaction_fits_the_window` /
+  `model.require_env_fields_cover_the_config` are the shape to copy: called at import, so the
+  guarantee is unchanged, and callable by a test with bad arguments.
+
+  Two traps met while doing it. **A `require()` message is evaluated whether or not the check
+  fails** — `require(cond, f"...{read_back(x)}")` calls `read_back` every time, which is why
+  `build_agent` calls `bound_step_limit` five times and not three; a test that stubs such a helper
+  by call count must count, not assume. And **two sites with the same message cannot be told
+  apart**: `RunDeadline`'s two backwards-clock checks were byte-identical, so `match="backwards"`
+  matched either and the pair read as covered while only one had a test. Give every check a message
+  no other check could produce.
+
+  Line coverage hides all of it — `require()` is a
+  function, so the
   raise lives in `negative_space.py` and the call site reads as covered whether or not the predicate
   ever went false.
 - **Evals** (`evals/`, `-m eval`) measure model-dependent behaviour and are allowed to be
@@ -274,12 +324,23 @@ Keep them apart. 376 offline tests and 2 live as of 2026-09-19.
   entry — harmless today, but read `docs/findings.md`, "Test-infrastructure specifics", before
   changing either.
 - **A passing suite is not a passing state if the tests cannot fail.** Before trusting new tests,
-  break the code they cover and watch them go red; fifteen such mutants are recorded in
-  `docs/findings.md`, and a test that survives one is decorative. Two corollaries: **assert the
+  break the code they cover and watch them go red; twenty-three such mutants are recorded in
+  `docs/findings.md`, and a test that survives one is decorative — two did, and are recorded as
+  findings in their own right (F39, F42). Two corollaries: **assert the
   claim and its discriminator** (`test_build_agent_withholds_the_shell_tool_from_every_subagent` is
   worthless without `test_a_bare_deep_agent_does_grant_the_shell_tool_to_its_subagent`, which keeps
   passing if deepagents stops granting `execute` for its own reasons), and **a pinned value equal to
   the library default cannot be tested by reading it back** — record the *call* instead (F21).
+- **A constant compared to itself is not a pinned constant.** The wider form of F21's rule: if the
+  expected value in a test can be changed by editing `src/`, the test is a tautology. Five constants
+  moved at once — including the router base URL to `api.openai.com`, plus a 10x wall clock and a 10x
+  token ceiling — and all 376 tests stayed green (F42). Every decision now has one literal pin.
+  Write the number down, and pin the default *object* too: pinning `TOKEN_LIMIT` does not pin the
+  `RunBounds` field that defaults to it.
+- **A mutation-verified test is only verified against the mutant you chose.** A behavioural test for
+  the parent step limit survived deleting the fix, because the fake it used dispatched a subagent
+  and hit `SUBAGENT_STEP_LIMIT` first — the turn aborted early whatever the parent was bound to.
+  Pick a fake whose only possible stopper is the bound under test (F39).
 - Do not run the suite under `python -O`: it exits 1 rather than lying to you. `filterwarnings =
   ["error"]` is set, and a new deprecation warning from these fast-moving libraries fails the build
   on purpose — fix it, or scope an ignore matched on message *and* category *and* module as the one
@@ -287,9 +348,15 @@ Keep them apart. 376 offline tests and 2 live as of 2026-09-19.
 
 ### What is deliberately not verified: the model's output
 
-**There is no rung of the verification ladder here, and that is a decision, not an oversight.**
-`run_turn` bounds a turn and asserts that one happened; it trusts nothing about the *content* and
-checks nothing about it either. The live checks assert on tool messages and token counts, never on
+**Nothing grades the model's prose, and that is a decision, not an oversight.** `run_turn` bounds
+a turn and asserts that one happened; it trusts nothing about the *content* and checks nothing about
+it either.
+
+What it does carry is the *record*: `failed_tool_calls`, `answered` and `files` — the agent's
+filesystem as the graph returned it. That last one was available on every turn from the start and
+was being discarded (F40), which is worth stating plainly, because this section used to say the
+ladder's first rung needed a domain. It did not; it needed a field. What still needs a domain is the
+*comparison* — deciding whether the files that appeared are the right ones. The live checks assert on tool messages and token counts, never on
 model prose. Nothing grades an answer.
 
 The reason is scope: verification is "did the agent do the thing", and the thing is TBD. A rule,
@@ -342,7 +409,11 @@ and returns a `CompiledStateGraph`. That list, `BackendProtocol` and `SubAgent` 
   otherwise, and skills are **not** inherited by subagents — pass `skills` on each subagent spec.
 - A consistent `thread_id` shares a conversation only *once a `checkpointer` exists*. There is none,
   so langgraph retains nothing between `invoke` calls and a conversation continues by sending prior
-  messages back: `run_turn(agent, prompt, history=...)` returns exactly what the next call wants.
+  messages back: `run_turn(agent, prompt, history=...)` returns exactly what the next call wants — *of the
+  messages*. **The filesystem does not carry.** `run_turn` sends only `messages`, so the agent's
+  `StateBackend` is empty at the start of every turn: a file written in turn one is gone in turn
+  two. That makes `TurnResult.files` precisely "what this turn wrote", and makes multi-turn work on
+  the agent's own files impossible until a `checkpointer` is set (F43).
 - The general-purpose subagent behind `task` gets its own middleware, not the parent's (F20).
 
 ### Hugging Face router via `langchain-openai`
@@ -392,9 +463,9 @@ Everything in this table lives in `src/my_agent/`.
 |---|---|
 | `model.py` | `ModelConfig`, `build_model`, router defaults, `USE_RESPONSES_API`. Reads `os.environ` via `from_env`; the only module that knows the router exists. |
 | `agent.py` | `AgentConfig`, `build_agent`. Takes a `BaseChatModel` and imports nothing from `model.py` — `main.py` is the only place the two meet. Compiles **twice**: the second build is what puts a step limit on the `task` subagent (F24). |
-| `capabilities.py` | The allowlist and the proof it held: `DEFAULT_FILESYSTEM_TOOLS`, `least_privilege_filesystem`, `compiled_tools`, `compiled_tool_names`, `subagent_graphs`, `bound_step_limit`, `require_withheld`/`require_granted`, plus the bounds on granted capabilities (`SUBAGENT_STEP_LIMIT`, `GREP_MATCH_LIMIT`, the eviction limits, `bounded_compaction` and `CONTEXT_WINDOW_TOKENS`) and the `DEEPAGENTS_PLUGIN_GROUPS` pin. |
+| `capabilities.py` | The allowlist and the proof it held: `DEFAULT_FILESYSTEM_TOOLS`, `least_privilege_filesystem`, `compiled_tools`, `compiled_tool_names`, `subagent_graphs`, `bound_step_limit`, `require_withheld`/`require_granted`, `compiled_output_keys`, plus the bounds on granted capabilities (`PARENT_STEP_LIMIT`, `SUBAGENT_STEP_LIMIT`, `GREP_MATCH_LIMIT`, the eviction limits, `bounded_compaction` and `CONTEXT_WINDOW_TOKENS`) and the `DEEPAGENTS_PLUGIN_GROUPS` / `DEEPAGENTS_CACHING_PROBE_MODULES` pins. |
 | `contracts.py` | `check_config_contract`, `pydantic_param_names` — the import-time check that makes `as_kwargs()` splatting safe. |
-| `run.py` | `Invokable`, `RunBounds`, `RunDeadline`, `RunTokenBudget`, `TurnResult`, `run_turn`, `resume_turn` — one bounded turn, with three outcomes: finished, failed (`DeadlineExceeded`, `StepLimitExceeded`, `TokenLimitExceeded`, `ResumeLimitExceeded`) or paused for approval, `failed_tool_calls` for a turn that finished without doing what it says, and `answered` for a turn cut off before its answer began. Owns the step limit, the wall clock and token budget across a pause, the resume count, the thread and multi-turn history. Imports no deepagents and builds no model. |
+| `run.py` | `Invokable`, `RunBounds`, `RunDeadline`, `RunTokenBudget`, `TurnResult`, `run_turn`, `resume_turn` — one bounded turn, with three outcomes: finished, failed (`DeadlineExceeded`, `StepLimitExceeded`, `TokenLimitExceeded`, `ResumeLimitExceeded`) or paused for approval, `failed_tool_calls` for a turn that finished without doing what it says, `answered` for a turn cut off before its answer began, and `state` — every key the graph returned bar `messages`/`__interrupt__`, with `files` and `structured_response` as properties over it. `_invoke` used to read `messages` and drop the rest (F40, F43). Owns the step limit, the wall clock and token budget across a pause, the resume count, the thread and multi-turn history. Imports no deepagents and builds no model. |
 | `main.py` | `uv run my-agent` — the composition root, and the live checks (one per finding). |
 | `negative_space.py` | `require`/`unreachable`/`bounded`, and the only doctests in `src/`. |
 | `tracing.py` | `TracingBackend`, `LangSmithTracing`, `WeaveTracing`, `available_backends`, `langchain_tracer_names`. |
@@ -403,7 +474,7 @@ Everything in this table lives in `src/my_agent/`.
 `tests/` mirrors that one file per module, offline by default, plus `conftest.py` for shared
 fixtures and the socket guard. The only `-m live` tests are one each at the end of `test_tracing.py`
 (calls the real `weave.init()` and hits the router) and `test_run.py` (proves multi-turn history
-against a real graph, which a fake cannot show). `evals/` is empty. `docs/findings.md` holds F1–F38
+against a real graph, which a fake cannot show). `evals/` is empty. `docs/findings.md` holds F1–F44
 plus the repo-gates, deepagents-surface, test-infrastructure and observability appendices;
 `scripts/audit_negative_space.py` is **vendored** from the negative-space-programming skill — do not
 hand-edit it, refresh by re-copying (it is excluded from ruff and mypy).

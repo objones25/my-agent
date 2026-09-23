@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable, Iterator
+from types import SimpleNamespace
 
 import pytest
 import weave
@@ -420,3 +421,28 @@ def test_langsmith_and_weave_trace_the_same_run(monkeypatch: pytest.MonkeyPatch)
     # indefinitely flushing a queue that a prior run's failed writes leave
     # stuck, which is a worse failure mode than the resource warning it was
     # meant to silence.
+
+
+def test_weave_activate_refuses_an_init_that_installed_no_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A programmer error, not an operating one: this asserts what the library
+    did in direct response to our own `weave.init()`, so a `None` client means
+    tracing silently did not start rather than that a service was unreachable."""
+    monkeypatch.setattr("my_agent.tracing.weave", SimpleNamespace(init=lambda _project: None))
+    monkeypatch.setattr("my_agent.tracing.get_weave_client", lambda: None)
+
+    with pytest.raises(CheckFailed, match="without installing a client"):
+        WeaveTracing(project="p").activate()
+
+
+def test_available_backends_refuses_two_backends_sharing_a_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`main` prints these names and activates each once, so a duplicate would
+    mean it reports a lie and installs global tracing state twice."""
+    twin = LangSmithTracing(project="p")
+    monkeypatch.setattr("my_agent.tracing._BACKEND_SOURCES", (lambda _env: twin, lambda _env: twin))
+
+    with pytest.raises(CheckFailed, match="names must be unique"):
+        available_backends({})

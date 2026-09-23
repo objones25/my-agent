@@ -17,7 +17,8 @@ from __future__ import annotations
 import io
 import re
 from collections.abc import Callable
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 from uuid import uuid4
 
 import pytest
@@ -38,6 +39,7 @@ from my_agent.mirror import JsonlMirror
 from my_agent.model import ModelConfig, build_model
 from my_agent.negative_space import CheckFailed
 from my_agent.run import (
+    DEFAULT_RUN_BOUNDS,
     RECURSION_LIMIT,
     RESUME_LIMIT,
     RUN_DEADLINE_S,
@@ -92,8 +94,16 @@ def _handlers(config: RunnableConfig | None) -> list[BaseCallbackHandler]:
 class FakeGraph:
     """The narrowest thing `run_turn` can accept: something with `.invoke`."""
 
-    def __init__(self, result: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        result: dict[str, Any] | None = None,
+        extra_state: dict[str, Any] | None = None,
+    ) -> None:
         self.result = result if result is not None else _two_messages()
+        # A real graph returns its whole state, not only the messages; this is
+        # how a test says so without compiling one.
+        if extra_state:
+            self.result = {**self.result, **extra_state}
         self.payload: dict[str, Any] | None = None
         self.config: RunnableConfig | None = None
 
@@ -1386,3 +1396,204 @@ def test_duplicate_tool_call_ids_let_one_result_answer_two_calls() -> None:
     result = run_turn(agent, "next", history=history)
 
     assert result[-1].text == "done"
+
+
+# --------------------------------------------------------------------------
+# What the agent actually wrote (F40)
+# --------------------------------------------------------------------------
+
+
+def test_a_turn_surfaces_the_files_the_agent_wrote() -> None:
+    """The read-back the harness already had and threw away.
+
+    deepagents' `StateBackend` puts the agent's filesystem in graph state, so
+    every `invoke` returns `files` alongside `messages`. `_invoke` took the
+    messages and dropped the rest, `TurnResult` had nowhere to put it and the
+    mirror records the state's *key names* only — so the one deterministic
+    artifact a turn produces, the object the agent claims to have created, was
+    visible nowhere.
+    """
+    model = FanningOutModel(width=2, turns_before_answering=1)
+
+    result = run_turn(build_agent(model), "write two files")
+
+    assert sorted(result.files) == ["/f1-0.txt", "/f1-1.txt"]
+    assert result.files["/f1-0.txt"]["content"] == "x"
+
+
+def test_a_turn_that_wrote_nothing_reports_no_files() -> None:
+    """The discriminator. Without it the assertion above is satisfied by any
+    non-empty mapping, and a `files` that simply echoed state would read as
+    proof the agent did something."""
+    result = run_turn(FakeGraph(), "say hello")
+
+    assert result.files == {}
+
+
+def test_the_run_bounds_are_the_values_that_were_chosen() -> None:
+    """Literals, for the reason `test_model.py` now pins the router defaults.
+
+    Measured 2026-09-21: `RUN_DEADLINE_S` 600.0 -> 6000.0 and `TOKEN_LIMIT`
+    500_000 -> 5_000_000 left all 376 tests green, because every test that reads
+    a bound compares it to the same module constant it came from — including the
+    two that pass the constant in as the budget, so the goalposts move together.
+    `RECURSION_LIMIT` was the one already pinned, incidentally, by the
+    `match="25 steps"` literal further up this file.
+    """
+    assert RECURSION_LIMIT == 25
+    assert RUN_DEADLINE_S == 600.0
+    assert TOKEN_LIMIT == 500_000
+    assert RESUME_LIMIT == 3
+
+
+def test_the_default_bounds_object_carries_those_same_values() -> None:
+    """The pin above is on the constants; this is on the object every turn
+    actually runs under. A `RunBounds` field that stopped defaulting to its
+    constant would leave the first test green and every run unbounded by the
+    number it names."""
+    assert DEFAULT_RUN_BOUNDS.step_limit == 25
+    assert DEFAULT_RUN_BOUNDS.deadline_s == 600.0
+    assert DEFAULT_RUN_BOUNDS.token_limit == 500_000
+    assert DEFAULT_RUN_BOUNDS.resume_limit == 3
+
+
+def test_a_turn_carries_every_state_key_the_graph_returned() -> None:
+    """`_invoke` read `messages` and dropped the rest of the state.
+
+    `files` was the key that mattered enough to notice (F40), but reading one
+    named key is the same mistake at a smaller scale: the compiled output schema
+    declares `['files', 'messages', 'structured_response']`, and a middleware may
+    add more. Anything the graph reports and this class cannot hold is
+    information the harness destroys at the only point it is available.
+    """
+    graph = FakeGraph(
+        extra_state={
+            "files": {"/a.txt": {"content": "x"}},
+            "structured_response": {"verdict": "pass"},
+            "some_future_key": 42,
+        }
+    )
+
+    result = run_turn(graph, "go")
+
+    assert result.state["some_future_key"] == 42
+    assert result.structured_response == {"verdict": "pass"}
+    assert dict(result.files) == {"/a.txt": {"content": "x"}}
+
+
+def test_the_state_a_turn_carries_excludes_what_has_its_own_field() -> None:
+    """The discriminator, and the reason this is not just `result.raw`.
+
+    `messages` and `__interrupt__` are already `TurnResult` fields. Repeating
+    them in `state` would double the memory a turn holds — the messages are the
+    bulk of it — and leave two copies that a later edit can disagree about.
+    """
+    graph = FakeGraph(extra_state={"files": {}})
+
+    result = run_turn(graph, "go")
+
+    assert "messages" not in result.state
+    assert "__interrupt__" not in result.state
+    assert result.messages
+
+
+def test_a_turn_against_a_graph_with_no_extra_state_carries_none() -> None:
+    """Absence is a legitimate state: a fake graph carries no filesystem, and a
+    `StateBackend` never written to reports none either."""
+    result = run_turn(FakeGraph(), "go")
+
+    assert result.state == {}
+    assert result.structured_response is None
+    assert result.files == {}
+
+
+# --------------------------------------------------------------------------
+# The last seven checks in this module with no test that trips them
+#
+# Measured by instrumenting `require()` to log its call site whenever it raises
+# and running the suite. These were what remained: the two shape checks on what
+# a graph hands back, the three type preconditions nothing had passed a wrong
+# type to, and the backwards-clock check on the accounting path.
+# --------------------------------------------------------------------------
+
+
+def test_the_deadline_refuses_a_backwards_clock_while_accounting() -> None:
+    """The *other* backwards-clock check. `_require_time_left`'s has a test;
+    this one feeds `TurnResult.elapsed_s`, so a negative value hands the next
+    resume a budget larger than the turn had left — the opposite of a bound.
+
+    Its message used to be byte-identical to the enforcement path's, so no
+    `match=` could tell the two apart and the pair read as covered.
+    """
+    deadline = RunDeadline(10.0, clock=FakeClock(0.0, -5.0))
+
+    with pytest.raises(CheckFailed, match="accounting for the turn"):
+        _ = deadline.elapsed_s
+
+
+def test_run_turn_rejects_a_result_that_is_not_a_mapping() -> None:
+    """`_invoke` subscripts what comes back. A graph returning a list would
+    otherwise fail with a `TypeError` from inside this module rather than
+    naming the library that changed."""
+    graph = FakeGraph(result=cast(Any, [HumanMessage("hi"), AIMessage("there")]))
+
+    with pytest.raises(CheckFailed, match="not a mapping"):
+        run_turn(graph, "go")
+
+
+def test_run_turn_rejects_interrupts_it_cannot_read() -> None:
+    """The shape check on a pause. `interrupts` is built by filtering for
+    `Interrupt` objects, so a langgraph that reported pauses some other way
+    would yield an empty tuple — a paused turn indistinguishable from a
+    finished one, which is the exact failure F29 exists for."""
+    # Typed loosely on purpose: the whole point is a payload shaped the way
+    # langgraph does *not* currently shape one.
+    result: dict[str, Any] = {
+        **_two_messages(),
+        "__interrupt__": [{"action_requests": [{"name": "write_file"}]}],
+    }
+    graph = FakeGraph(result=result)
+
+    with pytest.raises(CheckFailed, match="are Interrupt"):
+        run_turn(graph, "go")
+
+
+def test_run_turn_rejects_bounds_that_are_not_run_bounds() -> None:
+    """A duck-typed stand-in with the right attribute names would reach
+    `_run_config` and be sent as a `recursion_limit`, so the turn would run
+    under numbers that never passed `RunBounds.__post_init__`."""
+    loose = cast(Any, SimpleNamespace(step_limit=1, deadline_s=1.0, token_limit=1, resume_limit=0))
+
+    with pytest.raises(CheckFailed, match="bounds must be RunBounds"):
+        run_turn(FakeGraph(), "go", bounds=loose)
+
+
+def test_resume_turn_rejects_something_that_cannot_be_invoked() -> None:
+    """The resume half of `run_turn`'s own precondition. A resume path that
+    skipped it would fail with an `AttributeError` after the bounds had already
+    been computed and the resume counted."""
+    paused = run_turn(PausingGraph(), "write it", thread_id="t1")
+
+    with pytest.raises(CheckFailed, match="invoke"):
+        resume_turn(cast(Any, object()), paused, [{"type": "approve"}])
+
+
+def test_resume_turn_rejects_something_that_is_not_a_turn_result() -> None:
+    """`paused` carries the thread the pending interrupt lives in and the
+    budgets already spent. A look-alike would resume the wrong checkpoint with a
+    fresh budget — the two defects F33 closed, reached from a new direction."""
+    impostor = cast(Any, SimpleNamespace(paused=True, thread_id="t1", elapsed_s=0.0, tokens=0))
+
+    with pytest.raises(CheckFailed, match="must be the TurnResult"):
+        resume_turn(FakeGraph(), impostor, [{"type": "approve"}])
+
+
+def test_resume_turn_rejects_bounds_that_are_not_run_bounds() -> None:
+    """The same precondition as `run_turn`'s, on the path that subtracts the
+    spent budget from them. Unvalidated bounds here mean a resume computing its
+    remainder from numbers nothing checked."""
+    paused = run_turn(PausingGraph(), "write it", thread_id="t1")
+    loose = cast(Any, SimpleNamespace(step_limit=1, deadline_s=1.0, token_limit=1, resume_limit=3))
+
+    with pytest.raises(CheckFailed, match="bounds must be RunBounds"):
+        resume_turn(FakeGraph(), paused, [{"type": "approve"}], bounds=loose)

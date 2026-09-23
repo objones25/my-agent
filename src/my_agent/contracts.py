@@ -22,7 +22,12 @@ from pydantic import BaseModel
 
 from my_agent.negative_space import require
 
-__all__ = ["check_config_contract", "pydantic_param_names"]
+__all__ = [
+    "check_config_contract",
+    "check_known_parameters",
+    "check_required_parameters",
+    "pydantic_param_names",
+]
 
 
 def pydantic_param_names(model_cls: type[BaseModel]) -> frozenset[str]:
@@ -72,4 +77,54 @@ def check_config_contract(
         not conflicting,
         f"{config_cls.__name__} must not configure {sorted(conflicting)}; "
         f"those are supplied by the factory and would collide when splatted",
+    )
+
+
+def check_known_parameters(
+    actual: frozenset[str], known: frozenset[str], callee_name: str, why_new_matters: str
+) -> None:
+    """Fail if a callee's parameter set has drifted from the reviewed one.
+
+    `check_config_contract` asserts our fields are real parameters. It cannot
+    notice a **new** parameter appearing — and a new parameter is exactly how
+    deepagents' shell `execute` tool arrived switched on with no opt-in.
+
+    A function rather than two checks written at module level, for the reason
+    `check_config_contract` is one: a load-time check nothing can call is a
+    check nothing can test, and the only way to drive it otherwise is to reload
+    the defining module — which rebinds every class it defines and breaks
+    `isinstance` for every instance another module is holding (F44).
+
+    Two `require()`s, not one: gaining and losing a parameter are different
+    events needing different responses, and a compound check names neither.
+    """
+    gained = actual - known
+    require(
+        not gained,
+        f"{callee_name} gained parameters {sorted(gained)}. {why_new_matters}",
+    )
+    removed = known - actual
+    require(
+        not removed,
+        f"{callee_name} no longer accepts {sorted(removed)}; the config and this pin must "
+        f"change together",
+    )
+
+
+def check_required_parameters(
+    actual: frozenset[str], needed: frozenset[str], callee_name: str
+) -> None:
+    """Fail if a callee stopped accepting a keyword a config relies on.
+
+    Narrower than `check_known_parameters`: this says nothing about parameters
+    appearing, only that the ones being counted on are still there. Aliases are
+    the usual casualty — `ChatOpenAI` takes `base_url`, not its field name
+    `openai_api_base`, and an alias that disappears turns a splat into a
+    pydantic error naming a field rather than the rename behind it.
+    """
+    require(actual != frozenset(), f"could not introspect {callee_name} parameters")
+    missing = needed - actual
+    require(
+        not missing,
+        f"{callee_name} no longer accepts {sorted(missing)}; the config must change",
     )

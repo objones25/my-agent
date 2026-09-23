@@ -1395,6 +1395,312 @@ and the character truncation) would land in the same unbounded gap — nothing h
 
 ---
 
+## F39 — the parent graph runs to 9999 too; only `run_turn` was ever bounded
+
+**Severity: important, and precisely scoped.** F24 recorded that langchain's `create_agent` binds
+`recursion_limit: 9999` on every graph it compiles, and fixed it for the `task` subagent. The
+"every" is literal: the parent carries it as well, and nothing recorded that.
+
+```python
+bound_step_limit(build_agent(model))   # 9999
+```
+
+Measured 2026-09-21 with a model that requests one `ls` per turn and never answers — an ordinary
+tool, so no subagent limit can abort it early, and both call limits run `exit_behavior="continue"`
+so a blocked call is handed back as an error and the model simply asks again:
+
+```
+agent.invoke({"messages": [...]})      # no run_turn
+→ GraphRecursionError after 3,325 model calls
+```
+
+**`run_turn` was never affected.** It sends `RunBounds.step_limit` as `recursion_limit` on the
+invocation, and at the top level an explicit invoke config beats the graph's own bound config —
+which is the opposite of the subagent case, where deepagents invokes the subagent with *its* bound
+config and that wins the per-key merge. So the sanctioned path was bounded all along. What was
+wrong is the floor underneath it: `run.py`'s module docstring says a call-site bound means other
+callers "inherited langchain-core's defaults by accident", and names 25 as that default. The actual
+inheritance is 9999, about four hundred times larger.
+
+*What we do:* `capabilities.PARENT_STEP_LIMIT` (25), bound onto the returned graph by `build_agent`
+with `with_config`, asserted as a postcondition because `with_config` returns a copy. `with_config`
+returns `Self`, so the annotated return type survives, and `compiled_tools`, `subagent_graphs` and
+the subagent's own bound limit all still read back off the copy — checked, not assumed.
+
+Two tests, because the claim and its discriminator are different assertions: a bare invoke now stops
+at or under `PARENT_STEP_LIMIT`, and `run_turn` with a smaller `step_limit` still gets the smaller
+number. The first was written once against a model that dispatches subagents and **survived the
+mutant** — `SUBAGENT_STEP_LIMIT` raises through the tool call and aborts the parent long before the
+parent's own limit matters, so the test passed whatever the parent was bound to. That is recorded
+here because it is the exact failure mode `CLAUDE.md` warns about, caught only by mutating the fix.
+
+`LIBRARY_SUBAGENT_STEP_LIMIT` is renamed `LIBRARY_STEP_LIMIT`: the number is bound on every graph,
+not only on subagents, and a name that says otherwise makes the parent's discriminator read wrong.
+
+---
+
+## F40 — the harness threw away the only read-back it had
+
+**Severity: important.** deepagents' `StateBackend` keeps the agent's filesystem in graph state, so
+every invocation returns it:
+
+```
+RAW STATE KEYS: ['files', 'messages']
+files = {'/f1-0.txt': {'content': 'x', 'encoding': 'utf-8', 'created_at': ..., 'modified_at': ...}}
+```
+
+`_invoke` took `result["messages"]` and dropped the rest. `TurnResult` had no field for it.
+`mirror._state_summary` deliberately records a state payload's *key names* and message count only,
+because writing the whole state was 77% of a real run's bytes (F30). So the object the agent claims
+to have created — the deterministic artifact that answers "did the work happen" without reading a
+word of prose — was visible in no sink at all: not to the caller, not in the log, not in a trace.
+
+This matters because of what `CLAUDE.md` says next to it. *What is deliberately not verified* argues
+that the verification ladder needs a domain before its first rung can be built, and that rung is
+"a deterministic rule — an exit code, a schema, a read-back of the object the agent claims to have
+created". The read-back was already in hand on every turn. It needed a field, not a domain.
+
+*What we do:* `TurnResult.files`, beside `failed_tool_calls` and `answered` — a fact about the run,
+not a judgement of it. Nothing compares it against what the model *said* it wrote, because what the
+agent should have produced is the domain's question; what it did produce is this.
+
+Not accumulated across a pause the way `elapsed_s` and `tokens` are: the filesystem is state, so
+what the graph reports on a resume is already the whole of it, and adding the earlier half back
+would double-count a file the agent edited twice.
+
+*Still unverified:* nothing consumes it yet. `main.py` prints `failed_tool_calls` and would be the
+obvious place, and is deliberately left alone as scaffolding. An emptiness assertion on its own is
+also vacuous — an empty mapping means "wrote nothing" and "no `StateBackend`" alike, which is why
+the test that asserts emptiness is paired with one that writes.
+
+---
+
+## F41 — a second door onto the middleware stack, and it is not an entry point
+
+**Severity: minor today, structural.** F28 pinned the two entry-point groups through which an
+installed package can reconfigure the agent. There is a third route that pin cannot see, because it
+registers nothing.
+
+`deepagents/middleware/_prompt_caching.py` (0.7.15):
+
+```python
+def append_prompt_caching_middleware(middleware):
+    middleware.append(AnthropicPromptCachingMiddleware(unsupported_model_behavior="ignore"))
+    bedrock = _create_bedrock_prompt_caching_middleware()       # import_module("langchain_aws...")
+    if bedrock is not None: middleware.append(bedrock)
+    fireworks = _create_fireworks_prompt_caching_middleware()   # import_module("langchain_fireworks...")
+    if fireworks is not None: middleware.append(fireworks)
+```
+
+`graph.py` calls it three times: on the parent (`:905`), on every subagent spec (`:709`) and on the
+general-purpose subagent (`:812`). So installing `langchain-aws` or `langchain-fireworks` — as
+anyone's transitive dependency, never named at a call site — adds middleware to every graph this
+harness compiles. It passes through no parameter, so `KNOWN_CREATE_DEEP_AGENT_PARAMS` cannot see it;
+it advertises no entry point, so `DEEPAGENTS_PLUGIN_GROUPS` cannot either.
+
+**`AgentConfig.middleware` is therefore not the middleware stack**, and neither is the list
+`_agent_kwargs` assembles. Verified 2026-09-21: `_agent_kwargs` returns four middlewares; the
+compiled agent runs `AnthropicPromptCachingMiddleware`'s `wrap_model_call` as well, and it appears
+in no node list because a `wrap_model_call` middleware is not a graph node. There is no route found
+to read the installed stack back off a compiled graph — the closure hunt that works for
+`subagent_graphs` finds no middleware list — so unlike the tool allowlist this one cannot be
+asserted after the fact, only pinned before.
+
+**Blast radius today is nil, for two reasons that are both someone else's to change.**
+`_should_apply_caching` returns `False` for anything that is not a `ChatAnthropic`, and deepagents
+constructs the middleware with `unsupported_model_behavior="ignore"`. That argument is load-bearing
+in a way worth stating: the same class supports `"warn"`, and `"warn"` plus this repo's
+`filterwarnings = ["error"]` would turn every model call into a failed test.
+
+*What we do:* `capabilities.DEEPAGENTS_CACHING_PROBE_MODULES` names the two probed distributions and
+`installed_caching_probes()` reports which are importable; neither is, and an import-time `require`
+fails the load if that changes. Verified by adding an installed package to the probe list, which
+makes `capabilities.py` unimportable — the same failure shape as the plugin pin. The unconditional
+Anthropic middleware cannot be pinned away and is recorded by a test instead, including the
+`"ignore"` argument.
+
+---
+
+## F42 — a constant compared to itself is not a pinned constant
+
+**Severity: important.** F21 established the rule for values equal to a library default: *record the
+call, because reading the value back cannot tell "we chose it" from "we inherited it"*. The wider
+version went unnoticed — **a value read back from the same symbol the test imported cannot fail at
+all**, default or not.
+
+Measured 2026-09-21. Five constants changed at once:
+
+```
+HF_ROUTER_BASE_URL  → "https://api.openai.com/v1"
+DEFAULT_TEMPERATURE 0.0 → 1.9        DEFAULT_MAX_RETRIES 2 → 99
+RUN_DEADLINE_S 600.0 → 6000.0        TOKEN_LIMIT 500_000 → 5_000_000
+→ 376 passed, 2 deselected
+```
+
+The harness pointed at another provider, at temperature 1.9, with ten times the wall clock and ten
+times the token ceiling, and nothing went red. The sharpest case is
+`test_build_model_ignores_ambient_openai_env_vars`, which exists to prove an ambient
+`OPENAI_BASE_URL` cannot redirect us: it sets that variable to `api.openai.com` and asserts
+`openai_api_base == HF_ROUTER_BASE_URL`, so when the constant *is* that URL the test passes while
+making the opposite claim. `RECURSION_LIMIT` was the one constant already pinned, and only
+incidentally — by the literal `match="25 steps"` in an unrelated error-message test.
+
+Three more of the same shape:
+
+- **`exit_behavior="continue"`** deleted from both `ToolCallLimitMiddleware` calls → 376 passed.
+  Equal to the library default, so F21's own rule applied and had not been.
+- **`thread_limit is None`** was asserted about a parameter `call_limits()` never passes — a claim
+  about langchain's default dressed as a claim about this repo.
+- **`MAX_FIELD_CHARS` 4000 → 200** → all 51 mirror tests passed. The fixture was
+  `"x" * (MAX_FIELD_CHARS * 2)` and the assertion `len(output) == MAX_FIELD_CHARS`, so both
+  goalposts moved together and no value could turn it red. A 20x loss of log fidelity, invisible.
+
+And two vacuity failures of the kind `require_withheld` refuses in `src/`: `as_kwargs` stubbed to
+`return {}` left five contract tests green, because `set(...) <= accepted` and `"model" not in ...`
+are both vacuously true of an empty dict; and `on_chat_model_start` stubbed out entirely left the
+credential test green, because `"hf_super_secret" not in stream.getvalue()` holds on an empty
+stream.
+
+*What we do:* one literal pin per decision — `test_the_router_defaults_are_the_values_that_were_chosen`,
+`test_the_run_bounds_are_the_values_that_were_chosen`,
+`test_the_capability_bounds_are_the_numbers_that_were_chosen` — plus the default `RunBounds` object,
+because pinning the constant does not pin the field that defaults to it. `exit_behavior` is recorded
+on the call with the `monkeypatch` pattern `least_privilege_filesystem` already had; the mirror
+fixture uses literals behind a guard assertion; the vacuous tests gained the positive half. The
+five-constant mutation now fails four tests.
+
+*The general rule, for the next constant:* if the expected value in a test can be changed by editing
+`src/`, the test is a tautology. Write the number down.
+
+---
+
+## F43 — `_invoke` read one key and dropped the state
+
+**Severity: important.** F40 gave `TurnResult` a `files` field, which fixed the symptom and left the
+shape of the bug intact: `_invoke` still read named keys out of the result and discarded whatever
+else came back.
+
+What a compiled deep agent actually declares it may return:
+
+```python
+typing.get_type_hints(agent.output_schema)   # ['files', 'messages', 'structured_response']
+```
+
+`structured_response` was being dropped. It is empty on every path today, because `AgentConfig` has
+no `response_format` field — but adding one is the single-line change `AgentConfig`'s own docstring
+promises, and the caller who made it would have found `run_turn` silently discarding the only thing
+they added it for. Proven against a graph returning the declared shape: `files` surfaced,
+`structured_response` and an unrecognised key both vanished.
+
+Two further facts from the same introspection:
+
+- **The declared output class does not mention `files`.** `OutputAgentState` names `messages` and
+  `structured_response` only; `files` is contributed by `FilesystemMiddleware`, which is exactly how
+  a key that arrives on every turn stays invisible to anyone reading the type.
+- **The graph's internal channels are wider than its output.** `run_tool_call_count` and
+  `thread_tool_call_count` — the call-limit counters — are state channels but not output keys, so
+  they do not come back from `invoke` and `TurnResult` cannot report how many calls a run made.
+  `failed_tool_calls` counts the blocked ones from the messages instead.
+
+*What we do:* `TurnResult.state` carries every key the graph returned except `messages` and
+`__interrupt__`, which have fields of their own — excluded because the messages are the bulk of a
+turn's memory and two copies can disagree. `files` and `structured_response` are properties over it,
+so the keys with a documented meaning keep a name while an unrecognised key is still *there* rather
+than destroyed.
+
+Carried whole rather than one field per key on purpose: the keys are not ours to enumerate, and a
+middleware a domain adds tomorrow lands in `state` without `run.py` changing. What stops that being
+silent is a pin: `agent.KNOWN_OUTPUT_STATE_KEYS` plus `capabilities.compiled_output_keys`, asserted
+in `build_agent`, so a newly declared output key fails the build and someone decides whether it
+deserves a property. The same argument as `KNOWN_CREATE_DEEP_AGENT_PARAMS`, one layer down — that
+pin catches a new parameter, this catches a new output. The reader raises rather than returning an
+empty set when the structure moves, because a reader that finds no keys would make every
+"is this key known?" check pass by checking nothing.
+
+### The filesystem does not survive the turn
+
+Worth stating beside `files`, because it is easy to assume otherwise. `run_turn` sends
+`{"messages": sent}` and nothing else, and with no checkpointer langgraph retains nothing, so the
+agent's filesystem is empty at the start of every turn. Measured 2026-09-22 — a file written in turn
+one is gone in turn two of the same conversation, `history=` passed:
+
+```
+turn 1 files: ['/a.txt']
+turn 2 files: ['/b.txt']        # same agent, same conversation
+carried? False
+```
+
+The conversation continues across turns; the filesystem does not. `CLAUDE.md` says
+`run_turn(agent, prompt, history=...)` "returns exactly what the next call wants", which is now
+narrower than it reads: `TurnResult` carries `files`, and the next call has no way to accept them.
+
+Two readings, pointing opposite ways. It is *convenient*: because state resets, `files` is always
+precisely "what this turn wrote", which is a cleaner verification artifact than a cumulative
+filesystem. It is also a *gap*: an agent that writes notes in turn one cannot read them in turn two,
+and any multi-turn domain hits it immediately.
+
+*What we do:* nothing. The fix is a `checkpointer` — already an `AgentConfig` field — and it would
+also make `files` cumulative, so the read-back stops meaning "this turn". Which of the two readings
+matters depends on the domain, and inventing multi-turn filesystem persistence now would be the
+YAGNI this repo spends a section refusing. Recorded so the choice is made rather than discovered.
+
+---
+
+## F44 — reloading a module to test its load-time checks rebinds every class it defines
+
+**Severity: important, and the reason two pins moved file.** Fifteen check sites in `src/` run at
+*import*: that `execute` is still a filesystem tool, that `create_deep_agent` grew no parameter,
+that `ChatOpenAI` still accepts every alias `ModelConfig` splats. They execute once, when the test
+session imports the package, and no ordinary test can make one false — by the time it runs the
+import has long since succeeded.
+
+`importlib.reload` with the library patched is the only route, and it has a trap that the first
+eight tests did not hit and the next three did.
+
+**A reload rebinds every class the module defines.** `importlib.reload` re-executes the module body,
+so `class AgentConfig` produces a *new* class object while every other test module still holds the
+one imported at collection time. `build_agent`'s own `require(isinstance(agent_config, AgentConfig))`
+then compares an instance of the old class against the new one:
+
+```
+CheckFailed: expected an AgentConfig, got AgentConfig
+```
+
+Measured 2026-09-22: reloading `my_agent.agent` and `my_agent.model` failed **15 unrelated tests**
+across `test_capabilities.py`, `test_main.py` and `test_run.py` — the grep bound, the compaction
+behaviour, the eviction tests and every HITL test. **None of them fails when run alone**, which is
+the worst property a test failure can have. `my_agent.capabilities` reloads safely for one reason
+only: it defines no classes, just constants and functions.
+
+*What we do:* two things.
+
+**The fixture refuses the unsafe case.** `tripping_an_import_time_check` in `tests/conftest.py`
+asserts the target module defines no classes of its own before reloading it, naming them and saying
+what to do instead. A rule that is checked beats a rule that is written down.
+
+**The checks in class-defining modules moved into functions.** `agent.py`'s two
+`KNOWN_CREATE_DEEP_AGENT_PARAMS` checks became `contracts.check_known_parameters`, and `model.py`'s
+alias pin became `contracts.check_required_parameters`; both are still called at import, so the
+load-time guarantee is unchanged, and both are now ordinary functions a test drives with bad
+arguments. `contracts.check_config_contract` was already exactly this shape, which is what made it
+the obvious precedent rather than an invention.
+
+Two more moved for a related reason: `capabilities.require_compaction_fits_the_window` and
+`model.require_env_fields_cover_the_config` compare constants defined *in the file that checks
+them*, so no patch a test can apply reaches either. A reload could not drive them and neither could
+anything else; as functions they take the numbers as arguments.
+
+**The result, measured rather than counted** (by wrapping `require()` and `CheckFailed` in pytest
+plugins that log their call site, then diffing against an AST walk): **110 `require()` sites, 100
+tripped; 13 `raise CheckFailed` sites outside the helpers, 12 tripped.** Every remaining untripped
+site is in `main.py`. No import-time check is untripped any more.
+
+*Worth knowing for the next one:* a module-level check is a check that can only be driven by
+reloading, and reloading is only safe in a module with no classes. **Prefer a function called at
+import.** It costs one line and keeps the check testable.
+
+---
+
 ## Observability API reference
 
 Not findings — API surfaces recorded so the next piece of work does not have to re-derive them.
@@ -1531,7 +1837,7 @@ main checkout run a `scripts/check.sh` that may not exist on the branch checked 
 
 **Three scans run on this repo and only two are files here.** `ci.yml` runs the gate on every push
 and pull request. `.github/workflows/live.yml` runs `-m live` weekly (Mondays 06:00 UTC) and on
-demand, because this file is twenty-three verified behaviours and nothing else re-checks any of
+demand, because this file is forty-four verified behaviours and nothing else re-checks any of
 them; it skips rather than fails when `HF_TOKEN` is absent, so an unconfigured clone does not
 produce a weekly red X that means nothing, and it never gates a commit. **CodeQL is the third and it
 is not a file here** — it uses GitHub's default setup, so the workflow is generated and managed by
@@ -1627,6 +1933,18 @@ fixture, undersized enough to pass under every trigger tried until this branch r
 ## Open / unverified
 
 Each of these is also noted at the finding it belongs to.
+
+- Whether anything consumes `TurnResult.files` (F40). The field exists and is tested; `main.py`
+  prints `failed_tool_calls` and would be the obvious next reader, and is deliberately left alone.
+- Whether a `wrap_model_call` middleware installed by deepagents can be read back off a compiled
+  graph at all (F41). The closure hunt that finds `subagent_graphs` finds no middleware list, so
+  the caching door is pinned before the fact rather than asserted after it — the only door here
+  with no read-back.
+- Whether the 15 import-time check sites can be tripped by a test. They need `importlib.reload`
+  against a monkeypatched library and no test here does that, so they are the last group with no
+  coverage outside `main.py` — 83 of 108 `require()` sites and 15 of 16 `raise CheckFailed` sites
+  are tripped as of 2026-09-22, measured by wrapping `require()` in a pytest plugin rather than by
+  reading coverage. The remaining 11 are in `main.py` and deliberately left.
 
 - A **provider-pinned** model id (`org/model:groq`) on the token cap (F2), on `reasoning_effort`
   (F17, F26) and on the context window (F25). Only the router's own selection is covered, and F25 is

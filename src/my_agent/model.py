@@ -15,14 +15,18 @@ when this module loads, by name.
 from __future__ import annotations
 
 import os
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, fields
 from typing import Any
 
 from langchain_openai import ChatOpenAI
 from pydantic import SecretStr
 
-from my_agent.contracts import check_config_contract, pydantic_param_names
+from my_agent.contracts import (
+    check_config_contract,
+    check_required_parameters,
+    pydantic_param_names,
+)
 from my_agent.negative_space import CheckFailed, require
 
 __all__ = [
@@ -132,10 +136,8 @@ _CHAT_OPENAI_PARAMS = pydantic_param_names(ChatOpenAI)
 # Aliases are the part of the ChatOpenAI contract most likely to move: every
 # keyword below is one ModelConfig relies on, and three of the four are aliases
 # rather than field names.
-_MISSING_CHAT_OPENAI_PARAMS = {"model", "base_url", "api_key", "timeout"} - _CHAT_OPENAI_PARAMS
-require(
-    not _MISSING_CHAT_OPENAI_PARAMS,
-    f"ChatOpenAI no longer accepts {sorted(_MISSING_CHAT_OPENAI_PARAMS)}; ModelConfig must change",
+check_required_parameters(
+    _CHAT_OPENAI_PARAMS, frozenset({"model", "base_url", "api_key", "timeout"}), "ChatOpenAI"
 )
 
 _MODEL_INJECTED_PARAMS = frozenset({"use_responses_api"})
@@ -298,23 +300,41 @@ this module pays for explicitness everywhere else.
 # change". Defining the mapping as data lets a check assert it covers the
 # dataclass, the same way DEFAULT_FILESYSTEM_TOOLS is defined by subtraction and
 # then asserted. A new field now fails the import instead of being forgotten.
-_MODEL_CONFIG_FIELDS = {f.name for f in fields(ModelConfig)}
-_ENV_FIELD_NAMES = {spec.name for spec in _ENV_FIELDS}
+def require_env_fields_cover_the_config(
+    config_fields: Collection[str], env_fields: Sequence[_EnvField]
+) -> None:
+    """Fail unless every config field is reachable from the environment, once.
 
-require(
-    not (_MODEL_CONFIG_FIELDS - _ENV_FIELD_NAMES),
-    f"ModelConfig fields unreachable from the environment: "
-    f"{sorted(_MODEL_CONFIG_FIELDS - _ENV_FIELD_NAMES)}; add a row to _ENV_FIELDS",
-)
-require(
-    not (_ENV_FIELD_NAMES - _MODEL_CONFIG_FIELDS),
-    f"_ENV_FIELDS names that are not ModelConfig fields: "
-    f"{sorted(_ENV_FIELD_NAMES - _MODEL_CONFIG_FIELDS)}",
-)
-require(
-    len({spec.env_var for spec in _ENV_FIELDS}) == len(_ENV_FIELDS),
-    "two _ENV_FIELDS rows share an environment variable; one would shadow the other",
-)
+    A function rather than three bare checks at module level, for the reason
+    `contracts.check_config_contract` is one: both sides are defined *in this
+    file*, so no patch a test can apply reaches them and these would be the one
+    kind of check that can never be driven. Called below with the real pair, so
+    the load-time guarantee is unchanged.
+
+    Three separate `require()`s, not one compound: they fail for three different
+    reasons and the message has to say which.
+    """
+    names = {spec.name for spec in env_fields}
+    unreachable = set(config_fields) - names
+    require(
+        not unreachable,
+        f"ModelConfig fields unreachable from the environment: {sorted(unreachable)}; "
+        f"add a row to _ENV_FIELDS",
+    )
+    orphaned = names - set(config_fields)
+    require(
+        not orphaned,
+        f"_ENV_FIELDS names that are not ModelConfig fields: {sorted(orphaned)}",
+    )
+    require(
+        len({spec.env_var for spec in env_fields}) == len(env_fields),
+        "two _ENV_FIELDS rows share an environment variable; one would shadow the other",
+    )
+
+
+_MODEL_CONFIG_FIELDS = {f.name for f in fields(ModelConfig)}
+
+require_env_fields_cover_the_config(_MODEL_CONFIG_FIELDS, _ENV_FIELDS)
 
 
 def _blame(exc: CheckFailed, kwargs: dict[str, Any]) -> str:
