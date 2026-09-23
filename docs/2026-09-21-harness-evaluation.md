@@ -1,5 +1,15 @@
 # Harness evaluation — 2026-09-21
 
+> **Closed 2026-09-23. This is a record, not a backlog.** All four items in *Recommended order*
+> landed, plus findings 5-7: constants pinned (F42), `exit_behavior` recorded
+> (`test_the_call_limits_state_their_exit_behavior_rather_than_inheriting_it`), the parent step
+> limit bound (`capabilities.PARENT_STEP_LIMIT`, F39), `files` surfaced on `TurnResult` (F40, F43),
+> the caching-probe door pinned (`DEEPAGENTS_CACHING_PROBE_MODULES`, F41), check coverage measured
+> and closed (F44), the decorative subagent test given a discriminator, and the README counts
+> corrected. The numbers below (376 tests, 38 findings, 117 check sites) are this document's own
+> date; `CLAUDE.md` carries the current ones. The one item still open is the last section:
+> **the eight live checks still run at n=1.**
+
 An outside review of the harness at commit `9b4b9fc`, run against the working tree rather than
 against `CLAUDE.md`. Every claim below was reproduced locally; the one item taken from a delegated
 inventory is marked as such. Mutations used to prove a test blind spot were reverted and the tree
@@ -132,11 +142,15 @@ is no such tool; `AgentConfig.tools` defaults to `()` and nothing passes one.
 ## On evals
 
 `evals/` is empty and `EvalRunner` is a table row. But the eval suite already exists — it is the
-eight live checks in `main.py`: real tasks, code-based graders, PASS/FAIL, on a weekly cron. The gap
+eight live checks in `main.py`: real tasks, code-based graders, PASS/FAIL. The gap
 is not a framework, it is that they run at **n=1**, and three of them (`shell_tool_withheld`,
 `filesystem_tools_still_work`, `permissions_are_enforced`) depend on the model choosing to call a
 tool. A single non-deterministic failure reads as a regression with no error bars. Repeats and a
 pass^k line are cheap; a new eval harness is not, and does not pay before a domain.
+
+*(Correction, 2026-09-23: "on a weekly cron" was wrong. `live.yml`'s schedule runs
+`pytest -m live` — two tests. The eight checks run only when someone types `uv run my-agent`, so
+n=1 understates it: they are n=1 **and** unscheduled, last recorded green 2026-09-18.)*
 
 `main.py` is deliberately left out of the ranking — its 53% coverage and 11/11 untripped checks
 would otherwise look like the largest gap, and it is scaffolding slated for replacement.

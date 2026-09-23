@@ -762,7 +762,7 @@ against 131072 is a prompt that fails intermittently.
 
 *What we do:* `main.check_every_provider_serves_the_context_we_assume` reads the catalogue (one
 HTTP GET, no inference) and fails if any provider that *states* a length is below
-`ASSUMED_CONTEXT_TOKENS` (128000), reporting the ones that state nothing. Asserting on the unstated
+`capabilities.CONTEXT_WINDOW_TOKENS` (128,000), reporting the ones that state nothing. Asserting on the unstated
 ones would be a check that can never go green; the mitigation for those is pinning `:provider`,
 which is a decision, not an assertion. A `require()` guards against the catalogue publishing no
 lengths at all, which would otherwise make the check pass by measuring nothing.
@@ -1371,7 +1371,8 @@ that *does* get evicted when it is last (the adjacent eviction test) is untouche
 position.
 
 **`TOOL_RESULT_TOKEN_LIMIT` truncates at 80,000 characters (`NUM_CHARS_PER_TOKEN * 20,000`), but
-`read_file`'s 100-line default (`DEFAULT_READ_LIMIT`) cuts most long files first.** Measured
+`read_file`'s 100-line default (deepagents' `DEFAULT_READ_LIMIT`,
+`deepagents/middleware/filesystem.py:973`) cuts most long files first.** Measured
 (`test_the_line_limit_cuts_a_long_file_before_the_character_bound_can`): a 4,000-line, 134,890-
 character file — over 1.6 times the character bound — came back as ~3,000 characters with no
 truncation marker, because line 100 arrived long before byte 80,000. The character bound is only
@@ -1870,8 +1871,9 @@ prompt to re-verify CLAUDE.md's version block — not a reason to skip that step
 
 ## Live verification
 
-`uv run my-agent` runs one check per finding against the real router and prints PASS/FAIL. 8/8
-pass as of 2026-09-18, exit 0, both tracers active:
+`uv run my-agent` runs eight checks against the real router and prints PASS/FAIL. Each is tied to
+a finding; seven findings are covered, not all forty-four. 8/8 pass as of 2026-09-18, exit 0, both
+tracers active:
 
 | Finding | Check | Evidence |
 |---|---|---|
@@ -1940,11 +1942,11 @@ Each of these is also noted at the finding it belongs to.
   graph at all (F41). The closure hunt that finds `subagent_graphs` finds no middleware list, so
   the caching door is pinned before the fact rather than asserted after it — the only door here
   with no read-back.
-- Whether the 15 import-time check sites can be tripped by a test. They need `importlib.reload`
-  against a monkeypatched library and no test here does that, so they are the last group with no
-  coverage outside `main.py` — 83 of 108 `require()` sites and 15 of 16 `raise CheckFailed` sites
-  are tripped as of 2026-09-22, measured by wrapping `require()` in a pytest plugin rather than by
-  reading coverage. The remaining 11 are in `main.py` and deliberately left.
+- ~~Whether the import-time check sites can be tripped by a test.~~ **Closed by F44.** Re-measured
+  2026-09-23 by wrapping `require()` and `CheckFailed` in pytest plugins that log a raising call
+  site, then diffing against an AST walk: **100 of 110 `require()` sites and 12 of 13
+  `raise CheckFailed` sites outside the helpers are tripped**, and all 11 untripped sites are in
+  `main.py`, deliberately left. No import-time check is untripped.
 
 - A **provider-pinned** model id (`org/model:groq`) on the token cap (F2), on `reasoning_effort`
   (F17, F26) and on the context window (F25). Only the router's own selection is covered, and F25 is
