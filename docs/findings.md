@@ -1802,6 +1802,105 @@ prediction above; it is now measured.
 
 ---
 
+## F46 — the 429 was never retried, and `max_retries` was never the problem
+
+**Severity: important.** The router vetoes the retry and the openai client
+obeys, by design. Raising `max_retries` would change nothing.
+
+F45's first live run lost two attempts to
+`429 ... 'code': 'queue_exceeded'`. `ModelConfig.max_retries` is 2 and reaches
+the client — `build_model(...).root_client.max_retries == 2`, verified — and
+`BaseClient._should_retry` retries 429 by default. So the retries should have
+absorbed it.
+
+**The mirror says they never happened.** From
+`logs/20260923T161354Z-81b4f402.jsonl`, `chat_model_start` → `llm_error`:
+
+| | start | error | elapsed |
+|---|---|---|---|
+| first 429 | 16:14:38.073 | 16:14:38.254 | **181 ms** |
+| second 429 | 16:14:39.546 | 16:14:39.709 | **163 ms** |
+
+`INITIAL_RETRY_DELAY` is 0.5s, so two retries cannot cost less than ~1.5s of
+sleeping. 180 ms is one request.
+
+### Why, measured offline against a local 429 server
+
+No router involved, no tokens spent — a `BaseHTTPRequestHandler` returning 429
+with chosen headers, and our own `build_model` pointed at it:
+
+| response | requests made | elapsed |
+|---|---|---|
+| plain 429 | **3** | 1.49 s |
+| 429 + `x-should-retry: false` | **1** | 0.00 s |
+| 429 + `Retry-After: 300` | **1** | 0.00 s |
+| 429 + `Retry-After: 2` | **3** | 4.01 s |
+
+Three requests over 1.49 s is `max_retries=2` with 0.5 s + 1.0 s backoff,
+exactly as configured. **Our retry setup is correct and working.** The live
+shape — one request, ~180 ms — is the vetoed shape.
+
+`BaseClient._should_retry` reads two things *before* the status code, and
+returns `False` on either: `x-should-retry: false`, or a `Retry-After` above
+`MAX_RETRY_AFTER_DELAY` (120 s). The router sends one of them.
+
+### What we do
+
+`mirror._retry_advice` records `x-should-retry`, `retry-after`,
+`retry-after-ms` and the status code off the exception's `.response`, on
+`llm_error` only. `openai.APIStatusError` carries the whole `httpx2.Response`,
+so this needs no HTTP hook and no extra request — **the next real 429 explains
+itself in the run log.** The field is absent on errors that never reached a
+server, so its presence is itself the signal: absent means no server answered,
+present-but-empty means the server answered and gave no advice, which is an
+*exhausted* retry rather than a vetoed one — a different diagnosis and a
+different fix.
+
+### What we deliberately did not do
+
+- **Not a custom `http_client`.** It is the only option that would force the
+  retry, by discarding the header the SDK honours. The server said do not
+  retry; overriding that on a shared inference router turns queue pressure into
+  worse queue pressure. (It also has to be passed at construction —
+  `model_copy(update={"http_client": ...})` is silently ignored, F30.)
+- **Not `max_retries`.** Proven above to be irrelevant to this failure.
+- **Not a rate limiter or `ModelRetryMiddleware` yet.** Both are real levers and
+  both would need a constant — `requests_per_second`, or a backoff — that
+  nothing here has measured. Two 429s from one run is n=1 on the failure
+  itself. Pinning an unmeasured number is what F42 exists to stop.
+
+### The two levers, for when there is a number
+
+**A rate limiter belongs on the model, not in middleware.** `ChatOpenAI` takes
+`rate_limiter=`, and deepagents builds a subagent with
+`resolve_model(spec["model"])` — *the same object* — so a limiter on the model
+reaches every graph. `AgentConfig.middleware` reaches the parent only (F30), so
+`ModelRetryMiddleware` cannot be a global ceiling; it is a second layer, not the
+answer. This is the same trap as `step_limit` before F24 and F39: the graph you
+configure is not the only graph that runs.
+
+`ModelRetryMiddleware` does retry *above* the client, so the router's veto does
+not bind it, and `OpenAIRateLimitError.is_retryable is True` means
+`default_retry_on` already covers the case.
+
+**Both sleep, and `RunDeadline` counts wall clock.** A limiter slow enough to
+prevent 429s can convert them into `DeadlineExceeded`. That is trading one
+failure for another, and it is why the number has to be measured rather than
+chosen.
+
+### Open
+
+- **Which veto it is.** `x-should-retry: false` or an over-cap `Retry-After`.
+  The capture above answers it on the next 429; until then both are consistent
+  with the evidence and both imply the same thing.
+- Whether the 429 reproduces at all. It appeared on attempts 4 and 5 of the
+  fourth check, the deepest point of a ~40-turn burst that `_run_checks` fires
+  with no pacing — self-inflicted, and not yet shown to be repeatable.
+- What the router's actual rate limit is. Not published as far as this has
+  looked, and not measured.
+
+---
+
 ## Observability API reference
 
 Not findings — API surfaces recorded so the next piece of work does not have to re-derive them.
@@ -1938,7 +2037,7 @@ main checkout run a `scripts/check.sh` that may not exist on the branch checked 
 
 **Three scans run on this repo and only two are files here.** `ci.yml` runs the gate on every push
 and pull request. `.github/workflows/live.yml` runs `-m live` weekly (Mondays 06:00 UTC) and on
-demand, because this file is forty-five verified behaviours and nothing else re-checks any of
+demand, because this file is forty-six verified behaviours and nothing else re-checks any of
 them; it skips rather than fails when `HF_TOKEN` is absent, so an unconfigured clone does not
 produce a weekly red X that means nothing, and it never gates a commit. **CodeQL is the third and it
 is not a file here** — it uses GitHub's default setup, so the workflow is generated and managed by
@@ -1972,7 +2071,7 @@ prompt to re-verify CLAUDE.md's version block — not a reason to skip that step
 ## Live verification
 
 `uv run my-agent` runs eight checks against the real router and prints PASS/FAIL. Each is tied to
-a finding; seven findings are covered, not all forty-five. Each runs `LIVE_CHECK_REPEATS` times
+a finding; seven findings are covered, not all forty-six. Each runs `LIVE_CHECK_REPEATS` times
 and the run is scored pass^k (F45). The 8/8 below is from 2026-09-18, exit 0, both tracers
 active — **at one attempt each**, before the repeats existed:
 

@@ -266,6 +266,40 @@ def _component_name(serialized: dict[str, Any] | None, kwargs: dict[str, Any]) -
     return "unknown"
 
 
+_RETRY_ADVICE_HEADERS = ("x-should-retry", "retry-after", "retry-after-ms")
+"""The headers the openai client reads *before* it looks at the status code.
+
+`BaseClient._should_retry` returns `False` outright on `x-should-retry: false`
+or a `Retry-After` above its 120s cap — so a 429 can arrive unretried while
+`max_retries` is set and working. Measured offline against a local server: a
+plain 429 produced three requests over 1.49s, and either of those headers
+produced one request in 0.00s (F46).
+"""
+
+
+def _retry_advice(error: BaseException) -> dict[str, Any] | None:
+    """What the server told the client about retrying, or `None`.
+
+    `None` means the request never reached a server — a timeout or a connection
+    failure — which is a different diagnosis from a server that answered and
+    declined a retry. An empty-but-present mapping of headers means the server
+    answered and said nothing, so the retry was exhausted rather than vetoed.
+    """
+    response = getattr(error, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+    advice: dict[str, Any] = {}
+    status = getattr(response, "status_code", None)
+    if status is not None:
+        advice["status_code"] = status
+    for header in _RETRY_ADVICE_HEADERS:
+        value = headers.get(header)
+        if value is not None:
+            advice[header] = value
+    return advice
+
+
 class JsonlMirror(BaseCallbackHandler):
     """Writes one JSON object per line for every event LangChain reports."""
 
@@ -503,13 +537,16 @@ class JsonlMirror(BaseCallbackHandler):
         tags: list[str] | None = None,
         **kwargs: Any,
     ) -> None:
-        self._write(
-            "llm_error",
-            run_id,
-            parent_run_id,
-            error_type=type(error).__name__,
-            error=str(error),
-        )
+        payload: dict[str, Any] = {
+            "error_type": type(error).__name__,
+            "error": str(error),
+        }
+        # Only on errors that reached a server, so the key's presence is itself
+        # the signal (F46).
+        advice = _retry_advice(error)
+        if advice is not None:
+            payload["retry_advice"] = advice
+        self._write("llm_error", run_id, parent_run_id, **payload)
 
 
 # -- run-file lifecycle -------------------------------------------------------

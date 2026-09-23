@@ -1,6 +1,6 @@
 # The suite ci.yml deliberately excludes, run on a schedule instead.
 #
-# Why this exists: docs/findings.md is forty-five entries of verified library
+# Why this exists: docs/findings.md is forty-six entries of verified library
 # and provider behaviour, and CLAUDE.md requires re-verifying it after anything
 # moves. The `-m live` suite is the only thing that exercises the Hugging Face
 # router, LangSmith and Weave, so without a scheduled run nothing re-checks any

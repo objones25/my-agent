@@ -1,7 +1,7 @@
 # CLAUDE.md
 
 Guidance for Claude Code in this repository. `README.md` says what the project is; this is the
-contributor's contract, and **`docs/findings.md` (F1–F45) is the evidence behind it** — read it
+contributor's contract, and **`docs/findings.md` (F1–F46) is the evidence behind it** — read it
 before debugging anything that looks like a library bug, and add to it when you verify something
 new.
 
@@ -265,7 +265,7 @@ Bugs live in the states the code was never written to handle. Write those down a
 
 ## Testing and evals
 
-Keep them apart. 480 offline tests and 2 live as of 2026-09-23; `evals/` is still empty.
+Keep them apart. 485 offline tests and 2 live as of 2026-09-23; `evals/` is still empty.
 
 - **Unit tests** (`tests/`, default selection) are deterministic and offline. One test file per
   source module; a new module gets a new file, not an extra section in an existing one. They test
@@ -476,12 +476,12 @@ Everything in this table lives in `src/my_agent/`.
 | `main.py` | `uv run my-agent` — the composition root, and the eight live checks (`CheckOutcome`, `live_check_repeats`, pass^k). |
 | `negative_space.py` | `require`/`unreachable`/`bounded`, and the only doctests in `src/`. |
 | `tracing.py` | `TracingBackend`, `LangSmithTracing`, `WeaveTracing`, `available_backends`, `langchain_tracer_names`. |
-| `mirror.py` | `JsonlMirror`, `run_log_path`, `mirror_to_file` — the always-on local JSONL mirror of every agent event, including the per-call request size and a per-run per-tool byte breakdown (F30). |
+| `mirror.py` | `JsonlMirror`, `run_log_path`, `mirror_to_file` — the always-on local JSONL mirror of every agent event, including the per-call request size, a per-run per-tool byte breakdown (F30) and the server's retry advice on a failed model call (F46). |
 
 `tests/` mirrors that one file per module, offline by default, plus `conftest.py` for shared
 fixtures and the socket guard. The only `-m live` tests are one each at the end of `test_tracing.py`
 (calls the real `weave.init()` and hits the router) and `test_run.py` (proves multi-turn history
-against a real graph, which a fake cannot show). `evals/` is empty. `docs/findings.md` holds F1–F45
+against a real graph, which a fake cannot show). `evals/` is empty. `docs/findings.md` holds F1–F46
 plus the repo-gates, deepagents-surface, test-infrastructure and observability appendices;
 `scripts/audit_negative_space.py` is **vendored** from the negative-space-programming skill — do not
 hand-edit it, refresh by re-copying (it is excluded from ruff and mypy).
