@@ -6,7 +6,7 @@ options are.
 
 **Status, 2026-09-23:** the diagnosis held and the pinning experiment ran — see §8a. Three changes
 landed: the error-header capture (§3), the `_model_route` fix for a bug pinning exposed (§8a), and
-nothing else. `DEFAULT_MODEL` is still the bare id, so the harness still defaults to `:fastest`.
+**`DEFAULT_MODEL` is now pinned to `openai/gpt-oss-120b:groq`** — see §9.
 
 Logs: `logs/20260923T161354Z-81b4f402.jsonl`, `logs/20260923T162954Z-eed4d965.jsonl`.
 
@@ -274,10 +274,11 @@ set, which would otherwise pass by measuring nothing. Four mutants killed.
 1. ~~Decode the fingerprints.~~ **Done** — §8a. Cerebras identified; one fingerprint still unknown.
 2. ~~Pin a provider and re-run.~~ **Done** — §8a. Zero 429s in one run, and a real bug fixed on the
    way.
-3. **Decide whether to pin by default.** `ModelConfig.DEFAULT_MODEL` is still the bare id, so the
-   default is still `:fastest`. Changing it is a one-literal change plus its pin test, and it
-   should be a deliberate decision: it buys routing determinism, reproducibility and a known
-   context window (F25), and it costs whatever failover the router does on our behalf.
+3. ~~Decide whether to pin by default.~~ **Done, 2026-09-23** —
+   `DEFAULT_MODEL = "openai/gpt-oss-120b:groq"`. It buys routing determinism, reproducibility and a
+   known context window (F25) in one literal; it costs whatever failover the router does on our
+   behalf, which at a measured 2.36% unpinned 429 rate was not earning much. Held by two tests: the
+   literal pin, and one asserting the suffix names a provider rather than a policy.
 4. **Widen the error capture.** `mirror._retry_advice` records three headers; recording all of them
    would let a future 429 name its own provider. Free, and still unfinished.
 5. **Only if 429s return under a pin**, revisit fallback, knowing from §7 that anything covering

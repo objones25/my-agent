@@ -1911,9 +1911,12 @@ chosen.
   decode identified `cerebras`
   (`fp_752b9cb17e04d95d05c3`, the lowest-latency provider of the eleven) as one
   of the two backends serving the unpinned runs.
-- **`DEFAULT_MODEL` is still the bare id**, so the harness still defaults to
-  `:fastest`. Making the pin the default is a one-literal change and a decision
-  nobody has taken yet.
+- ~~`DEFAULT_MODEL` is still the bare id.~~ **Taken 2026-09-23:**
+  `DEFAULT_MODEL = "openai/gpt-oss-120b:groq"`. Pinned to a provider rather than
+  a policy, chosen on throughput, a stated 131,072 window and structured-output
+  support, and deliberately not the latency leader. Two tests hold it: the
+  literal pin, and one asserting the suffix is a provider and not `:fastest` /
+  `:cheapest` / `:preferred`.
 - What the router's actual per-provider limit is. Not published as far as this
   has looked, and not measured.
 
