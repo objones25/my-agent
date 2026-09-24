@@ -26,6 +26,7 @@ from langchain.agents.middleware import ToolCallLimitMiddleware
 from langchain_core.language_models.chat_models import BaseChatModel
 from langgraph.graph.state import CompiledStateGraph
 
+from my_agent.contracts import check_required_parameters
 from my_agent.negative_space import CheckFailed, require
 
 __all__ = [
@@ -270,7 +271,8 @@ _PINNED_FS_BOUNDS = {
 }
 
 _ALL_FILESYSTEM_TOOLS = frozenset(get_args(FsToolName))
-_FS_MIDDLEWARE_PARAMS = frozenset(inspect.signature(FilesystemMiddleware.__init__).parameters)
+_FS_SIGNATURE = inspect.signature(FilesystemMiddleware.__init__).parameters
+_FS_MIDDLEWARE_PARAMS = frozenset(_FS_SIGNATURE)
 
 # The least-privilege allowlist is defined by subtraction, and the subtraction is
 # checked here rather than assumed. If deepagents adds a filesystem tool, this
@@ -286,7 +288,6 @@ require(
 # what deepagents defaults to. Agreement is what makes these safe to state: if
 # an upstream default moves, a human decides whether ours moves with it rather
 # than finding out from a context window that behaves differently.
-_FS_SIGNATURE = inspect.signature(FilesystemMiddleware.__init__).parameters
 for _name, _pinned in _PINNED_FS_BOUNDS.items():
     require(_name in _FS_SIGNATURE, f"FilesystemMiddleware no longer accepts {_name}")
     require(
@@ -515,18 +516,21 @@ require_compaction_fits_the_window(COMPACTION_TRIGGER_TOKENS, CONTEXT_WINDOW_TOK
 # rename is the whole failure mode.
 _SUMMARIZATION_PARAMS = frozenset(inspect.signature(SummarizationMiddleware.__init__).parameters)
 _NEEDED_SUMMARIZATION_PARAMS = frozenset({"backend", "trigger", "keep", "truncate_args_settings"})
-require(
-    _NEEDED_SUMMARIZATION_PARAMS <= _SUMMARIZATION_PARAMS,
-    f"SummarizationMiddleware no longer accepts "
-    f"{sorted(_NEEDED_SUMMARIZATION_PARAMS - _SUMMARIZATION_PARAMS)}; the compaction bounds "
-    f"cannot be set and the agent would run at deepagents' own threshold",
+check_required_parameters(
+    _SUMMARIZATION_PARAMS,
+    _NEEDED_SUMMARIZATION_PARAMS,
+    "SummarizationMiddleware",
+    consequence="the compaction bounds cannot be set and the agent would run at "
+    "deepagents' own threshold",
 )
 
 # `_permissions` is private API. Pin it: losing it silently would drop every
 # permission rule (see docs/findings.md).
-require(
-    {"tools", "_permissions"} <= _FS_MIDDLEWARE_PARAMS,
-    "FilesystemMiddleware no longer accepts tools/_permissions; build_agent must change",
+check_required_parameters(
+    _FS_MIDDLEWARE_PARAMS,
+    frozenset({"tools", "_permissions"}),
+    "FilesystemMiddleware",
+    consequence="build_agent must change",
 )
 
 

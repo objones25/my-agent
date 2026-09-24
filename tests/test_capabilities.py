@@ -1242,7 +1242,10 @@ def test_the_pins_refuse_a_middleware_with_no_permission_channel(
             tools: Any = None,
         ) -> None: ...
 
-    with pytest.raises(CheckFailed, match="no longer accepts tools/_permissions"):
+    with pytest.raises(
+        CheckFailed,
+        match=r"FilesystemMiddleware no longer accepts \['_permissions'\]; build_agent must change",
+    ):
         tripping_an_import_time_check(
             my_agent.capabilities, deepagents, "FilesystemMiddleware", WithoutPermissions
         )
@@ -1258,7 +1261,11 @@ def test_the_pins_refuse_a_compaction_middleware_that_cannot_be_bounded(
     class Unbounded:
         def __init__(self, model: Any, *, backend: Any = None) -> None: ...
 
-    with pytest.raises(CheckFailed, match="no longer accepts"):
+    with pytest.raises(
+        CheckFailed,
+        match=r"SummarizationMiddleware no longer accepts \[.*\]; the compaction bounds "
+        r"cannot be set and the agent would run at deepagents' own threshold",
+    ):
         tripping_an_import_time_check(
             my_agent.capabilities,
             deepagents.middleware,

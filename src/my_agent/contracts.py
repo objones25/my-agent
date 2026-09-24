@@ -112,7 +112,11 @@ def check_known_parameters(
 
 
 def check_required_parameters(
-    actual: frozenset[str], needed: frozenset[str], callee_name: str
+    actual: frozenset[str],
+    needed: frozenset[str],
+    callee_name: str,
+    *,
+    consequence: str = "the config must change",
 ) -> None:
     """Fail if a callee stopped accepting a keyword a config relies on.
 
@@ -121,10 +125,14 @@ def check_required_parameters(
     the usual casualty — `ChatOpenAI` takes `base_url`, not its field name
     `openai_api_base`, and an alias that disappears turns a splat into a
     pydantic error naming a field rather than the rename behind it.
+
+    `consequence` says what breaks, mirroring `check_known_parameters`'s
+    `why_new_matters`. The default is the config-splat case this was written
+    for; `capabilities.py` passes its own.
     """
     require(actual != frozenset(), f"could not introspect {callee_name} parameters")
     missing = needed - actual
     require(
         not missing,
-        f"{callee_name} no longer accepts {sorted(missing)}; the config must change",
+        f"{callee_name} no longer accepts {sorted(missing)}; {consequence}",
     )
