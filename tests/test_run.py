@@ -1264,6 +1264,17 @@ def test_the_token_budget_counts_calls_that_reported_no_usage_at_all() -> None:
     assert budget.unmeasured_calls == 1
 
 
+def test_the_token_budget_counts_a_multi_choice_call_once() -> None:
+    """Every choice carries the whole request's usage, so summing choices would
+    charge an n-choice call n times."""
+    budget = RunTokenBudget(1000)
+    choice = _usage_report(100).generations[0][0]
+
+    budget.on_llm_end(LLMResult(generations=[[choice, choice]]), run_id=uuid4())
+
+    assert budget.tokens == 100
+
+
 def test_the_token_budget_does_not_let_langchain_swallow_its_own_failure() -> None:
     budget = RunTokenBudget(100)
 
