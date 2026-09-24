@@ -27,6 +27,12 @@ import pytest
 from deepagents import FilesystemPermission
 from pydantic import SecretStr
 
+# Only `pytester` — nothing else here needs a non-default plugin. It backs
+# `tests/test_conftest.py`'s wiring test for `_forbid_leaked_threads`, which
+# has to run the fixture as pytest actually runs it (autouse, around a real
+# test) rather than call its helper directly.
+pytest_plugins = ["pytester"]
+
 VALID_KEY = "hf_token_value"
 """Shaped like an HF token and obviously not one. Never a real credential."""
 
@@ -111,13 +117,26 @@ def threads_left_running(
 
     One shared deadline rather than `grace_s` per thread, so ten leaked threads
     cost one grace period, not ten.
+
+    `thread.join()` cannot be trusted here: a `threading._DummyThread` — the
+    handle Python fabricates for a thread that entered the interpreter without
+    going through `threading.Thread` (a worker spun up with the low-level
+    `_thread.start_new_thread`, as some C-backed libraries do) — raises
+    `RuntimeError("cannot join a dummy thread")` unconditionally, timeout or
+    not. Falling back to polling `is_alive()` against the same shared deadline
+    keeps a dummy thread from crashing the check that is supposed to report
+    it.
     """
     deadline = time.monotonic() + grace_s
     left: list[threading.Thread] = []
     for thread in threading.enumerate():
         if thread in before:
             continue
-        thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        try:
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        except RuntimeError:
+            while thread.is_alive() and time.monotonic() < deadline:
+                time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
         if thread.is_alive():
             left.append(thread)
     return left
