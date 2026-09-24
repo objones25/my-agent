@@ -26,7 +26,7 @@ from my_agent.capabilities import (
 from my_agent.main import EXIT_CHECK_FAILED, EXIT_MISCONFIGURED, CheckOutcome, CheckResult, main
 from my_agent.model import ModelConfig, build_model
 from my_agent.negative_space import CheckFailed
-from my_agent.run import DeadlineExceeded, TurnResult
+from my_agent.run import BoundExceeded, DeadlineExceeded, TurnResult
 
 VALID_SECRET = SecretStr("hf_token_value")
 
@@ -204,6 +204,61 @@ def test_main_reports_a_missed_deadline_instead_of_a_traceback(
     captured = capsys.readouterr()
     assert "600.0s deadline" in captured.err
     assert "Traceback" not in captured.err
+
+
+def test_main_reports_a_bound_it_was_never_told_about(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The property a hand-listed tuple of four could not give: a fifth bound is
+    reported, not raised, with no edit to `main.py`.
+
+    Driven through `_single_turn` on purpose. On the live-check path `_attempt`
+    catches `Exception` and would report it either way, so a test there passes
+    with or without `BoundExceeded`.
+    """
+
+    class CostLimitExceeded(BoundExceeded):
+        """A budget `main.py` has never heard of."""
+
+    monkeypatch.setattr(main_module, "load_dotenv", lambda *_a, **_k: False)
+    monkeypatch.setenv("HF_TOKEN", "hf_token_value")
+    monkeypatch.setattr(main_module, "available_backends", tuple)
+    monkeypatch.setattr(main_module, "run_log_path", lambda: tmp_path / "run.jsonl")
+    monkeypatch.setattr("sys.argv", ["my-agent", "ping"])
+
+    def over_budget(config: object, prompt: str, callbacks: list[BaseCallbackHandler]) -> int:
+        callbacks[0].on_chain_end({}, run_id=uuid4())
+        raise CostLimitExceeded("run spent its whole cost ceiling")
+
+    monkeypatch.setattr(main_module, "_single_turn", over_budget)
+
+    assert main() == EXIT_CHECK_FAILED
+
+    captured = capsys.readouterr()
+    assert "whole cost ceiling" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_main_still_crashes_on_a_broken_contract_during_a_single_turn(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Narrowing the clause to one base must not widen what it swallows. A
+    `CheckFailed` is a bug in our own contracts, and is never reported as a
+    spent budget."""
+    monkeypatch.setattr(main_module, "load_dotenv", lambda *_a, **_k: False)
+    monkeypatch.setenv("HF_TOKEN", "hf_token_value")
+    monkeypatch.setattr(main_module, "available_backends", tuple)
+    monkeypatch.setattr(main_module, "run_log_path", lambda: tmp_path / "run.jsonl")
+    monkeypatch.setattr("sys.argv", ["my-agent", "ping"])
+
+    def broken(config: object, prompt: str, callbacks: list[BaseCallbackHandler]) -> int:
+        callbacks[0].on_chain_end({}, run_id=uuid4())
+        raise CheckFailed("a contract of ours was violated mid-turn")
+
+    monkeypatch.setattr(main_module, "_single_turn", broken)
+
+    with pytest.raises(CheckFailed, match="violated mid-turn"):
+        main()
 
 
 # --------------------------------------------------------------------------

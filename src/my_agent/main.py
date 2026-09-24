@@ -38,10 +38,7 @@ from my_agent.mirror import mirror_to_file, run_log_path
 from my_agent.model import REASONING_EFFORTS, ModelConfig, build_model
 from my_agent.negative_space import CheckFailed, require
 from my_agent.run import (
-    DeadlineExceeded,
-    ResumeLimitExceeded,
-    StepLimitExceeded,
-    TokenLimitExceeded,
+    BoundExceeded,
     TurnResult,
     run_turn,
 )
@@ -673,19 +670,13 @@ def main() -> int:
                 exit_code = _single_turn(config, prompt, callbacks)
             else:
                 exit_code = _run_checks(config, callbacks, live_check_repeats())
-        except (
-            DeadlineExceeded,
-            ResumeLimitExceeded,
-            StepLimitExceeded,
-            TokenLimitExceeded,
-        ) as exc:
-            # Every bound in `RunBounds`, reported the same way. Before
-            # `StepLimitExceeded` existed the step limit escaped as langgraph's
-            # `GraphRecursionError` and printed a traceback, so the wall clock
-            # was a handled ceiling and the step count was a crash (F24).
-            # `ResumeLimitExceeded` joined them with the bound on how many times
-            # one paused turn may be resumed, and `TokenLimitExceeded` with the
-            # bound on what the turn costs.
+        except BoundExceeded as exc:
+            # Every bound in `RunBounds`, reported the same way, and any bound
+            # added later without editing this line. Before `StepLimitExceeded`
+            # existed the step limit escaped as langgraph's `GraphRecursionError`
+            # and printed a traceback (F24). A hand-listed tuple had the same
+            # failure waiting for the next bound. `CheckFailed` is not a
+            # `BoundExceeded` and still crashes.
             print(f"error: {exc}", file=sys.stderr)
             exit_code = EXIT_CHECK_FAILED
 

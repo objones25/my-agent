@@ -44,6 +44,7 @@ from my_agent.run import (
     RESUME_LIMIT,
     RUN_DEADLINE_S,
     TOKEN_LIMIT,
+    BoundExceeded,
     DeadlineExceeded,
     ResumeLimitExceeded,
     RunBounds,
@@ -1340,6 +1341,22 @@ def test_the_token_limit_is_an_operating_error_not_a_broken_contract() -> None:
     caller of ours passing something impossible."""
     assert issubclass(TokenLimitExceeded, RuntimeError)
     assert not issubclass(TokenLimitExceeded, CheckFailed)
+
+
+@pytest.mark.parametrize(
+    "bound", [DeadlineExceeded, ResumeLimitExceeded, StepLimitExceeded, TokenLimitExceeded]
+)
+def test_every_run_bound_fails_as_a_bound_exceeded(bound: type[Exception]) -> None:
+    """One base, so the edge catches every bound `RunBounds` rations — including
+    the next one — without being edited."""
+    assert issubclass(bound, BoundExceeded)
+
+
+def test_a_spent_budget_is_an_operating_error_not_a_broken_contract() -> None:
+    """Still a `RuntimeError`, so anything catching that today is unaffected, and
+    never a `CheckFailed`: a programmer error is not a spent budget."""
+    assert issubclass(BoundExceeded, RuntimeError)
+    assert not issubclass(BoundExceeded, CheckFailed)
 
 
 # --------------------------------------------------------------------------

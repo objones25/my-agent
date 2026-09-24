@@ -53,6 +53,7 @@ __all__ = [
     "RESUME_LIMIT",
     "RUN_DEADLINE_S",
     "TOKEN_LIMIT",
+    "BoundExceeded",
     "DeadlineExceeded",
     "Decision",
     "Invokable",
@@ -142,7 +143,17 @@ right value depends on what a turn is worth.
 """
 
 
-class TokenLimitExceeded(RuntimeError):
+class BoundExceeded(RuntimeError):
+    """A turn ran out of something `RunBounds` rationed. An operating error.
+
+    The one name the edge catches, so a bound added later is reported the way
+    the first four are without anyone editing an `except` clause. Still a
+    `RuntimeError`, so nothing catching that today changes. `CheckFailed` stays
+    outside it: a programmer error is not a spent budget.
+    """
+
+
+class TokenLimitExceeded(BoundExceeded):
     """A run spent every token `RunBounds.token_limit` allowed it.
 
     An *operating* error, like the other three: a model that kept talking is the
@@ -212,7 +223,7 @@ caller, and a default evaluated once is a default a reader can point at.
 """
 
 
-class DeadlineExceeded(RuntimeError):
+class DeadlineExceeded(BoundExceeded):
     """A run outlived its wall-clock budget.
 
     An *operating* error, not a broken contract: a slow provider is the outside
@@ -221,7 +232,7 @@ class DeadlineExceeded(RuntimeError):
     """
 
 
-class ResumeLimitExceeded(RuntimeError):
+class ResumeLimitExceeded(BoundExceeded):
     """One turn was resumed as often as `RunBounds.resume_limit` allowed.
 
     An *operating* error, for the same reason the other two are: a human who
@@ -230,7 +241,7 @@ class ResumeLimitExceeded(RuntimeError):
     """
 
 
-class StepLimitExceeded(RuntimeError):
+class StepLimitExceeded(BoundExceeded):
     """A run used every step `RunBounds.step_limit` allowed it.
 
     `RunBounds` owns the step limit, so it owns what happens when the limit
