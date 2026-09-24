@@ -46,6 +46,7 @@ from langgraph.errors import GraphRecursionError
 from langgraph.types import Command, Interrupt
 
 from my_agent.negative_space import CheckFailed, require
+from my_agent.usage import call_usage
 
 __all__ = [
     "DEFAULT_RUN_BOUNDS",
@@ -53,6 +54,7 @@ __all__ = [
     "RESUME_LIMIT",
     "RUN_DEADLINE_S",
     "TOKEN_LIMIT",
+    "BoundExceeded",
     "DeadlineExceeded",
     "Decision",
     "Invokable",
@@ -142,7 +144,17 @@ right value depends on what a turn is worth.
 """
 
 
-class TokenLimitExceeded(RuntimeError):
+class BoundExceeded(RuntimeError):
+    """A turn ran out of something `RunBounds` rationed. An operating error.
+
+    The one name the edge catches, so a bound added later is reported the way
+    the first four are without anyone editing an `except` clause. Still a
+    `RuntimeError`, so nothing catching that today changes. `CheckFailed` stays
+    outside it: a programmer error is not a spent budget.
+    """
+
+
+class TokenLimitExceeded(BoundExceeded):
     """A run spent every token `RunBounds.token_limit` allowed it.
 
     An *operating* error, like the other three: a model that kept talking is the
@@ -212,7 +224,7 @@ caller, and a default evaluated once is a default a reader can point at.
 """
 
 
-class DeadlineExceeded(RuntimeError):
+class DeadlineExceeded(BoundExceeded):
     """A run outlived its wall-clock budget.
 
     An *operating* error, not a broken contract: a slow provider is the outside
@@ -221,7 +233,7 @@ class DeadlineExceeded(RuntimeError):
     """
 
 
-class ResumeLimitExceeded(RuntimeError):
+class ResumeLimitExceeded(BoundExceeded):
     """One turn was resumed as often as `RunBounds.resume_limit` allowed.
 
     An *operating* error, for the same reason the other two are: a human who
@@ -230,7 +242,7 @@ class ResumeLimitExceeded(RuntimeError):
     """
 
 
-class StepLimitExceeded(RuntimeError):
+class StepLimitExceeded(BoundExceeded):
     """A run used every step `RunBounds.step_limit` allowed it.
 
     `RunBounds` owns the step limit, so it owns what happens when the limit
@@ -629,20 +641,16 @@ class RunTokenBudget(BaseCallbackHandler):
     ) -> None:
         """Add up what the call reported.
 
-        `usage_metadata` on the message rather than `response.llm_output`:
-        langchain normalises the former across providers and `mirror.py` reads
-        the same field, so the number this bounds is the number the log shows.
+        Read through `usage.call_usage`, which `mirror.py` reads too, so the
+        number this bounds is the number the log shows by construction rather
+        than by two loops happening to agree. A call that reported nothing is
+        counted in `unmeasured_calls` instead.
         """
-        measured = False
-        for batch in response.generations:
-            for generation in batch:
-                usage = getattr(getattr(generation, "message", None), "usage_metadata", None)
-                if not usage:
-                    continue
-                measured = True
-                self._tokens += int(usage.get("total_tokens", 0))
-        if not measured:
+        usage = call_usage(response)
+        if usage is None:
             self._unmeasured_calls += 1
+            return
+        self._tokens += int(usage.get("total_tokens", 0))
 
 
 _STATE_KEYS_WITH_A_FIELD = frozenset({"messages", "__interrupt__"})

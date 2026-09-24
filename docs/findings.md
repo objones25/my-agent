@@ -1187,10 +1187,10 @@ turn is worth.
 and refuses on `on_chat_model_start`, so the call that crossed the line is paid for and the one
 after it is not. That is the only granularity available, because a token count exists only once the
 call has returned. `run_inline` and `raise_error` are set for the F12 reason. It reads
-`message.usage_metadata`, the same field `mirror.py` records, so the number that bounds a run is the
-number the log shows. Subagent calls count: `ensure_config` seeds a subagent's run from the ambient
-parent config, which matters more here than for the wall clock because a `task` dispatch is where
-the tokens actually go.
+`message.usage_metadata` through `usage.call_usage`, the same function `mirror.py` now reads it
+through too, so the number that bounds a run is the number the log shows. Subagent calls count:
+`ensure_config` seeds a subagent's run from the ambient parent config, which matters more here than
+for the wall clock because a `task` dispatch is where the tokens actually go.
 
 **A provider that omits usage makes the bound blind**, so `RunTokenBudget.unmeasured_calls` counts
 those separately rather than folding them into a silent zero. Crashing a turn over someone else's
@@ -2088,6 +2088,39 @@ guard fires and the traceback prints, but an unretrieved task exception goes to
 exception handler or an `asyncio.all_tasks()` assertion at teardown, and it is unreachable today
 because nothing in `src/` is async. **It is the first thing to fix if async ever lands** — before
 the first async test, not after.
+
+**The socket guard is a monkeypatch, so a thread that outlives its test runs half outside it.**
+`_forbid_network` is undone at every teardown and re-applied at the next setup. Measured
+2026-09-23 with a plugin that wraps `getaddrinfo`/`connect` *underneath* the monkeypatch:
+`test_langchain_tracer_names_reports_the_installed_tracers` built a real `LangChainTracer`, which
+takes langsmith's process-global cached `Client`, whose default `auto_batch_tracing=True` starts
+`tracing_control_thread_func`. That thread calls `Client.info` (`GET /info`, with retries) at once
+and never exits. In one measured run it resolved `api.smith.langchain.com` with the **real** `getaddrinfo` in
+the gap between two tests, then hit the re-applied `connect` guard inside the next one. The guard
+raises `RuntimeError`, and urllib3's `create_connection` closes the socket on `OSError` only, so
+the socket leaked; its finaliser surfaced as `PytestUnraisableExceptionWarning` in whichever test
+the collector ran in, and `filterwarnings = ["error"]` failed it. On the base tree that file sorted
+last, so the finaliser mostly ran after the session; `tests/test_usage.py` sorting after it made it
+a 3-in-12 flake. Fixed at the source (the test hands the tracer a `Client(auto_batch_tracing=False)`
+through `langchain_core.tracers.langchain.get_client`), and **`_forbid_leaked_threads` now fails any
+unit test that leaves a thread running past a 1 s grace**, which turns this class of leak from a
+timing-dependent flake into a deterministic teardown error. The guard keeps raising
+`RuntimeError` rather than an `OSError` subclass on purpose: libraries catch `OSError` and carry on
+(langsmith logs "Failed to get info" and continues), which would make the guard silent.
+
+Not fixed, and outside both guards: **weave's telemetry sends to Sentry at interpreter exit**
+(`o151352.ingest.us.sentry.io`, `sentry-sdk.BackgroundWorker`'s own `transport.py`, via
+`urllib3`), after pytest has finished and every monkeypatch is gone. It happens with the langsmith
+test deselected, so it is a separate egress, and it is not a test failure because nothing is left to
+report it to. **It predates this branch**: measured with a `sys.addaudithook` registered before
+`pytest.main()` runs (so it sees underneath every monkeypatch, and an `atexit` callback registered
+before pytest's own — LIFO means it then runs *after* sentry-sdk's flush) against both the current
+tree and a worktree pinned to base `dec7fad`, same `weave==0.53.9` / `sentry-sdk==2.69.2`: **1
+`getaddrinfo` for `o151352.ingest.us.sentry.io` and 1 `connect` to `34.160.81.0:443`, identically at
+both**. The count is environment-dependent (DNS caching, which of Sentry's edge IPs answers, and
+anything else the SDK batches into one flush can all change it), so treat "1 and 1" as what this
+run measured rather than a promise; re-measure with the same technique before citing a different
+number.
 
 **A mutant on a pinned bound fails collection, not the test it targets — and that hides whether the
 test itself discriminates.** `_PINNED_FS_BOUNDS` (`capabilities.py:235-264`) asserts

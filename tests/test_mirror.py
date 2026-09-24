@@ -104,6 +104,40 @@ def test_llm_end_records_output_and_usage(mirror: JsonlMirror, stream: io.String
     assert written["usage"]["total_tokens"] == 4
 
 
+def test_llm_end_records_the_requests_usage_once(
+    mirror: JsonlMirror, stream: io.StringIO
+) -> None:
+    """The mirror used to keep the *last* choice's usage and the budget summed
+    all of them. Both now read the first choice carrying any."""
+    first = AIMessage(
+        content="a", usage_metadata={"input_tokens": 90, "output_tokens": 10, "total_tokens": 100}
+    )
+    second = AIMessage(
+        content="b", usage_metadata={"input_tokens": 30, "output_tokens": 10, "total_tokens": 40}
+    )
+    result = LLMResult(
+        generations=[[ChatGeneration(message=first), ChatGeneration(message=second)]]
+    )
+
+    mirror.on_llm_end(result, run_id=RUN_ID)
+
+    assert records(stream)[0]["usage"]["total_tokens"] == 100
+
+
+def test_llm_end_records_null_usage_when_none_was_reported(
+    mirror: JsonlMirror, stream: io.StringIO
+) -> None:
+    """Unchanged from before `call_usage`: log readers see `null`, not a missing
+    key and not `{}`."""
+    result = LLMResult(generations=[[ChatGeneration(message=AIMessage(content="pong"))]])
+
+    mirror.on_llm_end(result, run_id=RUN_ID)
+
+    written = records(stream)[0]
+    assert "usage" in written
+    assert written["usage"] is None
+
+
 def test_errors_are_mirrored(mirror: JsonlMirror, stream: io.StringIO) -> None:
     mirror.on_tool_error(ValueError("permission denied"), run_id=RUN_ID)
     written = records(stream)[0]
@@ -331,7 +365,10 @@ def test_run_log_path_rejects_a_run_id_with_a_path_separator() -> None:
 
 
 def test_run_log_path_rejects_a_run_id_with_a_backslash() -> None:
-    with pytest.raises(CheckFailed, match="separator"):
+    """Its own message, not the forward-slash one. Two byte-identical messages
+    cannot be told apart by a test, and this one used to read as covered by
+    either."""
+    with pytest.raises(CheckFailed, match="must not contain a backslash"):
         run_log_path(now=FIXED_NOW, run_id="a\\b")
 
 

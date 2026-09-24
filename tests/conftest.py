@@ -8,18 +8,30 @@ defect in the test, not a slow test.
 
 Anything that really needs the network is marked `live`, deselected by default
 in `addopts`, and stepped over here.
+
+`_forbid_leaked_threads` closes the hole the socket guard cannot see on its own:
+the guard is only patched in *during* a test, so a thread a test starts and
+leaves running reaches the network between tests, where nothing is patched.
 """
 
 from __future__ import annotations
 
 import importlib
 import socket
-from collections.abc import Callable
+import threading
+import time
+from collections.abc import Callable, Collection, Iterator
 from typing import Any, NoReturn
 
 import pytest
 from deepagents import FilesystemPermission
 from pydantic import SecretStr
+
+# Only `pytester` — nothing else here needs a non-default plugin. It backs
+# `tests/test_conftest.py`'s wiring test for `_forbid_leaked_threads`, which
+# has to run the fixture as pytest actually runs it (autouse, around a real
+# test) rather than call its helper directly.
+pytest_plugins = ["pytester"]
 
 VALID_KEY = "hf_token_value"
 """Shaped like an HF token and obviously not one. Never a real credential."""
@@ -88,6 +100,75 @@ def _forbid_network(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(socket, "gethostbyname", deny)
     monkeypatch.setattr(socket.socket, "sendto", deny)
     monkeypatch.setattr(socket.socket, "sendmsg", deny)
+
+
+THREAD_EXIT_GRACE_S = 1.0
+"""How long, in total, a test's new threads get to finish on their own.
+
+Only paid when a test leaves a thread behind; a test that starts none waits for
+nothing. A thread that ends inside this window was finishing, not leaked.
+"""
+
+
+def threads_left_running(
+    before: Collection[threading.Thread], grace_s: float
+) -> list[threading.Thread]:
+    """Threads not in `before` that are still alive once `grace_s` has run out.
+
+    One shared deadline rather than `grace_s` per thread, so ten leaked threads
+    cost one grace period, not ten.
+
+    `thread.join()` cannot be trusted here: a `threading._DummyThread` — the
+    handle Python fabricates for a thread that entered the interpreter without
+    going through `threading.Thread` (a worker spun up with the low-level
+    `_thread.start_new_thread`, as some C-backed libraries do) — raises
+    `RuntimeError("cannot join a dummy thread")` unconditionally, timeout or
+    not. Falling back to polling `is_alive()` against the same shared deadline
+    keeps a dummy thread from crashing the check that is supposed to report
+    it.
+    """
+    deadline = time.monotonic() + grace_s
+    left: list[threading.Thread] = []
+    for thread in threading.enumerate():
+        if thread in before:
+            continue
+        try:
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        except RuntimeError:
+            while thread.is_alive() and time.monotonic() < deadline:
+                time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
+        if thread.is_alive():
+            left.append(thread)
+    return left
+
+
+@pytest.fixture(autouse=True)
+def _forbid_leaked_threads(request: pytest.FixtureRequest) -> Iterator[None]:
+    """Fail any unmarked test that leaves a thread running after it ends.
+
+    `_forbid_network` is a monkeypatch, so it is undone at every teardown and
+    re-applied at the next setup. A thread outliving its test therefore runs
+    partly *unguarded*: measured, langsmith's tracing thread resolved
+    `api.smith.langchain.com` with the real `getaddrinfo` in the gap between
+    two tests, then hit the re-applied `connect` guard inside the next test.
+    The guard raises `RuntimeError`, which urllib3's `create_connection` does
+    not catch (it closes the socket on `OSError` only), so the socket leaked
+    and its finaliser failed whichever test the garbage collector happened to
+    run in. A leaked thread is the defect; the socket was only its symptom.
+    """
+    if request.node.get_closest_marker("live") is not None:
+        yield
+        return
+    before = frozenset(threading.enumerate())
+    yield
+    leaked = threads_left_running(before, THREAD_EXIT_GRACE_S)
+    if leaked:
+        pytest.fail(
+            f"a unit test left {len(leaked)} thread(s) running: "
+            f"{sorted(t.name for t in leaked)}. A thread outliving its test runs "
+            "outside the socket guard; stop it, or stop the code under test from "
+            "starting it."
+        )
 
 
 @pytest.fixture

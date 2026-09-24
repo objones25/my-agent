@@ -30,6 +30,7 @@ from langchain_core.messages import BaseMessage
 from langchain_core.outputs import LLMResult
 
 from my_agent.negative_space import require
+from my_agent.usage import call_usage
 
 __all__ = [
     "DEFAULT_LOG_DIR",
@@ -486,7 +487,6 @@ class JsonlMirror(BaseCallbackHandler):
     ) -> None:
         outputs: list[str] = []
         tool_calls: list[dict[str, Any]] = []
-        usage: dict[str, Any] | None = None
         metadata: dict[str, Any] = {}
         extra: dict[str, Any] = {}
 
@@ -513,9 +513,8 @@ class JsonlMirror(BaseCallbackHandler):
                     if value:
                         extra[key] = value
 
-                token_usage = getattr(message, "usage_metadata", None)
-                if token_usage:
-                    usage = dict(token_usage)
+        reported = call_usage(response)
+        usage = dict(reported) if reported is not None else None
 
         payload: dict[str, Any] = {
             "outputs": outputs,
@@ -577,8 +576,8 @@ def run_log_path(
     )
     require(
         "\\" not in token,
-        f"run_id must not contain a path separator (got {token!r}): "
-        "it becomes part of a filename, not a subdirectory",
+        f"run_id must not contain a backslash (got {token!r}): it is a path "
+        "separator on Windows, and this becomes part of a filename, not a subdirectory",
     )
     require(
         token not in (".", ".."),

@@ -233,7 +233,9 @@ Bugs live in the states the code was never written to handle. Write those down a
 - All four bounds fail the same way at the edge, as operating errors `main` reports rather than
   crashes: `DeadlineExceeded`, `StepLimitExceeded` (which translates langgraph's
   `GraphRecursionError` — before it existed the wall clock was a handled ceiling and the step count
-  was a traceback), `TokenLimitExceeded` and `ResumeLimitExceeded`.
+  was a traceback), `TokenLimitExceeded` and `ResumeLimitExceeded`. All four subclass
+  `run.BoundExceeded`, which is the one name `main` catches, so a fifth bound is reported without
+  editing it.
 - **A step is not a call.** langgraph's tool node runs every call in one `AIMessage`, so a fan-out
   does ten times the work per step and `step_limit` sees one step either way.
   `capabilities.call_limits()` installs the two bounds that can see it: `TOOL_CALL_LIMIT` (24,
@@ -265,7 +267,7 @@ Bugs live in the states the code was never written to handle. Write those down a
 
 ## Testing and evals
 
-Keep them apart. 502 offline tests and 2 live as of 2026-09-23; `evals/` is still empty.
+Keep them apart. 531 offline tests and 2 live as of 2026-09-23; `evals/` is still empty.
 
 - **Unit tests** (`tests/`, default selection) are deterministic and offline. One test file per
   source module; a new module gets a new file, not an extra section in an existing one. They test
@@ -273,8 +275,17 @@ Keep them apart. 502 offline tests and 2 live as of 2026-09-23; `evals/` is stil
   trips it — that is what turns a contract into a tested contract. **Outside one named exclusion,
   that is now the state rather than the goal.** Measured 2026-09-23 by wrapping `require()` and
   `CheckFailed` in pytest plugins that log their call site whenever one raises, then diffing against
-  an AST walk — not by reading coverage, and not by counting by hand: **113 `require()` sites, 103
-  tripped; 16 `raise CheckFailed` sites outside the helpers, 15 tripped.**
+  an AST walk — not by reading coverage, and not by counting by hand: **111 `require()` sites, 101
+  tripped; 16 `raise CheckFailed` sites outside the helpers, 15 tripped.** This count excludes
+  `negative_space.py` itself — it is the helpers module, not harness code under test. An earlier
+  measurement (`docs/findings.md`, F44) put an earlier tree at 113/103, which is not the same
+  discrepancy: verified 2026-09-23 by an AST walk of `src/my_agent` at both HEAD and base `dec7fad`
+  (same tree that earlier figure came from), the count is 112 sites including `negative_space.py` and
+  111 excluding it at HEAD, versus 113 including and 112 excluding at `dec7fad` — `negative_space.py`
+  contributes exactly one site at both (`bounded()`'s own `require()` at `negative_space.py:72`,
+  which the current tool excludes and the earlier one counted), and the other difference is real: this
+  branch's own commits (`capabilities.py`'s parameter pins routed through `check_required_parameters`)
+  removed a further site between `dec7fad` and HEAD, independent of which tool did the counting.
 
   **All 11 that remain are in `main.py`**, left alone deliberately — it is scaffolding, and a check
   there is worth a findings entry rather than a fix round. **No import-time check is untripped any
@@ -325,11 +336,17 @@ Keep them apart. 502 offline tests and 2 live as of 2026-09-23; `evals/` is stil
   Registering a marker does *not* deselect it — a real gap here until it was measured.
 - **"Offline" is enforced, not assumed.** An autouse `_forbid_network` fixture in
   `tests/conftest.py` fails any test in that directory that opens a socket, stepping aside only for
-  `live`. Shared setup (`valid_key`, `valid_secret`, `deny_secrets`, `assert_does_not_raise`) lives
-  there too as fixtures, so no test can leak a mutation into the next. It does **not** reach the
-  `src/` doctests, which run in the same suite (`--doctest-modules`) from a separate `testpaths`
-  entry — harmless today, but read `docs/findings.md`, "Test-infrastructure specifics", before
-  changing either.
+  `live`. A second autouse fixture, `_forbid_leaked_threads`, closes the hole `_forbid_network` cannot
+  see on its own: the socket guard is only a monkeypatch, undone at every teardown and re-applied at
+  the next setup, so a thread a test starts and leaves running reaches the network in the gap between
+  tests, unguarded — measured landing in the next test as a leaked socket and a
+  `PytestUnraisableExceptionWarning` (`docs/findings.md`, "Test-infrastructure specifics"). It fails
+  any unmarked test that leaves a new thread running after a 1s grace period, stepping aside for
+  `live` the same way. Shared setup (`valid_key`, `valid_secret`, `deny_secrets`,
+  `assert_does_not_raise`) lives there too as fixtures, so no test can leak a mutation into the next.
+  It does **not** reach the `src/` doctests, which run in the same suite (`--doctest-modules`) from a
+  separate `testpaths` entry — harmless today, but read `docs/findings.md`, "Test-infrastructure
+  specifics", before changing either.
 - **A passing suite is not a passing state if the tests cannot fail.** Before trusting new tests,
   break the code they cover and watch them go red; twenty-three such mutants are recorded in
   `docs/findings.md`, and a test that survives one is decorative — two did, and are recorded as
@@ -485,15 +502,16 @@ Everything in this table lives in `src/my_agent/`.
 | `agent.py` | `AgentConfig`, `build_agent`. Takes a `BaseChatModel` and imports nothing from `model.py` — `main.py` is the only place the two meet. Compiles **twice**: the second build is what puts a step limit on the `task` subagent (F24). |
 | `capabilities.py` | The allowlist and the proof it held: `DEFAULT_FILESYSTEM_TOOLS`, `least_privilege_filesystem`, `compiled_tools`, `compiled_tool_names`, `subagent_graphs`, `bound_step_limit`, `require_withheld`/`require_granted`, `compiled_output_keys`, plus the bounds on granted capabilities (`PARENT_STEP_LIMIT`, `SUBAGENT_STEP_LIMIT`, `GREP_MATCH_LIMIT`, the eviction limits, `bounded_compaction` and `CONTEXT_WINDOW_TOKENS`) and the `DEEPAGENTS_PLUGIN_GROUPS` / `DEEPAGENTS_CACHING_PROBE_MODULES` / `HARNESS_PROFILE_FIELDS` pins plus `require_no_harness_profile` (F47). |
 | `contracts.py` | `check_config_contract`, `pydantic_param_names` — the import-time check that makes `as_kwargs()` splatting safe. |
-| `run.py` | `Invokable`, `RunBounds`, `RunDeadline`, `RunTokenBudget`, `TurnResult`, `run_turn`, `resume_turn` — one bounded turn, with three outcomes: finished, failed (`DeadlineExceeded`, `StepLimitExceeded`, `TokenLimitExceeded`, `ResumeLimitExceeded`) or paused for approval, `failed_tool_calls` for a turn that finished without doing what it says, `answered` for a turn cut off before its answer began, and `state` — every key the graph returned bar `messages`/`__interrupt__`, with `files` and `structured_response` as properties over it. `_invoke` used to read `messages` and drop the rest (F40, F43). Owns the step limit, the wall clock and token budget across a pause, the resume count, the thread and multi-turn history. Imports no deepagents and builds no model. |
+| `run.py` | `Invokable`, `RunBounds`, `RunDeadline`, `RunTokenBudget`, `TurnResult`, `run_turn`, `resume_turn` — one bounded turn, with three outcomes: finished, failed (`DeadlineExceeded`, `StepLimitExceeded`, `TokenLimitExceeded`, `ResumeLimitExceeded`, all subclasses of `BoundExceeded`) or paused for approval, `failed_tool_calls` for a turn that finished without doing what it says, `answered` for a turn cut off before its answer began, and `state` — every key the graph returned bar `messages`/`__interrupt__`, with `files` and `structured_response` as properties over it. `_invoke` used to read `messages` and drop the rest (F40, F43). Owns the step limit, the wall clock and token budget across a pause, the resume count, the thread and multi-turn history. Imports no deepagents and builds no model. |
 | `main.py` | `uv run my-agent` — the composition root, and the eight live checks (`CheckOutcome`, `live_check_repeats`, pass^k). |
 | `negative_space.py` | `require`/`unreachable`/`bounded`, and the only doctests in `src/`. |
 | `tracing.py` | `TracingBackend`, `LangSmithTracing`, `WeaveTracing`, `available_backends`, `langchain_tracer_names`. |
 | `mirror.py` | `JsonlMirror`, `run_log_path`, `mirror_to_file` — the always-on local JSONL mirror of every agent event, including the per-call request size, a per-run per-tool byte breakdown (F30) and the server's retry advice on a failed model call (F46). |
+| `usage.py` | `call_usage` — the one reading of a model call's `usage_metadata`, shared by `RunTokenBudget` and `JsonlMirror` so the bound and the log cannot disagree. |
 
 `tests/` mirrors that one file per module, offline by default, plus `conftest.py` for shared
-fixtures and the socket guard. The only `-m live` tests are one each at the end of `test_tracing.py`
-(calls the real `weave.init()` and hits the router) and `test_run.py` (proves multi-turn history
+fixtures and the socket and thread guards. The only `-m live` tests are one each at the end of
+`test_tracing.py` (calls the real `weave.init()` and hits the router) and `test_run.py` (proves multi-turn history
 against a real graph, which a fake cannot show). `evals/` is empty. `docs/findings.md` holds F1–F47
 plus the repo-gates, deepagents-surface, test-infrastructure and observability appendices;
 `scripts/audit_negative_space.py` is **vendored** from the negative-space-programming skill — do not

@@ -212,3 +212,25 @@ def test_the_shipped_chat_openai_still_accepts_every_alias_model_config_uses(
             "ChatOpenAI",
         )
     )
+
+
+def test_required_parameters_names_the_consequence_it_was_given() -> None:
+    """Each caller knows what breaks when a parameter goes, and the message is
+    where a reader learns it."""
+    with pytest.raises(
+        CheckFailed, match=r"^Thing no longer accepts \['b'\]; the widget cannot be set$"
+    ):
+        check_required_parameters(
+            frozenset({"a"}),
+            frozenset({"a", "b"}),
+            "Thing",
+            consequence="the widget cannot be set",
+        )
+
+
+def test_required_parameters_defaults_to_the_config_consequence() -> None:
+    """The default keeps `model.py`'s message exactly what it was."""
+    with pytest.raises(
+        CheckFailed, match=r"^Thing no longer accepts \['b'\]; the config must change$"
+    ):
+        check_required_parameters(frozenset({"a"}), frozenset({"a", "b"}), "Thing")
