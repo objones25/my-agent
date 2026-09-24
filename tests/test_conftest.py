@@ -1,4 +1,4 @@
-"""Tests for the socket guard in `conftest.py`.
+"""Tests for the socket guard and the thread guard in `conftest.py`.
 
 `_forbid_network` is the enforcement behind CLAUDE.md's "'Offline' is enforced,
 not assumed". It had no tests, which made that claim exactly the kind of
@@ -13,8 +13,12 @@ rather than on a reconstruction of it.
 from __future__ import annotations
 
 import socket
+import threading
+import time
 
 import pytest
+
+from tests.conftest import threads_left_running
 
 
 def test_the_guard_blocks_a_tcp_connect() -> None:
@@ -72,3 +76,41 @@ def test_the_guard_blocks_sendmsg() -> None:
         pytest.raises(RuntimeError, match="opened a socket"),
     ):
         sock.sendmsg([b"x"], [], 0, ("127.0.0.1", 9))
+
+
+def test_a_thread_still_running_after_the_grace_period_is_reported() -> None:
+    """The shape of the leak `_forbid_leaked_threads` exists for: a thread that
+    outlives its test and would run outside the socket guard."""
+    before = frozenset(threading.enumerate())
+    release = threading.Event()
+    lingering = threading.Thread(target=release.wait, name="lingering", daemon=True)
+    lingering.start()
+    try:
+        assert threads_left_running(before, grace_s=0.05) == [lingering]
+    finally:
+        release.set()
+        lingering.join(timeout=5)
+
+
+def test_a_thread_that_finishes_inside_the_grace_period_is_not_reported() -> None:
+    """The discriminator: without it, a guard that reported *every* new thread
+    would pass the test above, and fail any test that briefly uses one."""
+    before = frozenset(threading.enumerate())
+    # Still running when the check starts, so only the wait can clear it.
+    finishing = threading.Thread(target=time.sleep, args=(0.05,), name="finishing")
+    finishing.start()
+
+    assert threads_left_running(before, grace_s=5.0) == []
+
+
+def test_threads_that_existed_before_the_test_are_not_reported() -> None:
+    """Only threads the test started are its responsibility."""
+    release = threading.Event()
+    earlier = threading.Thread(target=release.wait, name="earlier", daemon=True)
+    earlier.start()
+    try:
+        before = frozenset(threading.enumerate())
+        assert threads_left_running(before, grace_s=0.05) == []
+    finally:
+        release.set()
+        earlier.join(timeout=5)

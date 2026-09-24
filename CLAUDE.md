@@ -267,7 +267,7 @@ Bugs live in the states the code was never written to handle. Write those down a
 
 ## Testing and evals
 
-Keep them apart. 526 offline tests and 2 live as of 2026-09-23; `evals/` is still empty.
+Keep them apart. 529 offline tests and 2 live as of 2026-09-23; `evals/` is still empty.
 
 - **Unit tests** (`tests/`, default selection) are deterministic and offline. One test file per
   source module; a new module gets a new file, not an extra section in an existing one. They test

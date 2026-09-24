@@ -2089,6 +2089,31 @@ exception handler or an `asyncio.all_tasks()` assertion at teardown, and it is u
 because nothing in `src/` is async. **It is the first thing to fix if async ever lands** — before
 the first async test, not after.
 
+**The socket guard is a monkeypatch, so a thread that outlives its test runs half outside it.**
+`_forbid_network` is undone at every teardown and re-applied at the next setup. Measured
+2026-09-23 with a plugin that wraps `getaddrinfo`/`connect` *underneath* the monkeypatch:
+`test_langchain_tracer_names_reports_the_installed_tracers` built a real `LangChainTracer`, which
+takes langsmith's process-global cached `Client`, whose default `auto_batch_tracing=True` starts
+`tracing_control_thread_func`. That thread calls `Client.info` (`GET /info`, with retries) at once
+and never exits. In one measured run it resolved `api.smith.langchain.com` with the **real** `getaddrinfo` in
+the gap between two tests, then hit the re-applied `connect` guard inside the next one. The guard
+raises `RuntimeError`, and urllib3's `create_connection` closes the socket on `OSError` only, so
+the socket leaked; its finaliser surfaced as `PytestUnraisableExceptionWarning` in whichever test
+the collector ran in, and `filterwarnings = ["error"]` failed it. On the base tree that file sorted
+last, so the finaliser mostly ran after the session; `tests/test_usage.py` sorting after it made it
+a 3-in-12 flake. Fixed at the source (the test hands the tracer a `Client(auto_batch_tracing=False)`
+through `langchain_core.tracers.langchain.get_client`), and **`_forbid_leaked_threads` now fails any
+unit test that leaves a thread running past a 1 s grace**, which turns this class of leak from a
+timing-dependent flake into a deterministic teardown error. The guard keeps raising
+`RuntimeError` rather than an `OSError` subclass on purpose: libraries catch `OSError` and carry on
+(langsmith logs "Failed to get info" and continues), which would make the guard silent.
+
+Not fixed, and outside both guards: **weave's telemetry sends to Sentry at interpreter exit**
+(`o151352.ingest.us.sentry.io`, `sentry-sdk.BackgroundWorker`, 8 lookups and 8 connects per offline
+run), after pytest has finished and every monkeypatch is gone. It happens with the langsmith test
+deselected, so it is a separate egress, and it is not a test failure because nothing is left to
+report it to.
+
 **A mutant on a pinned bound fails collection, not the test it targets — and that hides whether the
 test itself discriminates.** `_PINNED_FS_BOUNDS` (`capabilities.py:235-264`) asserts
 `GREP_MATCH_LIMIT`, `TOOL_RESULT_TOKEN_LIMIT` and `HUMAN_MESSAGE_TOKEN_LIMIT` each equal

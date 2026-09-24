@@ -17,6 +17,8 @@ import re
 from collections.abc import Callable, Iterator
 from types import SimpleNamespace
 
+import langchain_core.tracers.langchain as langchain_tracer_module
+import langsmith
 import pytest
 import weave
 from dotenv import load_dotenv
@@ -331,8 +333,22 @@ def test_only_the_configured_backend_is_available() -> None:
 def test_langchain_tracer_names_reports_the_installed_tracers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """The real `CallbackManager.configure` path, with a client that starts no thread.
+
+    `LangChainTracer` falls back to langsmith's process-global cached client,
+    whose default `auto_batch_tracing=True` starts a tracing thread that calls
+    `Client.info` (`GET /info`, with retries) at once and lives as long as the
+    process. That thread outlived this test, reached the network between tests
+    where `_forbid_network` is not patched in, and leaked an unclosed socket
+    into whichever test ran next. This test reads tracer *names*; it never
+    needed a client that talks to anyone. Patched on the name
+    `LangChainTracer.__init__` actually calls, so the global cache stays empty.
+    """
     monkeypatch.setenv("LANGSMITH_TRACING", "true")
     monkeypatch.setenv("LANGSMITH_API_KEY", "ls-key-value")
+    quiet_client = langsmith.Client(api_key="ls-key-value", auto_batch_tracing=False)
+    monkeypatch.setattr(langchain_tracer_module, "get_client", lambda: quiet_client)
+
     assert "LangChainTracer" in tracing_module.langchain_tracer_names()
 
 
