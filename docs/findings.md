@@ -1187,10 +1187,10 @@ turn is worth.
 and refuses on `on_chat_model_start`, so the call that crossed the line is paid for and the one
 after it is not. That is the only granularity available, because a token count exists only once the
 call has returned. `run_inline` and `raise_error` are set for the F12 reason. It reads
-`message.usage_metadata`, the same field `mirror.py` records, so the number that bounds a run is the
-number the log shows. Subagent calls count: `ensure_config` seeds a subagent's run from the ambient
-parent config, which matters more here than for the wall clock because a `task` dispatch is where
-the tokens actually go.
+`message.usage_metadata` through `usage.call_usage`, the same function `mirror.py` now reads it
+through too, so the number that bounds a run is the number the log shows. Subagent calls count:
+`ensure_config` seeds a subagent's run from the ambient parent config, which matters more here than
+for the wall clock because a `task` dispatch is where the tokens actually go.
 
 **A provider that omits usage makes the bound blind**, so `RunTokenBudget.unmeasured_calls` counts
 those separately rather than folding them into a silent zero. Crashing a turn over someone else's
@@ -2109,10 +2109,18 @@ timing-dependent flake into a deterministic teardown error. The guard keeps rais
 (langsmith logs "Failed to get info" and continues), which would make the guard silent.
 
 Not fixed, and outside both guards: **weave's telemetry sends to Sentry at interpreter exit**
-(`o151352.ingest.us.sentry.io`, `sentry-sdk.BackgroundWorker`, 8 lookups and 8 connects per offline
-run), after pytest has finished and every monkeypatch is gone. It happens with the langsmith test
-deselected, so it is a separate egress, and it is not a test failure because nothing is left to
-report it to.
+(`o151352.ingest.us.sentry.io`, `sentry-sdk.BackgroundWorker`'s own `transport.py`, via
+`urllib3`), after pytest has finished and every monkeypatch is gone. It happens with the langsmith
+test deselected, so it is a separate egress, and it is not a test failure because nothing is left to
+report it to. **It predates this branch**: measured with a `sys.addaudithook` registered before
+`pytest.main()` runs (so it sees underneath every monkeypatch, and an `atexit` callback registered
+before pytest's own — LIFO means it then runs *after* sentry-sdk's flush) against both the current
+tree and a worktree pinned to base `dec7fad`, same `weave==0.53.9` / `sentry-sdk==2.69.2`: **1
+`getaddrinfo` for `o151352.ingest.us.sentry.io` and 1 `connect` to `34.160.81.0:443`, identically at
+both**. The count is environment-dependent (DNS caching, which of Sentry's edge IPs answers, and
+anything else the SDK batches into one flush can all change it), so treat "1 and 1" as what this
+run measured rather than a promise; re-measure with the same technique before citing a different
+number.
 
 **A mutant on a pinned bound fails collection, not the test it targets — and that hides whether the
 test itself discriminates.** `_PINNED_FS_BOUNDS` (`capabilities.py:235-264`) asserts
