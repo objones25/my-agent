@@ -259,7 +259,7 @@ LIBRARY_COMPACTION_TRIGGER_TOKENS = 170_000
 """What deepagents compacts at when nobody sets a threshold and the model
 exposes no profile.
 
-The discriminator for the pin above, exactly as `LIBRARY_SUBAGENT_STEP_LIMIT` is
+The discriminator for the pin above, exactly as `LIBRARY_STEP_LIMIT` is
 for the step limit: without it, a test asserting our trigger clears the window
 keeps passing on the day the library picks a sane number for its own reasons.
 """

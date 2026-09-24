@@ -172,6 +172,14 @@ _MODEL_INJECTED_PARAMS = frozenset({"use_responses_api"})
 # --------------------------------------------------------------------------
 
 
+_UNSET_OR_EMPTY = (
+    "{env_var} is unset or empty. Set it in .env (see .env.example) or export it "
+    "before starting the agent."
+)
+"""What a required variable that is missing or blank reports. One string for
+both, because both mean the same thing to the person reading it."""
+
+
 @dataclass(frozen=True, slots=True)
 class ModelConfig:
     """Everything needed to reach a chat model.
@@ -251,10 +259,7 @@ class ModelConfig:
             raw = source.get(spec.env_var)
             if raw is None:
                 if spec.required:
-                    raise ValueError(
-                        f"{spec.env_var} is unset or empty. Set it in .env "
-                        f"(see .env.example) or export it before starting the agent."
-                    )
+                    raise ValueError(_UNSET_OR_EMPTY.format(env_var=spec.env_var))
                 continue
 
             value = raw.strip()
@@ -262,10 +267,7 @@ class ModelConfig:
                 # Set-but-blank is a broken .env line, not a request for the
                 # default. Saying so beats silently ignoring what someone wrote.
                 if spec.required:
-                    raise ValueError(
-                        f"{spec.env_var} is unset or empty. Set it in .env "
-                        f"(see .env.example) or export it before starting the agent."
-                    )
+                    raise ValueError(_UNSET_OR_EMPTY.format(env_var=spec.env_var))
                 raise ValueError(
                     f"{spec.env_var} is set but empty; unset it to use the default."
                 )

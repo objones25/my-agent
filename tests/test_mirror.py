@@ -365,7 +365,10 @@ def test_run_log_path_rejects_a_run_id_with_a_path_separator() -> None:
 
 
 def test_run_log_path_rejects_a_run_id_with_a_backslash() -> None:
-    with pytest.raises(CheckFailed, match="separator"):
+    """Its own message, not the forward-slash one. Two byte-identical messages
+    cannot be told apart by a test, and this one used to read as covered by
+    either."""
+    with pytest.raises(CheckFailed, match="must not contain a backslash"):
         run_log_path(now=FIXED_NOW, run_id="a\\b")
 
 

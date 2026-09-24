@@ -134,6 +134,17 @@ def test_from_env_raises_value_error_when_the_token_is_absent(env: dict[str, str
     assert not issubclass(ValueError, CheckFailed)
 
 
+def test_an_absent_and_a_blank_required_variable_read_the_same() -> None:
+    """Both mean "set it", and both used to spell that out separately. One
+    message, so an edit to one cannot silently leave the other behind."""
+    with pytest.raises(ValueError, match="unset or empty") as absent:
+        ModelConfig.from_env({})
+    with pytest.raises(ValueError, match="unset or empty") as blank:
+        ModelConfig.from_env({API_KEY_ENV_VAR: "   "})
+
+    assert str(absent.value) == str(blank.value)
+
+
 def test_from_env_raises_value_error_on_a_blank_model_id(valid_key: str) -> None:
     with pytest.raises(ValueError, match=MODEL_ENV_VAR):
         ModelConfig.from_env({API_KEY_ENV_VAR: valid_key, MODEL_ENV_VAR: "   "})

@@ -576,8 +576,8 @@ def run_log_path(
     )
     require(
         "\\" not in token,
-        f"run_id must not contain a path separator (got {token!r}): "
-        "it becomes part of a filename, not a subdirectory",
+        f"run_id must not contain a backslash (got {token!r}): it is a path "
+        "separator on Windows, and this becomes part of a filename, not a subdirectory",
     )
     require(
         token not in (".", ".."),
