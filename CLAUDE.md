@@ -233,7 +233,9 @@ Bugs live in the states the code was never written to handle. Write those down a
 - All four bounds fail the same way at the edge, as operating errors `main` reports rather than
   crashes: `DeadlineExceeded`, `StepLimitExceeded` (which translates langgraph's
   `GraphRecursionError` — before it existed the wall clock was a handled ceiling and the step count
-  was a traceback), `TokenLimitExceeded` and `ResumeLimitExceeded`.
+  was a traceback), `TokenLimitExceeded` and `ResumeLimitExceeded`. All four subclass
+  `run.BoundExceeded`, which is the one name `main` catches, so a fifth bound is reported without
+  editing it.
 - **A step is not a call.** langgraph's tool node runs every call in one `AIMessage`, so a fan-out
   does ten times the work per step and `step_limit` sees one step either way.
   `capabilities.call_limits()` installs the two bounds that can see it: `TOOL_CALL_LIMIT` (24,
@@ -265,7 +267,7 @@ Bugs live in the states the code was never written to handle. Write those down a
 
 ## Testing and evals
 
-Keep them apart. 502 offline tests and 2 live as of 2026-09-23; `evals/` is still empty.
+Keep them apart. 526 offline tests and 2 live as of 2026-09-23; `evals/` is still empty.
 
 - **Unit tests** (`tests/`, default selection) are deterministic and offline. One test file per
   source module; a new module gets a new file, not an extra section in an existing one. They test
@@ -273,8 +275,10 @@ Keep them apart. 502 offline tests and 2 live as of 2026-09-23; `evals/` is stil
   trips it — that is what turns a contract into a tested contract. **Outside one named exclusion,
   that is now the state rather than the goal.** Measured 2026-09-23 by wrapping `require()` and
   `CheckFailed` in pytest plugins that log their call site whenever one raises, then diffing against
-  an AST walk — not by reading coverage, and not by counting by hand: **113 `require()` sites, 103
-  tripped; 16 `raise CheckFailed` sites outside the helpers, 15 tripped.**
+  an AST walk — not by reading coverage, and not by counting by hand: **111 `require()` sites, 101
+  tripped; 16 `raise CheckFailed` sites outside the helpers, 15 tripped.** Re-measured with a
+  `sys.monitoring` RAISE plugin and an AST walk; it counts one fewer `require()` site on the tree the
+  earlier figure came from, and the old tool is not in the repo to say why.
 
   **All 11 that remain are in `main.py`**, left alone deliberately — it is scaffolding, and a check
   there is worth a findings entry rather than a fix round. **No import-time check is untripped any
@@ -485,11 +489,12 @@ Everything in this table lives in `src/my_agent/`.
 | `agent.py` | `AgentConfig`, `build_agent`. Takes a `BaseChatModel` and imports nothing from `model.py` — `main.py` is the only place the two meet. Compiles **twice**: the second build is what puts a step limit on the `task` subagent (F24). |
 | `capabilities.py` | The allowlist and the proof it held: `DEFAULT_FILESYSTEM_TOOLS`, `least_privilege_filesystem`, `compiled_tools`, `compiled_tool_names`, `subagent_graphs`, `bound_step_limit`, `require_withheld`/`require_granted`, `compiled_output_keys`, plus the bounds on granted capabilities (`PARENT_STEP_LIMIT`, `SUBAGENT_STEP_LIMIT`, `GREP_MATCH_LIMIT`, the eviction limits, `bounded_compaction` and `CONTEXT_WINDOW_TOKENS`) and the `DEEPAGENTS_PLUGIN_GROUPS` / `DEEPAGENTS_CACHING_PROBE_MODULES` / `HARNESS_PROFILE_FIELDS` pins plus `require_no_harness_profile` (F47). |
 | `contracts.py` | `check_config_contract`, `pydantic_param_names` — the import-time check that makes `as_kwargs()` splatting safe. |
-| `run.py` | `Invokable`, `RunBounds`, `RunDeadline`, `RunTokenBudget`, `TurnResult`, `run_turn`, `resume_turn` — one bounded turn, with three outcomes: finished, failed (`DeadlineExceeded`, `StepLimitExceeded`, `TokenLimitExceeded`, `ResumeLimitExceeded`) or paused for approval, `failed_tool_calls` for a turn that finished without doing what it says, `answered` for a turn cut off before its answer began, and `state` — every key the graph returned bar `messages`/`__interrupt__`, with `files` and `structured_response` as properties over it. `_invoke` used to read `messages` and drop the rest (F40, F43). Owns the step limit, the wall clock and token budget across a pause, the resume count, the thread and multi-turn history. Imports no deepagents and builds no model. |
+| `run.py` | `Invokable`, `RunBounds`, `RunDeadline`, `RunTokenBudget`, `TurnResult`, `run_turn`, `resume_turn` — one bounded turn, with three outcomes: finished, failed (`DeadlineExceeded`, `StepLimitExceeded`, `TokenLimitExceeded`, `ResumeLimitExceeded`, all subclasses of `BoundExceeded`) or paused for approval, `failed_tool_calls` for a turn that finished without doing what it says, `answered` for a turn cut off before its answer began, and `state` — every key the graph returned bar `messages`/`__interrupt__`, with `files` and `structured_response` as properties over it. `_invoke` used to read `messages` and drop the rest (F40, F43). Owns the step limit, the wall clock and token budget across a pause, the resume count, the thread and multi-turn history. Imports no deepagents and builds no model. |
 | `main.py` | `uv run my-agent` — the composition root, and the eight live checks (`CheckOutcome`, `live_check_repeats`, pass^k). |
 | `negative_space.py` | `require`/`unreachable`/`bounded`, and the only doctests in `src/`. |
 | `tracing.py` | `TracingBackend`, `LangSmithTracing`, `WeaveTracing`, `available_backends`, `langchain_tracer_names`. |
 | `mirror.py` | `JsonlMirror`, `run_log_path`, `mirror_to_file` — the always-on local JSONL mirror of every agent event, including the per-call request size, a per-run per-tool byte breakdown (F30) and the server's retry advice on a failed model call (F46). |
+| `usage.py` | `call_usage` — the one reading of a model call's `usage_metadata`, shared by `RunTokenBudget` and `JsonlMirror` so the bound and the log cannot disagree. |
 
 `tests/` mirrors that one file per module, offline by default, plus `conftest.py` for shared
 fixtures and the socket guard. The only `-m live` tests are one each at the end of `test_tracing.py`
