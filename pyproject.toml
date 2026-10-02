@@ -13,7 +13,7 @@ dependencies = [
     "langsmith>=0.12.6",
     "pydantic-settings>=2.15.0",
     "python-dotenv>=1.2.3",
-    "weave>=0.53.9",
+    "weave>=0.53.11",
 ]
 
 [project.scripts]
